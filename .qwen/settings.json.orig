@@ -1,0 +1,17 @@
+{
+  "mcpServers": {
+    "extension-dev-mcp-tools": {
+      "command": "node",
+      "args": [
+        "D:\\教程\\easyeda-docs\\github-eext\\extension-dev-mcp-tools\\dist\\index.js"
+      ],
+      "env": {},
+      "disabled": false,
+      "autoApprove": [
+        "dev_plugin",
+        "import_plugin",
+        "get_console_logs"
+      ]
+    }
+  }
+}

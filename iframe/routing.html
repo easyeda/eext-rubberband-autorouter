@@ -1,0 +1,266 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>拓扑自动布线</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        html, body { height: 100%; overflow: hidden; }
+        body {
+            font-family: 'Segoe UI', 'Microsoft YaHei', -apple-system, sans-serif;
+            font-size: 12px;
+            background: #F5F5F5;
+            color: #333;
+            display: flex;
+            flex-direction: column;
+            height: 100vh;
+        }
+        .toolbar {
+            background: #FAFAFA;
+            border-bottom: 1px solid #E0E0E0;
+            padding: 8px 12px;
+            display: flex;
+            align-items: center;
+            gap: 16px;
+            flex-wrap: wrap;
+        }
+        .toolbar-group { display: flex; align-items: center; gap: 6px; }
+        .toolbar-label { color: #666; font-size: 11px; white-space: nowrap; }
+        .toolbar-input {
+            border: 1px solid #D0D0D0;
+            background: #FFF;
+            padding: 4px 8px;
+            font-size: 12px;
+            color: #333;
+            outline: none;
+        }
+        .toolbar-input:focus { border-color: #007AFF; }
+        .toolbar-input-small { width: 60px; text-align: center; }
+        .toolbar-btn {
+            background: #007AFF;
+            border: 1px solid #007AFF;
+            padding: 4px 12px;
+            font-size: 11px;
+            color: #FFF;
+            cursor: pointer;
+            white-space: nowrap;
+        }
+        .toolbar-btn:hover:not(:disabled) { background: #0066DD; border-color: #0066DD; }
+        .toolbar-btn:active:not(:disabled) { background: #0055CC; }
+        .toolbar-btn:disabled { background: #B0B0B0; border-color: #B0B0B0; cursor: not-allowed; }
+        .toolbar-btn.cancel { background: #FF3B30; border-color: #FF3B30; }
+        .toolbar-btn.cancel:hover:not(:disabled) { background: #E0352B; }
+        .toolbar-separator { width: 1px; height: 20px; background: #D0D0D0; margin: 0 4px; }
+        .log-panel {
+            flex: 1;
+            background: #FFFFFF;
+            border: 1px solid #E0E0E0;
+            margin: 8px;
+            display: flex;
+            flex-direction: column;
+            overflow: hidden;
+        }
+        .log-header {
+            background: #FAFAFA;
+            border-bottom: 1px solid #E0E0E0;
+            padding: 4px 8px;
+            font-size: 11px;
+            color: #666;
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+        }
+        .log-content {
+            flex: 1;
+            padding: 8px;
+            font-family: 'Consolas', 'SF Mono', 'Monaco', monospace;
+            font-size: 11px;
+            line-height: 1.5;
+            overflow-y: auto;
+            background: #FDFDFD;
+        }
+        .log-line { white-space: pre-wrap; word-break: break-all; color: #444; margin-bottom: 2px; }
+        .log-line.info { color: #007AFF; }
+        .log-line.success { color: #34C759; font-weight: 500; }
+        .log-line.error { color: #FF3B30; font-weight: 500; }
+        .log-line.warn { color: #FF9500; }
+        .statusbar {
+            background: #E8E8E8;
+            border-top: 1px solid #D0D0D0;
+            padding: 4px 12px;
+            font-size: 11px;
+            color: #666;
+        }
+        .progress-bar {
+            height: 3px;
+            background: #E0E0E0;
+            position: relative;
+            overflow: hidden;
+        }
+        .progress-fill {
+            height: 100%;
+            background: #007AFF;
+            width: 0%;
+            transition: width 0.3s ease;
+        }
+    </style>
+</head>
+<body>
+    <div class="toolbar">
+        <div class="toolbar-group">
+            <span class="toolbar-label">最大轮数:</span>
+            <input type="number" class="toolbar-input toolbar-input-small" id="maxPasses" value="100" min="1" max="1000">
+        </div>
+        <div class="toolbar-separator"></div>
+        <button class="toolbar-btn" id="btnStart">开始布线</button>
+        <button class="toolbar-btn cancel" id="btnCancel" disabled>取消</button>
+    </div>
+    <div class="progress-bar">
+        <div class="progress-fill" id="progressFill"></div>
+    </div>
+    <div class="log-panel">
+        <div class="log-header">
+            <span>运行日志</span>
+            <span id="logCount">0 行</span>
+        </div>
+        <div class="log-content" id="logContainer">
+            <div class="log-line info">准备就绪，点击"开始布线"开始自动布线</div>
+        </div>
+    </div>
+    <div class="statusbar">
+        <span>拓扑橡皮筋自动布线 | 本地算法</span>
+    </div>
+    <script>
+        let isRouting = false;
+        let lineCount = 0;
+        const MAX_LINES = 200;
+
+        const maxPassesEl = document.getElementById('maxPasses');
+        const btnStart = document.getElementById('btnStart');
+        const btnCancel = document.getElementById('btnCancel');
+        const logContainer = document.getElementById('logContainer');
+        const logCountEl = document.getElementById('logCount');
+        const progressFill = document.getElementById('progressFill');
+
+        function addLog(message, type = '') {
+            if (!message || !message.trim()) return;
+            const lines = message.split('\n');
+            lines.forEach(line => {
+                if (line.trim()) {
+                    const div = document.createElement('div');
+                    div.className = `log-line ${type}`;
+                    div.textContent = line;
+                    logContainer.appendChild(div);
+                    lineCount++;
+                    while (logContainer.children.length > MAX_LINES) {
+                        logContainer.removeChild(logContainer.firstChild);
+                    }
+                }
+            });
+            logCountEl.textContent = `${Math.min(lineCount, MAX_LINES)} 行`;
+            logContainer.scrollTop = logContainer.scrollHeight;
+        }
+
+        function clearLog() {
+            logContainer.innerHTML = '';
+            lineCount = 0;
+            logCountEl.textContent = '0 行';
+        }
+
+        function setRouting(routing) {
+            isRouting = routing;
+            btnStart.disabled = routing;
+            btnCancel.disabled = !routing;
+            maxPassesEl.disabled = routing;
+        }
+
+        function setProgress(percentage) {
+            progressFill.style.width = `${percentage}%`;
+        }
+
+        function collectOptions() {
+            return {
+                maxPasses: parseInt(maxPassesEl.value) || 100,
+                enableJlcPostprocess: true
+            };
+        }
+
+        // 获取父窗口的 EDA API
+        const parentEda = window.parent.eda;
+
+        // 订阅来自扩展的消息
+        if (parentEda && parentEda.sys_MessageBus) {
+            // 监听布线开始
+            parentEda.sys_MessageBus.subscribe('routing-started', (msg) => {
+                addLog('布线已开始...', 'success');
+                setRouting(true);
+            });
+
+            // 监听进度更新
+            parentEda.sys_MessageBus.subscribe('routing-progress', (msg) => {
+                if (msg.percentage !== undefined) {
+                    setProgress(msg.percentage);
+                }
+                if (msg.message) {
+                    addLog(msg.message, 'info');
+                }
+            });
+
+            // 监听日志消息
+            parentEda.sys_MessageBus.subscribe('routing-log', (msg) => {
+                if (msg.message) {
+                    addLog(msg.message, msg.level || 'info');
+                }
+            });
+
+            // 监听布线完成
+            parentEda.sys_MessageBus.subscribe('routing-complete', (msg) => {
+                setRouting(false);
+                setProgress(100);
+                if (msg.success) {
+                    addLog('布线完成！', 'success');
+                } else {
+                    addLog('布线失败', 'error');
+                }
+            });
+
+            // 监听错误
+            parentEda.sys_MessageBus.subscribe('routing-error', (msg) => {
+                setRouting(false);
+                setProgress(0);
+                if (msg.error) {
+                    addLog(`错误: ${msg.error}`, 'error');
+                }
+            });
+        }
+
+        btnStart.addEventListener('click', () => {
+            clearLog();
+            setProgress(0);
+            addLog('正在启动布线...', 'info');
+            setRouting(true);
+
+            const options = collectOptions();
+            addLog(`最大轮数: ${options.maxPasses}`, 'info');
+
+            // 通知扩展开始布线
+            sendToExtension('start', { options: options });
+        });
+
+        btnCancel.addEventListener('click', () => {
+            addLog('正在取消布线...', 'warn');
+            setRouting(false);
+            setProgress(0);
+            sendToExtension('cancel', {});
+        });
+
+        // 发送消息到扩展
+        function sendToExtension(type, data) {
+            if (parentEda && parentEda.sys_MessageBus) {
+                parentEda.sys_MessageBus.publish('routing-iframe', { type, ...data });
+            }
+        }
+    </script>
+</body>
+</html>

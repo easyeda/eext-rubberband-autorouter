@@ -1,0 +1,52 @@
+{
+	"name": "rubberband-autorouter",
+	"uuid": "cb8695de3b6f4258a74f0c3b9aff73ea",
+	"displayName": "橡皮筋自动布线2",
+	"description": "基于拓扑橡皮筋算法的PCB自动布线工具，使用本地JavaScript算法完成布线",
+	"version": "2.10.29",
+	"publisher": "JLCEDA",
+	"engines": {
+		"eda": "^3.2.0"
+	},
+	"license": "Apache-2.0",
+	"repository": {
+		"type": "extension-store",
+		"url": ""
+	},
+	"categories": "PCB",
+	"keywords": [
+		"PCB",
+		"AutoRoute",
+		"自动布线",
+		"拓扑路由",
+		"Topological"
+	],
+	"images": {
+		"logo": "./images/freerouting.jpg"
+	},
+	"homepage": "https://github.com/easyeda/eext-rubberband-autorouter",
+	"bugs": "https://github.com/easyeda/eext-rubberband-autorouter/issues",
+	"activationEvents": {},
+	"entry": "./dist/index",
+	"dependentExtensions": {},
+	"headerMenus": {
+		"pcb": [
+			{
+				"id": "TopologicalRouter",
+				"title": "橡皮筋自动布线2",
+				"menuItems": [
+					{
+						"id": "AutoRoute",
+						"title": "开始自动布线",
+						"registerFn": "autoRoute"
+					},
+					{
+						"id": "About",
+						"title": "关于 v2.10.29",
+						"registerFn": "about"
+					}
+				]
+			}
+		]
+	}
+}
