@@ -32,7 +32,7 @@
 	"headerMenus": {
 		"pcb": [
 			{
-				"id": "TopologicalRouter",
+				"id": "RubberbandAutorouter",
 				"title": "橡皮筋自动布线",
 				"menuItems": [
 					{
