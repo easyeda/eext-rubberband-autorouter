@@ -18,7 +18,15 @@
 /package.json
 /tsconfig.json
 debug.log
-/app-offline
-/doc
+/doc/
 /.claude/
 /.qwen/
+/server/
+/scripts/
+/debug/
+/test/
+.edaignore
+CLAUDE.md
+QWEN.md
+REQUIREMENT.md
+Agent.md

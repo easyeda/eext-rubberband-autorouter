@@ -1,9 +1,9 @@
 {
 	"name": "rubberband-autorouter",
 	"uuid": "cb8695de3b6f4258a74f0c3b9aff73ea",
-	"displayName": "橡皮筋自动布线2",
+	"displayName": "橡皮筋自动布线",
 	"description": "基于拓扑橡皮筋算法的PCB自动布线工具，使用本地JavaScript算法完成布线",
-	"version": "2.10.29",
+	"version": "2.10.36",
 	"publisher": "JLCEDA",
 	"engines": {
 		"eda": "^3.2.0"
@@ -33,7 +33,7 @@
 		"pcb": [
 			{
 				"id": "TopologicalRouter",
-				"title": "橡皮筋自动布线2",
+				"title": "橡皮筋自动布线",
 				"menuItems": [
 					{
 						"id": "AutoRoute",
@@ -42,7 +42,7 @@
 					},
 					{
 						"id": "About",
-						"title": "关于 v2.10.29",
+						"title": "关于 v2.10.36",
 						"registerFn": "about"
 					}
 				]

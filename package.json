@@ -1,10 +1,10 @@
 {
-  "name": "eext-pcb-topological-router",
-  "version": "2.10.29",
-  "description": "基于拓扑橡皮筋算法的PCB自动布线工具",
+  "name": "rubberband-autorouter",
+  "version": "2.10.36",
+  "description": "基于拓扑橡皮筋算法的PCB自动布线工具，使用本地JavaScript算法完成布线",
   "main": "dist/index.js",
   "scripts": {
-    "build": "node scripts/bump-version.js && tsx config/esbuild.prod.ts",
+    "build": "node scripts/bump-version.js && tsx config/esbuild.prod.ts && npm run package",
     "watch": "tsx config/esbuild.prod.ts --watch",
     "package": "node -e \"const fs=require('fs');fs.rmSync('build/dist',{recursive:true,force:true});fs.mkdirSync('build/dist',{recursive:true})\" && tsx build/packaged.ts",
     "test": "tsx test/core.test.ts"
@@ -19,12 +19,14 @@
   "license": "Apache-2.0",
   "devDependencies": {
     "@types/node": "^20.0.0",
+    "chokidar": "^5.0.0",
     "esbuild": "^0.19.0",
     "fs-extra": "^11.0.0",
     "ignore": "^5.3.0",
     "jszip": "^3.10.0",
     "tsx": "^4.0.0",
-    "typescript": "^5.0.0"
+    "typescript": "^5.0.0",
+    "ws": "^8.20.0"
   },
   "dependencies": {
     "delaunator": "^5.0.0",

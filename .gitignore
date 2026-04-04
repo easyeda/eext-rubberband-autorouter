@@ -7,5 +7,5 @@
 /.eslintcache
 debug.log
 /doc
-/app-offline
+/build/
 
