@@ -6,9 +6,11 @@
 interface Point {
 	x: number;
 	y: number;
+	arcAngle?: number;
 }
 
 interface Obstacle {
+	id?: string;
 	x: number;
 	y: number;
 	radius: number;
@@ -141,7 +143,7 @@ export class ObstacleBypasser {
 		excludeNet?: string
 	): Obstacle[] {
 		const intersecting: Obstacle[] = [];
-		const margin = this.clearanceMil + this.trackWidthMil / 2;
+		const margin = this.trackWidthMil / 2;
 
 		// 获取线段的层号
 		const startLayer = (start as any).layer;
@@ -170,15 +172,264 @@ export class ObstacleBypasser {
 
 	/**
 	 * 生成绕行点
-	 * 在障碍物两侧生成切线路径点
+	 * 优先使用切线+圆弧绕行，失败时回退到直角绕行
 	 */
 	private generateBypassPoints(
 		start: Point,
 		end: Point,
 		obstacle: Obstacle,
+		direction: 'left' | 'right',
+		offsetMultiplier: number = 1
+	): Point[] {
+		// 优先尝试切线+圆弧绕行
+		const tangentResult = this.generateTangentBypass(start, end, obstacle, direction);
+		if (tangentResult && tangentResult.length > 0) {
+			return tangentResult;
+		}
+
+		// 回退到直角绕行
+		if (obstacle.startX !== undefined && obstacle.startY !== undefined &&
+			obstacle.endX !== undefined && obstacle.endY !== undefined) {
+			return this.generateSegmentBypassPoints(start, end, obstacle, direction, offsetMultiplier);
+		}
+		return this.generateCircleBypassPoints(start, end, obstacle, direction);
+	}
+
+	/**
+	 * 切线+圆弧绕行算法
+	 * 圆形障碍物：计算外切线切点 + 圆弧
+	 * 线段障碍物：绕过端点，切线必须清除整条线段
+	 */
+	private generateTangentBypass(
+		start: Point,
+		end: Point,
+		obstacle: Obstacle,
+		direction: 'left' | 'right'
+	): Point[] | null {
+		const margin = this.trackWidthMil / 2 + 3;
+
+		if (obstacle.startX !== undefined && obstacle.endX !== undefined) {
+			return this.generateSegmentTangentBypass(start, end, obstacle, direction);
+		}
+
+		// 圆形障碍物
+		const cx = obstacle.x;
+		const cy = obstacle.y;
+		const R = obstacle.radius + margin;
+
+		return this.computeTangentArc(start, end, cx, cy, R, direction);
+	}
+
+	/**
+	 * 线段障碍物的切线绕行
+	 * 线段障碍物形成"胶囊体"：两条平行偏移线 + 两个端点半圆
+	 * 路径：起点 → 切线到偏移线 → 沿偏移线到端点 → 圆弧绕端点 → 沿偏移线 → 切线到终点
+	 */
+	private generateSegmentTangentBypass(
+		start: Point,
+		end: Point,
+		obstacle: Obstacle,
+		direction: 'left' | 'right'
+	): Point[] | null {
+		const margin = this.trackWidthMil / 2 + 3;
+		const sx = obstacle.startX!, sy = obstacle.startY!;
+		const ex = obstacle.endX!, ey = obstacle.endY!;
+		const R = obstacle.radius + margin;
+
+		const segDx = ex - sx, segDy = ey - sy;
+		const segLen = Math.sqrt(segDx * segDx + segDy * segDy);
+		if (segLen < 0.001) return null;
+		const segUx = segDx / segLen, segUy = segDy / segLen;
+		const nx = -segUy, ny = segUx;
+
+		// 判断起点和终点在线段的哪一侧
+		const startSide = (start.x - sx) * nx + (start.y - sy) * ny;
+		const endSide = (end.x - sx) * nx + (end.y - sy) * ny;
+
+		if ((startSide > 0) === (endSide > 0)) {
+			// 同侧：沿法向偏移线直接通过
+			const sign = startSide > 0 ? 1 : -1;
+			const osx = sx + nx * sign * R, osy = sy + ny * sign * R;
+			const oex = ex + nx * sign * R, oey = ey + ny * sign * R;
+			const t1 = this.projectOntoLine(start.x, start.y, osx, osy, oex, oey);
+			const t2 = this.projectOntoLine(end.x, end.y, osx, osy, oex, oey);
+			return [
+				{ x: osx + t1 * (oex - osx), y: osy + t1 * (oey - osy) },
+				{ x: osx + t2 * (oex - osx), y: osy + t2 * (oey - osy) },
+			];
+		}
+
+		// 不同侧：需要绕过端点，用切线+圆弧
+		// 尝试两个端点，选择路径更短的
+		const endpoints = [
+			{ x: sx, y: sy, awayX: -segUx, awayY: -segUy },
+			{ x: ex, y: ey, awayX: segUx, awayY: segUy },
+		];
+
+		let bestResult: Point[] | null = null;
+		let bestLen = Infinity;
+
+		for (const ep of endpoints) {
+			const result = this.computeTangentArc(start, end, ep.x, ep.y, R, direction);
+			if (!result) continue;
+
+			// 验证切线不穿过线段本身
+			const fullPath = [start, ...result, end];
+			let crossesSegment = false;
+			for (let i = 0; i < fullPath.length - 1; i++) {
+				const p1 = fullPath[i], p2 = fullPath[i + 1];
+				if (p2.arcAngle) continue; // 圆弧段单独检查
+				const dist = this.segmentToSegmentDistance(
+					p1.x, p1.y, p2.x, p2.y,
+					sx, sy, ex, ey
+				);
+				if (dist < R - 1) { crossesSegment = true; break; }
+			}
+			if (crossesSegment) continue;
+
+			const len = this.calculatePathLength(fullPath);
+			if (len < bestLen) {
+				bestLen = len;
+				bestResult = result;
+			}
+		}
+
+		return bestResult;
+	}
+
+	/**
+	 * 计算点到线段的投影参数 t (0-1)
+	 */
+	private projectOntoLine(px: number, py: number, x1: number, y1: number, x2: number, y2: number): number {
+		const dx = x2 - x1, dy = y2 - y1;
+		const len2 = dx * dx + dy * dy;
+		if (len2 === 0) return 0;
+		return Math.max(0, Math.min(1, ((px - x1) * dx + (py - y1) * dy) / len2));
+	}
+
+	/**
+	 * 通用切线+圆弧计算
+	 * 从 start 和 end 到圆 (cx, cy, R) 的外切线，切点间用圆弧连接
+	 */
+	private computeTangentArc(
+		start: Point,
+		end: Point,
+		cx: number, cy: number, R: number,
+		direction: 'left' | 'right'
+	): Point[] | null {
+		const dx1 = start.x - cx, dy1 = start.y - cy;
+		const d1 = Math.sqrt(dx1 * dx1 + dy1 * dy1);
+		const dx2 = end.x - cx, dy2 = end.y - cy;
+		const d2 = Math.sqrt(dx2 * dx2 + dy2 * dy2);
+
+		if (d1 <= R || d2 <= R) return null;
+
+		const alpha1 = Math.asin(R / d1);
+		const baseAngle1 = Math.atan2(cy - start.y, cx - start.x);
+		const alpha2 = Math.asin(R / d2);
+		const baseAngle2 = Math.atan2(cy - end.y, cx - end.x);
+
+		const sign = direction === 'left' ? -1 : 1;
+
+		// 切点 T1（起点侧）
+		const t1Angle = baseAngle1 + sign * alpha1 + Math.PI + sign * (Math.PI / 2 - alpha1);
+		const t1x = cx + R * Math.cos(t1Angle);
+		const t1y = cy + R * Math.sin(t1Angle);
+
+		// 切点 T2（终点侧）
+		const t2Angle = baseAngle2 - sign * alpha2 + Math.PI - sign * (Math.PI / 2 - alpha2);
+		const t2x = cx + R * Math.cos(t2Angle);
+		const t2y = cy + R * Math.sin(t2Angle);
+
+		// 圆弧角度
+		let arcSpan = t2Angle - t1Angle;
+		while (arcSpan > Math.PI) arcSpan -= 2 * Math.PI;
+		while (arcSpan < -Math.PI) arcSpan += 2 * Math.PI;
+		if (sign > 0 && arcSpan < 0) arcSpan += 2 * Math.PI;
+		if (sign < 0 && arcSpan > 0) arcSpan -= 2 * Math.PI;
+
+		if (Math.abs(arcSpan) > Math.PI) return null;
+
+		const distT1 = Math.sqrt((t1x - start.x) ** 2 + (t1y - start.y) ** 2);
+		const distT2 = Math.sqrt((t2x - end.x) ** 2 + (t2y - end.y) ** 2);
+		if (distT1 < 1 || distT2 < 1) return null;
+
+		return [
+			{ x: t1x, y: t1y },
+			{ x: t2x, y: t2y, arcAngle: arcSpan },
+		];
+	}
+
+	/**
+	 * 线段障碍物绕行：选择绕过更近的端点，沿垂直方向偏移
+	 */
+	private generateSegmentBypassPoints(
+		start: Point,
+		end: Point,
+		obstacle: Obstacle,
+		direction: 'left' | 'right',
+		offsetMultiplier: number = 1
+	): Point[] {
+		const margin = this.trackWidthMil / 2 + 5;
+
+		const sx = obstacle.startX!, sy = obstacle.startY!;
+		const ex = obstacle.endX!, ey = obstacle.endY!;
+
+		const segDx = ex - sx;
+		const segDy = ey - sy;
+		const segLen = Math.sqrt(segDx * segDx + segDy * segDy);
+		if (segLen < 0.001) return [];
+
+		const segUx = segDx / segLen;
+		const segUy = segDy / segLen;
+
+		const offset = (obstacle.radius + margin) * offsetMultiplier;
+
+		// "left" 绕过起点端，"right" 绕过终点端
+		let tipX: number, tipY: number, extDirX: number, extDirY: number;
+		if (direction === 'left') {
+			tipX = sx; tipY = sy;
+			extDirX = -segUx; extDirY = -segUy;
+		} else {
+			tipX = ex; tipY = ey;
+			extDirX = segUx; extDirY = segUy;
+		}
+
+		// 端点外侧的 y/x 坐标（绕行基准线）
+		const beyondX = tipX + extDirX * offset;
+		const beyondY = tipY + extDirY * offset;
+
+		// 生成两个绕行点：
+		// 点1：从起点垂直/水平移动到绕行基准线
+		// 点2：从绕行基准线移动到终点方向
+		// 这样路径不会穿过线段
+		const isVertical = Math.abs(segDx) < Math.abs(segDy);
+
+		if (isVertical) {
+			// 竖线：绕行点在端点上方或下方，保持各自的 x 坐标
+			return [
+				{ x: start.x, y: beyondY },
+				{ x: end.x, y: beyondY },
+			];
+		} else {
+			// 横线：绕行点在端点左侧或右侧，保持各自的 y 坐标
+			return [
+				{ x: beyondX, y: start.y },
+				{ x: beyondX, y: end.y },
+			];
+		}
+	}
+
+	/**
+	 * 圆形障碍物绕行（原有逻辑）
+	 */
+	private generateCircleBypassPoints(
+		start: Point,
+		end: Point,
+		obstacle: Obstacle,
 		direction: 'left' | 'right'
 	): Point[] {
-		const margin = this.clearanceMil + this.trackWidthMil / 2 + 3; // 额外 3mil 余量
+		const margin = this.trackWidthMil / 2 + 3;
 		const bypassRadius = obstacle.radius + margin;
 
 		// 计算从起点到障碍物中心的向量
@@ -310,32 +561,50 @@ export class ObstacleBypasser {
 			}
 		});
 
-		// 尝试左侧和右侧绕行
-		const mainObstacle = blocking[0]; // 使用第一个阻挡的障碍物
+		// 尝试 1: 切线+圆弧绕行（橡皮筋效果）
+		const mainObstacle = blocking[0];
+		let bestTangentPath: Point[] | null = null;
+		let bestTangentLen = Infinity;
 
-		// 尝试左侧绕行
-		console.log('[Bypass] 尝试左侧绕行...');
-		const leftPoints = this.generateBypassPoints(start, end, mainObstacle, 'left');
-		if (leftPoints.length > 0) {
-			const leftPath = [start, ...leftPoints, end];
-			if (this.isPathSafe(leftPath, obstacles, excludeNet)) {
-				console.log('[Bypass] 左侧绕行成功');
-				return leftPath;
-			} else {
-				console.log('[Bypass] 左侧绕行失败：路径不安全');
+		for (const dir of ['left', 'right'] as const) {
+			const tangentPoints = this.generateTangentBypass(start, end, mainObstacle, dir);
+			if (tangentPoints && tangentPoints.length > 0) {
+				const tangentPath = [start, ...tangentPoints, end];
+				if (this.isPathSafe(tangentPath, obstacles, excludeNet)) {
+					const len = this.calculatePathLength(tangentPath);
+					if (len < bestTangentLen) {
+						bestTangentLen = len;
+						bestTangentPath = tangentPath;
+					}
+				}
 			}
 		}
 
-		// 尝试右侧绕行
-		console.log('[Bypass] 尝试右侧绕行...');
-		const rightPoints = this.generateBypassPoints(start, end, mainObstacle, 'right');
-		if (rightPoints.length > 0) {
-			const rightPath = [start, ...rightPoints, end];
-			if (this.isPathSafe(rightPath, obstacles, excludeNet)) {
-				console.log('[Bypass] 右侧绕行成功');
-				return rightPath;
-			} else {
-				console.log('[Bypass] 右侧绕行失败：路径不安全');
+		if (bestTangentPath) {
+			console.log('[Bypass] 切线+圆弧绕行成功');
+			return bestTangentPath;
+		}
+
+		// 尝试 2: 直角绕行 + 扩展
+		for (const dir of ['left', 'right'] as const) {
+			console.log(`[Bypass] 尝试${dir === 'left' ? '左' : '右'}侧绕行...`);
+			const isSegment = mainObstacle.startX !== undefined && mainObstacle.endX !== undefined;
+			const bypassFn = isSegment
+				? () => this.generateSegmentBypassPoints(start, end, mainObstacle, dir)
+				: () => this.generateCircleBypassPoints(start, end, mainObstacle, dir);
+			const points = bypassFn();
+			if (points.length > 0) {
+				const path = [start, ...points, end];
+				if (this.isPathSafe(path, obstacles, excludeNet)) {
+					console.log(`[Bypass] ${dir === 'left' ? '左' : '右'}侧绕行成功`);
+					return path;
+				}
+				const expanded = this.expandBypassToAvoidAll(path, obstacles, excludeNet, mainObstacle, dir);
+				if (expanded && this.isPathSafe(expanded, obstacles, excludeNet)) {
+					console.log(`[Bypass] ${dir === 'left' ? '左' : '右'}侧扩展绕行成功`);
+					return expanded;
+				}
+				console.log(`[Bypass] ${dir === 'left' ? '左' : '右'}侧绕行失败：路径不安全`);
 			}
 		}
 
@@ -361,6 +630,7 @@ export class ObstacleBypasser {
 
 	/**
 	 * 检查整条路径是否安全
+	 * 支持圆弧段：对有 arcAngle 的点，采样弧上的点检查
 	 */
 	private isPathSafe(
 		path: Point[],
@@ -368,11 +638,85 @@ export class ObstacleBypasser {
 		excludeNet?: string
 	): boolean {
 		for (let i = 0; i < path.length - 1; i++) {
-			if (!this.isSegmentSafe(path[i], path[i + 1], obstacles, excludeNet)) {
+			const p1 = path[i];
+			const p2 = path[i + 1];
+
+			if (p2.arcAngle) {
+				// 圆弧段：采样弧上的点检查
+				if (!this.isArcSafe(p1, p2, p2.arcAngle, obstacles, excludeNet)) {
+					return false;
+				}
+			} else {
+				if (!this.isSegmentSafe(p1, p2, obstacles, excludeNet)) {
+					return false;
+				}
+			}
+		}
+		return true;
+	}
+
+	/**
+	 * 检查圆弧段是否安全
+	 * 将圆弧采样为多段小线段检查
+	 */
+	private isArcSafe(
+		start: Point,
+		end: Point,
+		arcAngle: number,
+		obstacles: Obstacle[],
+		excludeNet?: string
+	): boolean {
+		const samples = this.sampleArc(start, end, arcAngle, 8);
+		for (let i = 0; i < samples.length - 1; i++) {
+			if (!this.isSegmentSafe(samples[i], samples[i + 1], obstacles, excludeNet)) {
 				return false;
 			}
 		}
 		return true;
+	}
+
+	/**
+	 * 将圆弧采样为点序列
+	 */
+	private sampleArc(start: Point, end: Point, arcAngle: number, numSamples: number): Point[] {
+		// 从起点、终点和弧度角反算圆心
+		const mx = (start.x + end.x) / 2;
+		const my = (start.y + end.y) / 2;
+		const dx = end.x - start.x;
+		const dy = end.y - start.y;
+		const chordLen = Math.sqrt(dx * dx + dy * dy);
+
+		if (chordLen < 0.001 || Math.abs(arcAngle) < 0.001) {
+			return [start, end];
+		}
+
+		// 弦的中点到圆心的距离
+		const halfAngle = arcAngle / 2;
+		const R = (chordLen / 2) / Math.sin(Math.abs(halfAngle));
+		const d = R * Math.cos(Math.abs(halfAngle));
+
+		// 弦的法向量（指向圆心方向）
+		const nx = -dy / chordLen;
+		const ny = dx / chordLen;
+		const sign = arcAngle > 0 ? 1 : -1;
+
+		const cx = mx + nx * d * sign;
+		const cy = my + ny * d * sign;
+
+		// 起点角度
+		const startAngle = Math.atan2(start.y - cy, start.x - cx);
+
+		const points: Point[] = [];
+		for (let i = 0; i <= numSamples; i++) {
+			const t = i / numSamples;
+			const angle = startAngle + arcAngle * t;
+			points.push({
+				x: cx + R * Math.cos(angle),
+				y: cy + R * Math.sin(angle),
+			});
+		}
+
+		return points;
 	}
 
 	/**
@@ -431,7 +775,7 @@ export class ObstacleBypasser {
 		obstacles: Obstacle[],
 		excludeNet?: string
 	): Point[] | null {
-		const margin = this.clearanceMil + this.trackWidthMil / 2 + 5;
+		const margin = this.trackWidthMil / 2 + 5;
 
 		// 找到所有阻挡的障碍物
 		const directPath = [start, end];
@@ -503,6 +847,112 @@ export class ObstacleBypasser {
 			length += Math.sqrt(dx * dx + dy * dy);
 		}
 		return length;
+	}
+
+	/**
+	 * 扩展绕行路径以避开所有障碍物
+	 * 找到阻挡绕行路径的障碍物，计算需要的最小偏移量
+	 */
+	private expandBypassToAvoidAll(
+		path: Point[],
+		obstacles: Obstacle[],
+		excludeNet: string | undefined,
+		mainObstacle: Obstacle,
+		direction: 'left' | 'right'
+	): Point[] | null {
+		if (!(mainObstacle.startX !== undefined && mainObstacle.endX !== undefined)) return null;
+
+		const sx = mainObstacle.startX!, sy = mainObstacle.startY!;
+		const ex = mainObstacle.endX!, ey = mainObstacle.endY!;
+		const segDx = ex - sx, segDy = ey - sy;
+		const segLen = Math.sqrt(segDx * segDx + segDy * segDy);
+		if (segLen < 0.001) return null;
+
+		const segUx = segDx / segLen, segUy = segDy / segLen;
+		const isVertical = Math.abs(segDx) < Math.abs(segDy);
+		const margin = this.trackWidthMil / 2;
+
+		const start = path[0], end = path[path.length - 1];
+
+		let maxNeeded = 0;
+		for (const obs of obstacles) {
+			if (excludeNet && obs.net === excludeNet) continue;
+			for (let i = 0; i < path.length - 1; i++) {
+				if (!this.isSegmentSafe(path[i], path[i + 1], [obs])) {
+					const obsRadius = obs.radius + margin + 5;
+					if (isVertical) {
+						if (direction === 'left') {
+							const needed = (obs.y + obsRadius) - sy;
+							if (needed > maxNeeded) maxNeeded = needed;
+						} else {
+							const needed = ey - (obs.y - obsRadius);
+							if (needed > maxNeeded) maxNeeded = needed;
+						}
+					} else {
+						if (direction === 'left') {
+							const needed = (obs.x + obsRadius) - sx;
+							if (needed > maxNeeded) maxNeeded = needed;
+						} else {
+							const needed = ex - (obs.x - obsRadius);
+							if (needed > maxNeeded) maxNeeded = needed;
+						}
+					}
+				}
+			}
+		}
+
+		if (maxNeeded <= 0) return null;
+
+		// 用计算出的偏移量生成新路径
+		const offset = maxNeeded + margin + 10;
+		let tipX: number, tipY: number, extDirX: number, extDirY: number;
+		if (direction === 'left') {
+			tipX = sx; tipY = sy; extDirX = -segUx; extDirY = -segUy;
+		} else {
+			tipX = ex; tipY = ey; extDirX = segUx; extDirY = segUy;
+		}
+
+		const beyondX = tipX + extDirX * offset;
+		const beyondY = tipY + extDirY * offset;
+
+		let bypassPoints: Point[];
+		if (isVertical) {
+			bypassPoints = [{ x: start.x, y: beyondY }, { x: end.x, y: beyondY }];
+		} else {
+			bypassPoints = [{ x: beyondX, y: start.y }, { x: beyondX, y: end.y }];
+		}
+
+		const expanded = [start, ...bypassPoints, end];
+
+		// 检查扩展路径是否安全，如果不安全（可能碰到板框），尝试缩小偏移量找到安全间隙
+		if (this.isPathSafe(expanded, obstacles, excludeNet)) {
+			return expanded;
+		}
+
+		// 二分搜索安全偏移量
+		let lo = mainObstacle.radius + margin + 5;
+		let hi = offset;
+		let bestPath: Point[] | null = null;
+
+		for (let iter = 0; iter < 10; iter++) {
+			const mid = (lo + hi) / 2;
+			const bx = tipX + extDirX * mid;
+			const by = tipY + extDirY * mid;
+			let pts: Point[];
+			if (isVertical) {
+				pts = [start, { x: start.x, y: by }, { x: end.x, y: by }, end];
+			} else {
+				pts = [start, { x: bx, y: start.y }, { x: bx, y: end.y }, end];
+			}
+			if (this.isPathSafe(pts, obstacles, excludeNet)) {
+				bestPath = pts;
+				hi = mid;
+			} else {
+				lo = mid;
+			}
+		}
+
+		return bestPath;
 	}
 
 	/**

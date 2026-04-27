@@ -9,12 +9,17 @@ interface Point {
 }
 
 interface Obstacle {
+	id?: string;
 	x: number;
 	y: number;
 	radius: number; // 排斥半径 = 物体半径 + clearance
-	type: 'pad' | 'via' | 'track';
+	type: 'pad' | 'via' | 'track' | 'keepout';
 	net?: string;
 	layer?: number;
+	startX?: number;
+	startY?: number;
+	endX?: number;
+	endY?: number;
 }
 
 interface TrackSegment {

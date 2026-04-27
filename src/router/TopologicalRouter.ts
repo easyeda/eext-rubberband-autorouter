@@ -40,6 +40,12 @@ const FALLBACK_CLEARANCE_MIL = 8;
 interface DRCRules {
 	traceWidthMil: number;
 	clearanceMil: number;
+	/** Track↔Line 间距 */
+	trackToLineMil: number;
+	/** Track↔Board Outline 间距 */
+	trackToBoardMil: number;
+	/** Track↔SMD Pad 间距 */
+	trackToPadMil: number;
 }
 
 interface PadInfo {
@@ -55,10 +61,11 @@ interface PadInfo {
 	radius: number;
 }
 
-interface Point { 
-	x: number; 
-	y: number; 
+interface Point {
+	x: number;
+	y: number;
 	layer?: number;
+	arcAngle?: number;
 }
 
 interface TrackPolyline {
@@ -69,6 +76,7 @@ interface TrackPolyline {
 }
 
 interface Obstacle {
+	id?: string;
 	x: number;
 	y: number;
 	radius: number;
@@ -156,8 +164,9 @@ export class TopologicalRouter {
 	private isRouting = false;
 	private shouldCancel = false;
 	
-	// 动态障碍物（已布线的走线）
+	// 动态障碍物（静态 + 已布线的走线）
 	private dynamicObstacles: Obstacle[] = [];
+	private obstacleIdCounter = 0;
 	
 	// 错误处理器
 	private errorHandler: ErrorHandler;
@@ -223,29 +232,48 @@ export class TopologicalRouter {
 			const config = await eda.pcb_Drc.getCurrentRuleConfiguration();
 			const cfg = (config as any)?.config;
 
-			// 读取 Track↔Pad 间距
+			// 读取间距矩阵
 			const spacing = cfg?.Spacing?.['Safe Spacing'];
 			let clearanceMm = 0.2;
+			let trackToLineMm = 0.15;
+			let trackToBoardMm = 0.3;
+			let trackToPadMm = 0.15;
 
 			if (spacing) {
-				const tableKey = Object.keys(spacing)[0];
+				const tableKey = Object.keys(spacing).find(k => spacing[k].isSetDefault) ?? Object.keys(spacing)[0];
 				const tbl = spacing[tableKey];
 				const content: number[][] = tbl?.tables?.['1']?.content ?? [];
 				const cols: string[] = tbl?.column ?? [];
 				const rows: string[] = tbl?.row ?? [];
 
 				const trackColIdx = cols.indexOf('Track');
-				const clearVals: number[] = [];
 
-				for (const padType of ['SMD Pad', 'TH Pad', 'Via']) {
-					const rowIdx = rows.indexOf(padType);
-					const val = content[rowIdx]?.[trackColIdx];
-					if (typeof val === 'number' && val > 0) clearVals.push(val);
-				}
+				// 读取各类型与 Track 的间距（矩阵是下三角，row[i][trackColIdx]）
+				const readSpacing = (rowName: string): number | null => {
+					const rowIdx = rows.indexOf(rowName);
+					if (rowIdx < 0) return null;
+					const val = content[rowIdx]?.[Math.min(trackColIdx, content[rowIdx]?.length - 1)];
+					return typeof val === 'number' && val > 0 ? val : null;
+				};
 
-				if (clearVals.length > 0) {
-					clearanceMm = Math.max(...clearVals);
-				}
+				// Track↔Track
+				const trackTrack = readSpacing('Track');
+				if (trackTrack) clearanceMm = trackTrack;
+
+				// Track↔Pad（取最大值）
+				const padVals = ['SMD Pad', 'TH Pad', 'Via'].map(readSpacing).filter((v): v is number => v !== null);
+				if (padVals.length > 0) trackToPadMm = Math.max(...padVals);
+
+				// Track↔Line
+				const lineVal = readSpacing('Line');
+				if (lineVal) trackToLineMm = lineVal;
+
+				// Track↔Board Outline
+				const boardVal = readSpacing('Board Outline');
+				if (boardVal) trackToBoardMm = boardVal;
+
+				// clearanceMil 取所有间距的最大值作为通用回退
+				clearanceMm = Math.max(clearanceMm, trackToPadMm);
 			}
 
 			// 读取默认走线宽度
@@ -262,28 +290,38 @@ export class TopologicalRouter {
 
 			const clearanceMil = clearanceMm * MM_TO_MIL;
 			const traceWidthMil = traceWidthMm * MM_TO_MIL;
+			const trackToLineMil = trackToLineMm * MM_TO_MIL;
+			const trackToBoardMil = trackToBoardMm * MM_TO_MIL;
+			const trackToPadMil = trackToPadMm * MM_TO_MIL;
 
 			this.onLog?.(
-				`DRC 规则：间距 ${clearanceMm.toFixed(3)}mm (${clearanceMil.toFixed(1)}mil)` +
-				`，走线宽度 ${traceWidthMm.toFixed(3)}mm (${traceWidthMil.toFixed(1)}mil)`,
+				`DRC 规则：Track间距 ${clearanceMm.toFixed(3)}mm，Line间距 ${trackToLineMm.toFixed(3)}mm` +
+				`，板框间距 ${trackToBoardMm.toFixed(3)}mm，走线宽度 ${traceWidthMm.toFixed(3)}mm`,
 				'info',
 			);
 
-			return { clearanceMil, traceWidthMil };
+			return { clearanceMil, traceWidthMil, trackToLineMil, trackToBoardMil, trackToPadMil };
 		} catch (err) {
 			console.warn('[TopologicalRouter] 获取 DRC 规则失败，使用默认值:', err);
-			this.onLog?.(`读取 DRC 规则失败，使用默认值（间距 ${FALLBACK_CLEARANCE_MIL}mil，宽度 ${FALLBACK_TRACE_WIDTH_MIL}mil）`, 'warn');
-			return { clearanceMil: FALLBACK_CLEARANCE_MIL, traceWidthMil: FALLBACK_TRACE_WIDTH_MIL };
+			this.onLog?.(`读取 DRC 规则失败，使用默认值`, 'warn');
+			return {
+				clearanceMil: FALLBACK_CLEARANCE_MIL,
+				traceWidthMil: FALLBACK_TRACE_WIDTH_MIL,
+				trackToLineMil: FALLBACK_CLEARANCE_MIL,
+				trackToBoardMil: 12,
+				trackToPadMil: FALLBACK_CLEARANCE_MIL,
+			};
 		}
 	}
 
-	// ── 1. 收集所有网络的焊盘（增强版）────────────
+	// ── 1. 收集所有障碍物（焊盘 + 铜层图元）────────────
 
-	private async collectPads(clearanceMil: number): Promise<{
+	private async collectObstacles(drcRulesInput: DRCRules): Promise<{
 		padMap: Map<string, PadInfo[]>;
 		allPads: PadInfo[];
 		obstacles: Obstacle[];
 	}> {
+		const clearanceMil = drcRulesInput.clearanceMil;
 		const allNets = await eda.pcb_Net.getAllNetsName();
 		if (!allNets || allNets.length === 0) {
 			throw new Error('未找到任何网络，请确保 PCB 包含网络连接');
@@ -344,7 +382,7 @@ export class TopologicalRouter {
 					}
 
 					const padRadius = Math.max(wMil / 2, hMil / 2, holeMil / 2);
-					const exclusion = (padRadius > 0 ? padRadius : 40) + clearanceMil;
+					const exclusion = (padRadius > 0 ? padRadius : 40) + drcRulesInput.trackToPadMil;
 
 					console.log(`[TopologicalRouter] 焊盘：(${x},${y}), 尺寸：${wMil}x${hMil}mil, 孔径：${holeMil}mil, 类型：${padType}`);
 
@@ -362,6 +400,7 @@ export class TopologicalRouter {
 					// 添加为障碍物（用于后续布线）
 					const obsType: Obstacle['type'] = padType === 'via' ? 'via' : 'pad';
 					obstacles.push({
+						id: `pad_${netName}_${allPads.length}`,
 						x, y, radius: exclusion, layer, type: obsType, net: netName
 					});
 				}
@@ -380,8 +419,270 @@ export class TopologicalRouter {
 		}
 
 		console.log(`[TopologicalRouter] 总计：${allPads.length} 个焊盘，${padMap.size} 个可布线网络`);
-		
+
+		// 收集铜层图元障碍物（线条、折线、填充、独立焊盘、板框）
+		const collectedPadIds = new Set(allPads.map(p => p.id));
+		await this.collectCopperLayerObstacles(obstacles, drcRulesInput, collectedPadIds);
+
 		return { padMap, allPads, obstacles };
+	}
+
+	/**
+	 * 收集铜层上所有图元作为障碍物
+	 * 包括：Polyline、Line（含有网络的）、Fill、独立焊盘、板框
+	 */
+	private async collectCopperLayerObstacles(obstacles: Obstacle[], drc: DRCRules, collectedPadIds: Set<string>): Promise<void> {
+		try {
+			let added = 0;
+			// radius 策略：物理半宽 + DRC间距（不含走线半宽，由碰撞检测器统一加）
+
+			// 1. 收集所有铜层 Polyline
+			const polylines = await eda.pcb_PrimitivePolyline.getAll();
+			for (const pl of polylines) {
+				const p = pl as any;
+				const layer: number = p.layerId ?? p.layer ?? 1;
+				if (layer !== 1 && layer !== 2 && layer !== 12) continue;
+
+				const lineWidthMil = (p.lineWidth ?? 10);
+				const radius = lineWidthMil / 2 + drc.trackToLineMil;
+				const net: string = p.net ?? '';
+
+				const segments = this.parsePolylineSegments(p.polygon?.polygon ?? p.polygon ?? []);
+				for (const seg of segments) {
+					obstacles.push({
+						id: `polyline_${added}`,
+						x: (seg.startX + seg.endX) / 2,
+						y: (seg.startY + seg.endY) / 2,
+						radius,
+						layer,
+						type: 'keepout',
+						net: net || undefined,
+						startX: seg.startX, startY: seg.startY,
+						endX: seg.endX, endY: seg.endY,
+					});
+					added++;
+				}
+			}
+
+			// 2. 收集所有铜层 Line
+			const lines = await eda.pcb_PrimitiveLine.getAll();
+			for (const line of lines) {
+				const l = line as any;
+				const net: string = l.net ?? '';
+				const layer: number = l.layerId ?? l.layer ?? 1;
+				if (layer !== 1 && layer !== 2 && layer !== 12) continue;
+
+				const lineWidthMil = l.lineWidth ?? 10;
+				const spacing = net ? drc.clearanceMil : drc.trackToLineMil;
+				const radius = lineWidthMil / 2 + spacing;
+				const startX = l.startX ?? 0;
+				const startY = l.startY ?? 0;
+				const endX = l.endX ?? 0;
+				const endY = l.endY ?? 0;
+
+				obstacles.push({
+					id: `line_${added}`,
+					x: (startX + endX) / 2,
+					y: (startY + endY) / 2,
+					radius,
+					layer,
+					type: net ? 'track' : 'keepout',
+					net: net || undefined,
+					startX, startY, endX, endY,
+				});
+				added++;
+			}
+
+			// 3. 收集铜层 Fill
+			const fills = await eda.pcb_PrimitiveFill.getAll();
+			for (const fill of fills) {
+				const f = fill as any;
+				const layer: number = f.layerId ?? f.layer ?? 1;
+				if (layer !== 1 && layer !== 2 && layer !== 12) continue;
+
+				const lineWidthMil = f.lineWidth ?? 0;
+				const radius = lineWidthMil / 2 + drc.clearanceMil;
+				const net: string = f.net ?? '';
+
+				const polygon = f.complexPolygon ?? f.polygon ?? [];
+				const segments = this.parseFillEdges(polygon);
+				for (const seg of segments) {
+					obstacles.push({
+						id: `fill_${added}`,
+						x: (seg.startX + seg.endX) / 2,
+						y: (seg.startY + seg.endY) / 2,
+						radius,
+						layer,
+						type: 'keepout',
+						net: net || undefined,
+						startX: seg.startX, startY: seg.startY,
+						endX: seg.endX, endY: seg.endY,
+					});
+					added++;
+				}
+			}
+
+			// 4. 收集独立焊盘（跳过已通过网络收集的元件焊盘）
+			const allPadsFromApi = await eda.pcb_PrimitivePad.getAll();
+			for (const sp of allPadsFromApi) {
+				const p = sp as any;
+				const padId = p.primitiveId || p.globalIndex || '';
+				if (collectedPadIds.has(padId)) continue;
+
+				const layer: number = p.layerId ?? p.layer ?? 1;
+				if (layer !== 1 && layer !== 2 && layer !== 12) continue;
+
+				const x = p.x ?? p.center?.x ?? 0;
+				const y = p.y ?? p.center?.y ?? 0;
+				const net: string = p.net ?? '';
+
+				// 解析焊盘尺寸：pad 格式 ["RECT", w, h, r] 或 ["ELLIPSE", w, h]
+				const padShape = p.pad ?? [];
+				let padW = 0, padH = 0;
+				if (Array.isArray(padShape) && padShape.length >= 3) {
+					padW = padShape[1] ?? 0;
+					padH = padShape[2] ?? 0;
+				}
+				// 孔径
+				const hole = p.hole ?? [];
+				const holeDia = Array.isArray(hole) && hole.length >= 2 ? hole[1] ?? 0 : 0;
+
+				const padRadius = Math.max(padW / 2, padH / 2, holeDia / 2, 10);
+				const exclusion = padRadius + drc.trackToPadMil;
+
+				obstacles.push({
+					id: `spad_${added}`,
+					x, y,
+					radius: exclusion,
+					layer,
+					type: 'pad',
+					net: net || undefined,
+				});
+				added++;
+			}
+
+			// 5. 收集板框（Board Outline，layer 11）
+			const allPolylines = await eda.pcb_PrimitivePolyline.getAll();
+			for (const pl of allPolylines) {
+				const p = pl as any;
+				const layer: number = p.layerId ?? p.layer ?? 1;
+				if (layer !== 11) continue;
+
+				const lineWidthMil = (p.lineWidth ?? 10);
+				const radius = lineWidthMil / 2 + drc.trackToBoardMil;
+
+				const rawPolygon = p.polygon?.polygon ?? p.polygon ?? [];
+				const segments = this.parseBoardOutlineSegments(rawPolygon);
+				for (const seg of segments) {
+					obstacles.push({
+						id: `board_${added}`,
+						x: (seg.startX + seg.endX) / 2,
+						y: (seg.startY + seg.endY) / 2,
+						radius,
+						layer: 12,
+						type: 'keepout',
+						startX: seg.startX, startY: seg.startY,
+						endX: seg.endX, endY: seg.endY,
+					});
+					added++;
+				}
+			}
+
+			if (added > 0) {
+				this.onLog?.(`收集到 ${added} 个障碍物（线条/折线/填充/焊盘/板框）`, 'info');
+			}
+		} catch (err) {
+			console.warn('[TopologicalRouter] 收集铜层障碍物失败:', err);
+		}
+	}
+
+	/**
+	 * 解析 Polyline 的 polygon 数据为线段列表
+	 * polygon 格式: [x1, y1, "L", x2, y2, "L", x3, y3, ...]
+	 */
+	private parsePolylineSegments(polygon: any[]): Array<{ startX: number; startY: number; endX: number; endY: number }> {
+		const segments: Array<{ startX: number; startY: number; endX: number; endY: number }> = [];
+		if (!polygon || polygon.length < 4) return segments;
+
+		let curX = typeof polygon[0] === 'number' ? polygon[0] : 0;
+		let curY = typeof polygon[1] === 'number' ? polygon[1] : 0;
+		let i = 2;
+
+		while (i < polygon.length) {
+			if (typeof polygon[i] === 'string') {
+				i++;
+				continue;
+			}
+
+			if (typeof polygon[i] === 'number' && typeof polygon[i + 1] === 'number') {
+				const nextX = polygon[i];
+				const nextY = polygon[i + 1];
+				segments.push({ startX: curX, startY: curY, endX: nextX, endY: nextY });
+				curX = nextX;
+				curY = nextY;
+				i += 2;
+			} else {
+				i++;
+			}
+		}
+
+		return segments;
+	}
+
+	/**
+	 * 解析板框 polygon 数据为线段
+	 * 支持 "R" 矩形格式: ["R", x, y, w, h, rx, ry] → 4条边
+	 * 以及 "L" 折线格式
+	 */
+	private parseBoardOutlineSegments(polygon: any[]): Array<{ startX: number; startY: number; endX: number; endY: number }> {
+		if (!polygon || polygon.length < 3) return [];
+
+		// "R" 矩形格式: ["R", x, y, w, h, rx, ry]
+		if (polygon[0] === 'R' && polygon.length >= 5) {
+			const x = polygon[1] as number;
+			const y = polygon[2] as number;
+			const w = polygon[3] as number;
+			const h = polygon[4] as number;
+			// 矩形从 (x, y-h) 到 (x+w, y)
+			const x1 = x, y1 = y - h;
+			const x2 = x + w, y2 = y;
+			return [
+				{ startX: x1, startY: y1, endX: x2, endY: y1 }, // 上边
+				{ startX: x2, startY: y1, endX: x2, endY: y2 }, // 右边
+				{ startX: x2, startY: y2, endX: x1, endY: y2 }, // 下边
+				{ startX: x1, startY: y2, endX: x1, endY: y1 }, // 左边
+			];
+		}
+
+		// 其他格式回退到折线解析
+		return this.parsePolylineSegments(polygon);
+	}
+
+	/**
+	 * 解析 Fill 的 complexPolygon 为边线段
+	 * 复用 parsePolylineSegments 逻辑，额外处理闭合环
+	 */
+	private parseFillEdges(complexPolygon: any): Array<{ startX: number; startY: number; endX: number; endY: number }> {
+		const segments: Array<{ startX: number; startY: number; endX: number; endY: number }> = [];
+		if (!complexPolygon) return segments;
+
+		const rings = Array.isArray(complexPolygon?.[0]) ? complexPolygon : [complexPolygon];
+
+		for (const ring of rings) {
+			if (!ring || ring.length < 4) continue;
+
+			const ringSegments = this.parsePolylineSegments(ring);
+			if (ringSegments.length > 0) {
+				segments.push(...ringSegments);
+				const first = ringSegments[0];
+				const last = ringSegments[ringSegments.length - 1];
+				if (Math.abs(last.endX - first.startX) > 0.01 || Math.abs(last.endY - first.startY) > 0.01) {
+					segments.push({ startX: last.endX, startY: last.endY, endX: first.startX, endY: first.startY });
+				}
+			}
+		}
+
+		return segments;
 	}
 
 	// ── 2. Delaunay 三角剖分建邻接图 ───────────────
@@ -633,58 +934,112 @@ export class TopologicalRouter {
 
 	private optimizePath(points: Point[]): Point[] {
 		if (points.length <= 2) return points;
-		
+
 		const optimized: Point[] = [points[0]];
 		let current = 0;
-		
+
 		while (current < points.length - 1) {
-			// 尝试跳过中间点，直接连接到更远的点
+			const next = points[current + 1];
+
+			// 保留圆弧点，不跳过
+			if (next.arcAngle) {
+				optimized.push(next);
+				current++;
+				continue;
+			}
+
+			// 不跳过圆弧点之后的点
 			let furthest = current + 1;
-			
+
 			for (let j = current + 2; j < points.length; j++) {
-				// 检查从 current 到 j 的线段是否与任何障碍物相交
+				// 不跳过带圆弧的点
+				if (points[j].arcAngle) break;
+				// 不跳过圆弧点前面的点
+				if (j + 1 < points.length && points[j + 1].arcAngle) break;
+
 				if (this.isLineClear(points[current], points[j], current === 0 || j === points.length - 1)) {
 					furthest = j;
 				} else {
 					break;
 				}
 			}
-			
+
 			if (furthest > current + 1) {
-				// 可以跳过中间点
 				optimized.push(points[furthest]);
 				current = furthest;
 			} else {
-				// 不能跳过，添加下一个点
 				optimized.push(points[current + 1]);
 				current++;
 			}
 		}
-		
+
 		return optimized;
 	}
 
 	private isLineClear(p1: Point, p2: Point, allowTouchEndpoints: boolean): boolean {
 		const obstacles = this.dynamicObstacles;
-		const minGap = 5; // 最小间隙 mils
-		
+		const minGap = 5;
+
 		for (const obs of obstacles) {
-			// 计算点到线段的最短距离
-			const dist = this.pointToSegmentDistance(obs.x, obs.y, p1.x, p1.y, p2.x, p2.y);
-			
+			let dist: number;
+
+			if (obs.startX !== undefined && obs.startY !== undefined &&
+				obs.endX !== undefined && obs.endY !== undefined) {
+				dist = this.segToSegDistance(
+					p1.x, p1.y, p2.x, p2.y,
+					obs.startX, obs.startY, obs.endX, obs.endY
+				);
+			} else {
+				dist = this.pointToSegmentDistance(obs.x, obs.y, p1.x, p1.y, p2.x, p2.y);
+			}
+
 			if (allowTouchEndpoints) {
-				// 允许接触端点
 				const distToP1 = Math.sqrt((obs.x - p1.x) ** 2 + (obs.y - p1.y) ** 2);
 				const distToP2 = Math.sqrt((obs.x - p2.x) ** 2 + (obs.y - p2.y) ** 2);
 				if (distToP1 < obs.radius || distToP2 < obs.radius) continue;
 			}
-			
+
 			if (dist < obs.radius + minGap) {
 				return false;
 			}
 		}
-		
+
 		return true;
+	}
+
+	private segToSegDistance(
+		x1: number, y1: number, x2: number, y2: number,
+		x3: number, y3: number, x4: number, y4: number
+	): number {
+		if (this.segsIntersect(x1, y1, x2, y2, x3, y3, x4, y4)) return 0;
+		return Math.min(
+			this.pointToSegmentDistance(x1, y1, x3, y3, x4, y4),
+			this.pointToSegmentDistance(x2, y2, x3, y3, x4, y4),
+			this.pointToSegmentDistance(x3, y3, x1, y1, x2, y2),
+			this.pointToSegmentDistance(x4, y4, x1, y1, x2, y2),
+		);
+	}
+
+	private segsIntersect(
+		x1: number, y1: number, x2: number, y2: number,
+		x3: number, y3: number, x4: number, y4: number
+	): boolean {
+		const ccw = (ax: number, ay: number, bx: number, by: number, cx: number, cy: number) =>
+			(cy - ay) * (bx - ax) - (by - ay) * (cx - ax);
+		const d1 = ccw(x3, y3, x4, y4, x1, y1);
+		const d2 = ccw(x3, y3, x4, y4, x2, y2);
+		const d3 = ccw(x1, y1, x2, y2, x3, y3);
+		const d4 = ccw(x1, y1, x2, y2, x4, y4);
+		if (((d1 > 0 && d2 < 0) || (d1 < 0 && d2 > 0)) &&
+			((d3 > 0 && d4 < 0) || (d3 < 0 && d4 > 0))) return true;
+		const on = (ax: number, ay: number, bx: number, by: number, cx: number, cy: number) =>
+			Math.min(ax, cx) <= bx && bx <= Math.max(ax, cx) &&
+			Math.min(ay, cy) <= by && by <= Math.max(ay, cy);
+		if (d1 === 0 && on(x3, y3, x1, y1, x4, y4)) return true;
+		if (d2 === 0 && on(x3, y3, x2, y2, x4, y4)) return true;
+		if (d3 === 0 && on(x1, y1, x3, y3, x2, y2)) return true;
+		if (d4 === 0 && on(x1, y1, x4, y4, x2, y2)) return true;
+		return false;
 	}
 
 	private pointToSegmentDistance(
@@ -706,6 +1061,21 @@ export class TopologicalRouter {
 		const projY = y1 + t * dy;
 		
 		return Math.sqrt((px - projX) ** 2 + (py - projY) ** 2);
+	}
+
+	private addDynamicObstacle(obstacle: Omit<Obstacle, 'id'>): string {
+		const id = `dyn_${++this.obstacleIdCounter}`;
+		this.dynamicObstacles.push({ ...obstacle, id });
+		return id;
+	}
+
+	private removeDynamicObstacle(id: string): boolean {
+		const idx = this.dynamicObstacles.findIndex(o => o.id === id);
+		if (idx !== -1) {
+			this.dynamicObstacles.splice(idx, 1);
+			return true;
+		}
+		return false;
 	}
 
 	// ── 7. 创建过孔（增强功能）──────
@@ -739,17 +1109,20 @@ export class TopologicalRouter {
 		this.isRouting = true;
 		this.shouldCancel = false;
 		this.dynamicObstacles = [];
+		this.obstacleIdCounter = 0;
 		this.errorHandler.clearErrorLog();
 		this.onStatus?.('connected');
 
 		try {
 			// Step 0: 读取 DRC 规则（带重试）
 			this.onProgress?.({ stage: '读取规则', percentage: 3, message: '正在读取 DRC 间距规则...' });
-			const { clearanceMil, traceWidthMil } = await this.errorHandler.withRetry(
+			const { clearanceMil, traceWidthMil, trackToLineMil, trackToBoardMil, trackToPadMil } = await this.errorHandler.withRetry(
 				() => this.fetchDRCRules(),
 				ErrorType.DRC_ERROR,
 				{ stage: 'fetchDRCRules' }
 			);
+
+			const drcRules = { clearanceMil, traceWidthMil, trackToLineMil, trackToBoardMil, trackToPadMil };
 
 			// 初始化 DRC 检查器和绕行器
 			this.drcChecker = new DRCChecker(clearanceMil, traceWidthMil);
@@ -761,11 +1134,14 @@ export class TopologicalRouter {
 			// Step 1: 收集焊盘（带重试）
 			this.onProgress?.({ stage: '解析 PCB', percentage: 8, message: '正在获取 PCB 数据...' });
 			const { padMap, allPads, obstacles } = await this.errorHandler.withRetry(
-				() => this.collectPads(clearanceMil),
+				() => this.collectObstacles(drcRules),
 				ErrorType.PCB_API_ERROR,
-				{ stage: 'collectPads' }
+				{ stage: 'collectObstacles' }
 			);
 			if (padMap.size === 0) throw new Error('没有可布线的网络');
+
+			// 将静态障碍物（焊盘 + 无网络线条）注入动态障碍物列表
+			this.dynamicObstacles.push(...obstacles);
 
 			// Step 2: 建图
 			this.onProgress?.({ stage: '建图', percentage: 22, message: '正在构建 Delaunay 拓扑图...' });
@@ -929,8 +1305,8 @@ export class TopologicalRouter {
 					}
 
 					if (points.length >= 2) {
-						// 优化路径 - 使用 PathOptimizer
-						const optimizedPoints = this.pathOptimizer.optimize(points);
+						// 优化路径 - 使用障碍物感知的优化（不使用 PathOptimizer，它不知道外部障碍物）
+						const optimizedPoints = this.optimizePath(points);
 
 						console.log(`[TopologicalRouter] 网络 ${netName}: 优化后路径点数=${optimizedPoints.length}`);
 						optimizedPoints.forEach((p, i) => {
@@ -1004,20 +1380,33 @@ export class TopologicalRouter {
 						const p2 = pl.points[i + 1];
 
 						const lineLayer = p1.layer ?? pl.layer;
-						console.log(`[TopologicalRouter] 写入导线: net=${pl.net}, layer=${lineLayer}, (${p1.x.toFixed(1)},${p1.y.toFixed(1)}) -> (${p2.x.toFixed(1)},${p2.y.toFixed(1)})`);
+						console.log(`[TopologicalRouter] 写入导线: net=${pl.net}, layer=${lineLayer}, (${p1.x.toFixed(1)},${p1.y.toFixed(1)}) -> (${p2.x.toFixed(1)},${p2.y.toFixed(1)})${p2.arcAngle ? ` arc=${(p2.arcAngle * 180 / Math.PI).toFixed(1)}°` : ''}`);
 
-						await eda.pcb_PrimitiveLine.create(
-							pl.net,
-							lineLayer,
-							p1.x, p1.y,
-							p2.x, p2.y,
-							pl.width, false
-						);
+						if (p2.arcAngle) {
+							// 圆弧段
+							await eda.pcb_PrimitiveArc.create(
+								pl.net,
+								lineLayer,
+								p1.x, p1.y,
+								p2.x, p2.y,
+								p2.arcAngle,
+								pl.width
+							);
+						} else {
+							// 直线段
+							await eda.pcb_PrimitiveLine.create(
+								pl.net,
+								lineLayer,
+								p1.x, p1.y,
+								p2.x, p2.y,
+								pl.width, false
+							);
+						}
 						created++;
 
 						// 添加为动态障碍物（用于后续布线）- 使用线段模型
-						this.dynamicObstacles.push({
-							x: (p1.x + p2.x) / 2, // 中点（用于兼容）
+						this.addDynamicObstacle({
+							x: (p1.x + p2.x) / 2,
 							y: (p1.y + p2.y) / 2,
 							radius: pl.width / 2 + clearanceMil,
 							layer: p1.layer ?? pl.layer,
