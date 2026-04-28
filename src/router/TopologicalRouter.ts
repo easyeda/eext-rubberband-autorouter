@@ -73,6 +73,8 @@ interface TrackPolyline {
 	points: Point[];
 	layer: number;
 	width: number;
+	src?: PadInfo;
+	dst?: PadInfo;
 }
 
 interface Obstacle {
@@ -349,12 +351,11 @@ export class TopologicalRouter {
 				for (const prim of primitives) {
 					const p = prim as any;
 
-					// 调试：打印基元信息
-					console.log(`[TopologicalRouter] 基元类型:`, p.type || 'unknown', '属性:', Object.keys(p));
-
-					// 尝试多种可能的坐标属性
+					// 只处理焊盘类型（type=1），跳过走线、圆弧等其他基元
+					if (p.type !== undefined && p.type !== 1) continue;
 					const x: number = p.center?.x ?? p.x ?? p.startX ?? 0;
 					const y: number = p.center?.y ?? p.y ?? p.startY ?? 0;
+					if (x === 0 && y === 0 && !p.center) continue;
 					const id: string = p.globalIndex || p.uuid || `${netName}_${allPads.length}`;
 
 					// 焊盘尺寸（mm 转 mil）- 尝试多种可能的属性名
@@ -1063,6 +1064,208 @@ export class TopologicalRouter {
 		return Math.sqrt((px - projX) ** 2 + (py - projY) ** 2);
 	}
 
+	// ── RBR 风格切线+圆弧渲染 ──────
+
+	/**
+	 * 计算两个圆之间的外切线（移植自 RBR getTangents）
+	 * 返回 [切线起点x, 切线起点y, 切线终点x, 切线终点y]
+	 */
+	private calcTangent(
+		x1: number, y1: number, r1: number, l1: boolean,
+		x2: number, y2: number, r2: number, l2: boolean
+	): [number, number, number, number] {
+		const d = Math.hypot(x1 - x2, y1 - y2);
+		if (d < 0.001) return [x1, y1, x2, y2];
+		const vx = (x2 - x1) / d;
+		const vy = (y2 - y1) / d;
+		const adjR2 = r2 * (l1 === l2 ? 1 : -1);
+		const c = (r1 - adjR2) / d;
+		let h = 1 - c * c;
+		h = Math.sqrt(Math.max(0, h)) * (l1 ? -1 : 1);
+		const nx = vx * c - h * vy;
+		const ny = vy * c + h * vx;
+		return [x1 + r1 * nx, y1 + r1 * ny, x2 + adjR2 * nx, y2 + adjR2 * ny];
+	}
+
+	/**
+	 * 用切线+圆弧渲染路径（RBR drawRoutes 风格）
+	 * nodes: 路径经过的节点序列（起点焊盘 → 障碍物 → ... → 终点焊盘）
+	 */
+	private async renderPathWithTangents(
+		nodes: Array<{ x: number; y: number; radius: number; rgt: boolean }>,
+		net: string,
+		layer: number,
+		traceWidth: number,
+		clearanceMil: number,
+	): Promise<number> {
+		if (nodes.length < 2) return 0;
+
+		let created = 0;
+		let lastTx = 0, lastTy = 0;
+		let prevRadius = 0;
+
+		for (let i = 1; i < nodes.length; i++) {
+			const prev = nodes[i - 1];
+			const cur = nodes[i];
+
+			const [tx1, ty1, tx2, ty2] = this.calcTangent(
+				prev.x, prev.y, prevRadius, prev.rgt,
+				cur.x, cur.y, cur.radius, cur.rgt
+			);
+
+			// 在 prev 处画圆弧（连接上一段切线终点到这段切线起点）
+			if (i > 1 && prevRadius > 0) {
+				const arcAngle = this.calcArcAngle(
+					prev.x, prev.y, lastTx, lastTy, tx1, ty1, prev.rgt
+				);
+				if (Math.abs(arcAngle) > 0.01) {
+					console.log(`[Render] 圆弧: (${lastTx.toFixed(1)},${lastTy.toFixed(1)}) -> (${tx1.toFixed(1)},${ty1.toFixed(1)}) angle=${(arcAngle * 180 / Math.PI).toFixed(1)}°`);
+					await eda.pcb_PrimitiveArc.create(
+						net, layer, lastTx, lastTy, tx1, ty1, arcAngle, traceWidth
+					);
+					created++;
+				}
+			}
+
+			// 画切线直线段
+			const lineLen = Math.hypot(tx2 - tx1, ty2 - ty1);
+			if (lineLen > 0.5) {
+				console.log(`[Render] 直线: (${tx1.toFixed(1)},${ty1.toFixed(1)}) -> (${tx2.toFixed(1)},${ty2.toFixed(1)})`);
+				await eda.pcb_PrimitiveLine.create(
+					net, layer, tx1, ty1, tx2, ty2, traceWidth, false
+				);
+				created++;
+
+				this.addDynamicObstacle({
+					x: (tx1 + tx2) / 2, y: (ty1 + ty2) / 2,
+					radius: traceWidth / 2 + clearanceMil,
+					layer, type: 'track', net,
+					startX: tx1, startY: ty1, endX: tx2, endY: ty2,
+				});
+			}
+
+			lastTx = tx2;
+			lastTy = ty2;
+			prevRadius = cur.radius;
+		}
+
+		return created;
+	}
+
+	/**
+	 * 计算圆弧角度：从 (fromX,fromY) 到 (toX,toY) 绕圆心 (cx,cy)
+	 */
+	private calcArcAngle(
+		cx: number, cy: number,
+		fromX: number, fromY: number,
+		toX: number, toY: number,
+		rgt: boolean
+	): number {
+		const a1 = Math.atan2(fromY - cy, fromX - cx);
+		const a2 = Math.atan2(toY - cy, toX - cx);
+		let angle = a2 - a1;
+		while (angle > Math.PI) angle -= 2 * Math.PI;
+		while (angle < -Math.PI) angle += 2 * Math.PI;
+		// 始终选择短弧（绝对值 <= PI）
+		return angle;
+	}
+
+	/**
+	 * 从绕行路径构建 PathNode 序列
+	 * 找到路径经过的障碍物，确定绕行侧
+	 */
+	private buildPathNodes(
+		points: Point[],
+		src: PadInfo,
+		dst: PadInfo,
+		obstacles: Obstacle[],
+		traceWidthMil: number,
+	): Array<{ x: number; y: number; radius: number; rgt: boolean }> {
+		const margin = traceWidthMil / 2;
+		const nodes: Array<{ x: number; y: number; radius: number; rgt: boolean }> = [];
+
+		// 起点焊盘
+		nodes.push({ x: src.x, y: src.y, radius: 0, rgt: false });
+
+		// 检查起点到终点的直连路径，找到阻挡的障碍物
+		for (const obs of obstacles) {
+			if (obs.net === src.net) continue;
+			if (obs.type === 'track') continue;
+
+			let obsCx: number, obsCy: number, obsR: number;
+
+			if (obs.startX !== undefined && obs.endX !== undefined) {
+				// 线段障碍物
+				const dist = this.segToSegDistance(
+					src.x, src.y, dst.x, dst.y,
+					obs.startX!, obs.startY!, obs.endX!, obs.endY!
+				);
+				if (dist >= obs.radius + margin) continue;
+				// 选择更近的端点
+				const midX = (src.x + dst.x) / 2, midY = (src.y + dst.y) / 2;
+				const sx = obs.startX!, sy = obs.startY!;
+				const ex = obs.endX!, ey = obs.endY!;
+				if (Math.hypot(midX - sx, midY - sy) < Math.hypot(midX - ex, midY - ey)) {
+					obsCx = sx; obsCy = sy;
+				} else {
+					obsCx = ex; obsCy = ey;
+				}
+				// 有效半径 = 端点到路径交叉点的距离 + 物理半径
+				const otherX = obsCx === sx ? ex : sx;
+				const otherY = obsCy === sy ? ey : sy;
+				const segDx2 = otherX - obsCx, segDy2 = otherY - obsCy;
+				const pathDx = dst.x - src.x, pathDy = dst.y - src.y;
+				const denom = pathDx * segDy2 - pathDy * segDx2;
+				let crossDist = 0;
+				if (Math.abs(denom) > 0.001) {
+					const t = ((obsCx - src.x) * segDy2 - (obsCy - src.y) * segDx2) / denom;
+					const crossX = src.x + t * pathDx;
+					const crossY = src.y + t * pathDy;
+					crossDist = Math.hypot(crossX - obsCx, crossY - obsCy);
+					crossDist = Math.min(crossDist, Math.hypot(otherX - obsCx, otherY - obsCy));
+				}
+					obsR = crossDist + obs.radius + margin;
+			} else {
+				// 圆形障碍物
+				const dist = this.pointToSegmentDistance(obs.x, obs.y, src.x, src.y, dst.x, dst.y);
+				if (dist >= obs.radius + margin) continue;
+				obsCx = obs.x; obsCy = obs.y;
+				obsR = obs.radius + margin;
+			}
+
+			// 避免重复
+			if (nodes.some(n => Math.hypot(n.x - obsCx, n.y - obsCy) < obsR * 0.5)) continue;
+
+			// 用绕行路径的中间点判断从哪一侧通过
+			let rgt = false;
+			if (points.length > 2) {
+				const mid = points[Math.floor(points.length / 2)];
+				const cross = (dst.x - src.x) * (obsCy - src.y) - (dst.y - src.y) * (obsCx - src.x);
+				const midCross = (dst.x - src.x) * (mid.y - src.y) - (dst.y - src.y) * (mid.x - src.x);
+				// 路径中点和障碍物在直连线的同侧 → rgt 取决于障碍物位置
+				rgt = (cross > 0) === (midCross > 0) ? cross > 0 : cross < 0;
+			} else {
+				const cross = (dst.x - src.x) * (obsCy - src.y) - (dst.y - src.y) * (obsCx - src.x);
+				rgt = cross > 0;
+			}
+
+			nodes.push({ x: obsCx, y: obsCy, radius: obsR, rgt });
+		}
+
+		// 终点焊盘
+		nodes.push({ x: dst.x, y: dst.y, radius: 0, rgt: false });
+
+		// 按距离起点排序
+		const sx = src.x, sy = src.y;
+		nodes.sort((a, b) => {
+			const da = (a.x - sx) ** 2 + (a.y - sy) ** 2;
+			const db = (b.x - sx) ** 2 + (b.y - sy) ** 2;
+			return da - db;
+		});
+
+		return nodes;
+	}
+
 	private addDynamicObstacle(obstacle: Omit<Obstacle, 'id'>): string {
 		const id = `dyn_${++this.obstacleIdCounter}`;
 		this.dynamicObstacles.push({ ...obstacle, id });
@@ -1345,7 +1548,8 @@ export class TopologicalRouter {
 							net: netName,
 							points: optimizedPoints,
 							layer: routingLayer,
-							width: traceWidthMil
+							width: traceWidthMil,
+							src, dst,
 						});
 					}
 				}
@@ -1365,69 +1569,62 @@ export class TopologicalRouter {
 				'success',
 			);
 
-			// Step 4: 写入 PCB（增强版 - 支持过孔）
+			// Step 4: 写入 PCB（RBR 风格切线+圆弧渲染）
 			this.onProgress?.({ stage: '导入走线', percentage: 78, message: '正在写入走线...' });
 			let created = 0;
 			let createdVias = 0;
-			const totalSegs = polylines.reduce((s, pl) => s + pl.points.length - 1, 0);
 
 			for (const pl of polylines) {
-				for (let i = 0; i < pl.points.length - 1; i++) {
-					if (this.shouldCancel) break;
+				if (this.shouldCancel) break;
 
-					try {
-						const p1 = pl.points[i];
-						const p2 = pl.points[i + 1];
-
-						const lineLayer = p1.layer ?? pl.layer;
-						console.log(`[TopologicalRouter] 写入导线: net=${pl.net}, layer=${lineLayer}, (${p1.x.toFixed(1)},${p1.y.toFixed(1)}) -> (${p2.x.toFixed(1)},${p2.y.toFixed(1)})${p2.arcAngle ? ` arc=${(p2.arcAngle * 180 / Math.PI).toFixed(1)}°` : ''}`);
-
-						if (p2.arcAngle) {
-							// 圆弧段
-							await eda.pcb_PrimitiveArc.create(
-								pl.net,
-								lineLayer,
-								p1.x, p1.y,
-								p2.x, p2.y,
-								p2.arcAngle,
-								pl.width
-							);
-						} else {
-							// 直线段
-							await eda.pcb_PrimitiveLine.create(
-								pl.net,
-								lineLayer,
-								p1.x, p1.y,
-								p2.x, p2.y,
-								pl.width, false
-							);
-						}
-						created++;
-
-						// 添加为动态障碍物（用于后续布线）- 使用线段模型
-						this.addDynamicObstacle({
-							x: (p1.x + p2.x) / 2,
-							y: (p1.y + p2.y) / 2,
-							radius: pl.width / 2 + clearanceMil,
-							layer: p1.layer ?? pl.layer,
-							type: 'track',
-							net: pl.net,
-							startX: p1.x,
-							startY: p1.y,
-							endX: p2.x,
-							endY: p2.y
+				try {
+					if (pl.src && pl.dst) {
+						// 使用切线+圆弧渲染
+						const pathNodes = this.buildPathNodes(
+							pl.points, pl.src, pl.dst,
+							this.dynamicObstacles, pl.width
+						);
+						console.log(`[Render] 网络 ${pl.net}: ${pathNodes.length} 个节点`);
+						pathNodes.forEach((n, i) => {
+							console.log(`  节点${i}: (${n.x.toFixed(1)},${n.y.toFixed(1)}) r=${n.radius.toFixed(1)} rgt=${n.rgt}`);
 						});
-					} catch (err) {
-						console.warn(`[TopologicalRouter] 创建走线失败 (${pl.net}):`, err);
-					}
+						const segs = await this.renderPathWithTangents(
+							pathNodes, pl.net, pl.layer, pl.width, clearanceMil
+						);
+						created += segs;
+					} else {
+						// 回退：逐段直线写入
+						for (let i = 0; i < pl.points.length - 1; i++) {
+							const p1 = pl.points[i];
+							const p2 = pl.points[i + 1];
+							const lineLayer = p1.layer ?? pl.layer;
 
-					if (created % 20 === 0) {
-						const pct = 78 + Math.floor((created / Math.max(totalSegs, 1)) * 20);
-						this.onProgress?.({ stage: '导入走线', percentage: pct, message: `已写入 ${created} 段...` });
+							if (p2.arcAngle) {
+								await eda.pcb_PrimitiveArc.create(
+									pl.net, lineLayer, p1.x, p1.y, p2.x, p2.y, p2.arcAngle, pl.width
+								);
+							} else {
+								await eda.pcb_PrimitiveLine.create(
+									pl.net, lineLayer, p1.x, p1.y, p2.x, p2.y, pl.width, false
+								);
+							}
+							created++;
+
+							this.addDynamicObstacle({
+								x: (p1.x + p2.x) / 2, y: (p1.y + p2.y) / 2,
+								radius: pl.width / 2 + clearanceMil,
+								layer: p1.layer ?? pl.layer, type: 'track', net: pl.net,
+								startX: p1.x, startY: p1.y, endX: p2.x, endY: p2.y,
+							});
+						}
 					}
+				} catch (err) {
+					console.warn(`[TopologicalRouter] 创建走线失败 (${pl.net}):`, err);
 				}
+
+				this.onProgress?.({ stage: '导入走线', percentage: 78 + Math.floor((created / Math.max(polylines.length, 1)) * 20), message: `已写入 ${created} 段...` });
 			}
-			
+
 			// 创建过孔（去重）
 			if (vias.length > 0) {
 				console.log(`[Router2] 过孔去重前: ${vias.length} 个`);

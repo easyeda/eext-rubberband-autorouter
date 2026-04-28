@@ -12,7 +12,11 @@
       "Bash(npx tsx:*)",
       "Bash(npm test:*)",
       "Bash(explorer:*)",
-      "Bash(echo \"exit code: $?\")"
+      "Bash(echo \"exit code: $?\")",
+      "WebFetch(domain:github.com)",
+      "Bash(gh repo *)",
+      "Bash(gh api *)",
+      "WebSearch"
     ]
   }
 }

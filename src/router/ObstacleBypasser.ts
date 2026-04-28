@@ -259,38 +259,71 @@ export class ObstacleBypasser {
 			];
 		}
 
-		// 不同侧：需要绕过端点，用切线+圆弧
-		// 尝试两个端点，选择路径更短的
-		const endpoints = [
-			{ x: sx, y: sy, awayX: -segUx, awayY: -segUy },
-			{ x: ex, y: ey, awayX: segUx, awayY: segUy },
-		];
+		// 不同侧：需要绕过端点
+		// 起点先水平/垂直到偏移线，沿偏移线到端点，圆弧绕过，再回到终点
+		const startSign = startSide > 0 ? 1 : -1;
+		const endSign = endSide > 0 ? 1 : -1;
 
 		let bestResult: Point[] | null = null;
 		let bestLen = Infinity;
 
-		for (const ep of endpoints) {
-			const result = this.computeTangentArc(start, end, ep.x, ep.y, R, direction);
-			if (!result) continue;
+		for (const ep of [
+			{ tipX: sx, tipY: sy, awayX: -segUx, awayY: -segUy },
+			{ tipX: ex, tipY: ey, awayX: segUx, awayY: segUy },
+		]) {
+			// 起点侧偏移线：平行于线段，偏移 R
+			const offSX = nx * startSign * R;
+			const offSY = ny * startSign * R;
+			// 终点侧偏移线
+			const offEX = nx * endSign * R;
+			const offEY = ny * endSign * R;
 
-			// 验证切线不穿过线段本身
-			const fullPath = [start, ...result, end];
-			let crossesSegment = false;
-			for (let i = 0; i < fullPath.length - 1; i++) {
-				const p1 = fullPath[i], p2 = fullPath[i + 1];
-				if (p2.arcAngle) continue; // 圆弧段单独检查
-				const dist = this.segmentToSegmentDistance(
-					p1.x, p1.y, p2.x, p2.y,
-					sx, sy, ex, ey
-				);
-				if (dist < R - 1) { crossesSegment = true; break; }
+			// 切入点：从起点垂直投影到起点侧偏移线
+			const entryX = start.x + offSX - (start.x - sx) * (1 - Math.abs(nx));
+			const entryY = start.y + offSY - (start.y - sy) * (1 - Math.abs(ny));
+			// 简化：对竖线 nx=1,ny=0 → entry=(sx+R*sign, start.y)
+			// 对横线 nx=0,ny=1 → entry=(start.x, sy+R*sign)
+			const eX = sx + offSX + segUx * ((start.x - sx) * segUx + (start.y - sy) * segUy);
+			const eY = sy + offSY + segUy * ((start.x - sx) * segUx + (start.y - sy) * segUy);
+
+			// 切出点：从终点垂直投影到终点侧偏移线
+			const xX = sx + offEX + segUx * ((end.x - sx) * segUx + (end.y - sy) * segUy);
+			const xY = sy + offEY + segUy * ((end.x - sx) * segUx + (end.y - sy) * segUy);
+
+			// 圆弧起点/终点
+			const arcSX = ep.tipX + offSX;
+			const arcSY = ep.tipY + offSY;
+			const arcEX = ep.tipX + offEX;
+			const arcEY = ep.tipY + offEY;
+
+			// 圆弧角度
+			const a1 = Math.atan2(arcSY - ep.tipY, arcSX - ep.tipX);
+			const a2 = Math.atan2(arcEY - ep.tipY, arcEX - ep.tipX);
+			let arcSpan = a2 - a1;
+			while (arcSpan > Math.PI) arcSpan -= 2 * Math.PI;
+			while (arcSpan < -Math.PI) arcSpan += 2 * Math.PI;
+
+			const arcMidAngle = a1 + arcSpan / 2;
+			const arcMidX = ep.tipX + R * Math.cos(arcMidAngle);
+			const arcMidY = ep.tipY + R * Math.sin(arcMidAngle);
+			const midToAway = (arcMidX - ep.tipX) * ep.awayX + (arcMidY - ep.tipY) * ep.awayY;
+			if (midToAway < 0) {
+				arcSpan = arcSpan > 0 ? arcSpan - 2 * Math.PI : arcSpan + 2 * Math.PI;
 			}
-			if (crossesSegment) continue;
+			if (Math.abs(arcSpan) > Math.PI * 1.1) continue;
 
+			const points: Point[] = [
+				{ x: eX, y: eY },
+				{ x: arcSX, y: arcSY },
+				{ x: arcEX, y: arcEY, arcAngle: arcSpan },
+				{ x: xX, y: xY },
+			];
+
+			const fullPath = [start, ...points, end];
 			const len = this.calculatePathLength(fullPath);
 			if (len < bestLen) {
 				bestLen = len;
-				bestResult = result;
+				bestResult = points;
 			}
 		}
 
