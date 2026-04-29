@@ -358,10 +358,20 @@ export class TopologicalRouter {
 					if (x === 0 && y === 0 && !p.center) continue;
 					const id: string = p.globalIndex || p.uuid || `${netName}_${allPads.length}`;
 
-					// 焊盘尺寸（mm 转 mil）- 尝试多种可能的属性名
-					const wMil = (p.topWidth || p.width || p.w || 0) * MM_TO_MIL;
-					const hMil = (p.topHeight || p.height || p.h || 0) * MM_TO_MIL;
-					const holeMil = (p.holeRadius || p.holeDiameter || p.drill || 0) * 2 * MM_TO_MIL;
+					// 焊盘尺寸 - 优先使用 pad 属性（已经是 mil）
+					// topWidth/topHeight 是 mm 单位但不代表铜面尺寸，不可靠
+					const padShape = p.pad ?? [];
+					let wMil = 0, hMil = 0;
+					if (Array.isArray(padShape) && padShape.length >= 3) {
+						wMil = padShape[1] ?? 0;
+						hMil = padShape[2] ?? 0;
+					}
+					const hole = p.hole ?? [];
+					const holeMil = Array.isArray(hole) && hole.length >= 2 ? (hole[1] ?? 0) : 0;
+					// 如果没有 pad 属性，使用默认焊盘尺寸
+					if (wMil === 0 && hMil === 0) {
+						wMil = 32; hMil = 34;
+					}
 
 					// 确定焊盘类型
 					let padType: 'th' | 'smd' | 'via' = 'smd';
@@ -1088,6 +1098,84 @@ export class TopologicalRouter {
 	}
 
 	/**
+	 * 验证切线路径是否安全（不穿过其他网络的障碍物）
+	 */
+	private validateTangentPath(
+		nodes: Array<{ x: number; y: number; radius: number; rgt: boolean }>,
+		net: string
+	): boolean {
+		const margin = 5;
+		let prevRadius = 0;
+
+		for (let i = 1; i < nodes.length; i++) {
+			const prev = nodes[i - 1];
+			const cur = nodes[i];
+
+			const [tx1, ty1, tx2, ty2] = this.calcTangent(
+				prev.x, prev.y, prevRadius, prev.rgt,
+				cur.x, cur.y, cur.radius, cur.rgt
+			);
+
+			// 检查切线段是否穿过障碍物
+			for (const obs of this.dynamicObstacles) {
+				if (obs.net === net) continue;
+
+				let dist: number;
+				if (obs.startX !== undefined && obs.endX !== undefined) {
+					dist = this.segToSegDistance(tx1, ty1, tx2, ty2, obs.startX, obs.startY, obs.endX, obs.endY);
+				} else {
+					dist = this.pointToSegmentDistance(obs.x, obs.y, tx1, ty1, tx2, ty2);
+				}
+
+				if (dist < obs.radius + margin) {
+					console.log(`[Validate] 切线段 (${tx1.toFixed(0)},${ty1.toFixed(0)})->(${tx2.toFixed(0)},${ty2.toFixed(0)}) 穿过障碍物 ${obs.id || obs.type}`);
+					return false;
+				}
+			}
+
+			prevRadius = cur.radius;
+		}
+
+		return true;
+	}
+	private findTangentBlocker(
+		nodes: Array<{ x: number; y: number; radius: number; rgt: boolean }>,
+		net: string
+	): { x: number; y: number; radius: number } | null {
+		const margin = 5;
+		let prevRadius = 0;
+		for (let i = 1; i < nodes.length; i++) {
+			const prev = nodes[i - 1];
+			const cur = nodes[i];
+			const [tx1, ty1, tx2, ty2] = this.calcTangent(prev.x, prev.y, prevRadius, prev.rgt, cur.x, cur.y, cur.radius, cur.rgt);
+			for (const obs of this.dynamicObstacles) {
+				if (obs.net === net) continue;
+				if (nodes.some(n => Math.hypot(n.x - obs.x, n.y - obs.y) < (n.radius || 10))) continue;
+				let dist: number;
+				if (obs.startX !== undefined && obs.endX !== undefined) {
+					dist = this.segToSegDistance(tx1, ty1, tx2, ty2, obs.startX, obs.startY, obs.endX, obs.endY);
+				} else {
+					dist = this.pointToSegmentDistance(obs.x, obs.y, tx1, ty1, tx2, ty2);
+				}
+				if (dist < obs.radius + margin) {
+					let cx: number, cy: number, r: number;
+					if (obs.startX !== undefined && obs.endX !== undefined) {
+						// 走线障碍物太长，无法用圆建模，放弃切线渲染
+						return null;
+					} else {
+						cx = obs.x;
+						cy = obs.y;
+						r = obs.radius + margin;
+					}
+					return { x: cx, y: cy, radius: r };
+				}
+			}
+			prevRadius = cur.radius;
+		}
+		return null;
+	}
+
+	/**
 	 * 用切线+圆弧渲染路径（RBR drawRoutes 风格）
 	 * nodes: 路径经过的节点序列（起点焊盘 → 障碍物 → ... → 终点焊盘）
 	 */
@@ -1190,7 +1278,11 @@ export class TopologicalRouter {
 		// 检查起点到终点的直连路径，找到阻挡的障碍物
 		for (const obs of obstacles) {
 			if (obs.net === src.net) continue;
-			if (obs.type === 'track') continue;
+
+			// 跳过距离起点/终点太近的障碍物（同元件的其他焊盘）
+			const distToSrc = Math.hypot((obs.x ?? 0) - src.x, (obs.y ?? 0) - src.y);
+			const distToDst = Math.hypot((obs.x ?? 0) - dst.x, (obs.y ?? 0) - dst.y);
+			if (distToSrc < obs.radius * 1.5 || distToDst < obs.radius * 1.5) continue;
 
 			let obsCx: number, obsCy: number, obsR: number;
 
@@ -1588,10 +1680,52 @@ export class TopologicalRouter {
 						pathNodes.forEach((n, i) => {
 							console.log(`  节点${i}: (${n.x.toFixed(1)},${n.y.toFixed(1)}) r=${n.radius.toFixed(1)} rgt=${n.rgt}`);
 						});
-						const segs = await this.renderPathWithTangents(
-							pathNodes, pl.net, pl.layer, pl.width, clearanceMil
-						);
-						created += segs;
+
+					// 验证切线路径，失败时迭代添加阻挡障碍物重试
+						let tangentSafe = pathNodes.length <= 2;
+						let retries = 0;
+						while (!tangentSafe && retries < 5) {
+							const blocker = this.findTangentBlocker(pathNodes, pl.net);
+							if (!blocker) {
+								// 没有更多可修复的阻挡物，做最终验证
+								tangentSafe = this.validateTangentPath(pathNodes, pl.net);
+								break;
+							}
+							const cross = (pl.dst!.x - pl.src!.x) * (blocker.y - pl.src!.y) - (pl.dst!.y - pl.src!.y) * (blocker.x - pl.src!.x);
+							pathNodes.push({ x: blocker.x, y: blocker.y, radius: blocker.radius, rgt: cross > 0 });
+							const sx2 = pl.src!.x, sy2 = pl.src!.y;
+							pathNodes.sort((a, b) => ((a.x - sx2) ** 2 + (a.y - sy2) ** 2) - ((b.x - sx2) ** 2 + (b.y - sy2) ** 2));
+							retries++;
+						}
+
+						if (tangentSafe) {
+
+
+
+
+							const segs = await this.renderPathWithTangents(
+								pathNodes, pl.net, pl.layer, pl.width, clearanceMil
+							);
+							created += segs;
+						} else {
+							// 切线路径不安全，回退到逐段直线写入
+							console.log(`[Render] 网络 ${pl.net}: 切线路径不安全，回退直线`);
+							for (let i = 0; i < pl.points.length - 1; i++) {
+								const p1 = pl.points[i];
+								const p2 = pl.points[i + 1];
+								const lineLayer = p1.layer ?? pl.layer;
+								await eda.pcb_PrimitiveLine.create(
+									pl.net, lineLayer, p1.x, p1.y, p2.x, p2.y, pl.width, false
+								);
+								created++;
+								this.addDynamicObstacle({
+									x: (p1.x + p2.x) / 2, y: (p1.y + p2.y) / 2,
+									radius: pl.width / 2 + clearanceMil,
+									layer: p1.layer ?? pl.layer, type: 'track', net: pl.net,
+									startX: p1.x, startY: p1.y, endX: p2.x, endY: p2.y,
+								});
+							}
+						}
 					} else {
 						// 回退：逐段直线写入
 						for (let i = 0; i < pl.points.length - 1; i++) {
