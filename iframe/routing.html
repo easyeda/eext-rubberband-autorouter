@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>拓扑自动布线</title>
+    <title id="pageTitle"></title>
     <style>
         * { margin: 0; padding: 0; box-sizing: border-box; }
         html, body { height: 100%; overflow: hidden; }
@@ -109,29 +109,45 @@
 <body>
     <div class="toolbar">
         <div class="toolbar-group">
-            <span class="toolbar-label">最大轮数:</span>
+            <span class="toolbar-label" id="lblMaxPasses"></span>
             <input type="number" class="toolbar-input toolbar-input-small" id="maxPasses" value="100" min="1" max="1000">
         </div>
         <div class="toolbar-separator"></div>
-        <button class="toolbar-btn" id="btnStart">开始布线</button>
-        <button class="toolbar-btn cancel" id="btnCancel" disabled>取消</button>
+        <button class="toolbar-btn" id="btnStart"></button>
+        <button class="toolbar-btn cancel" id="btnCancel" disabled></button>
     </div>
     <div class="progress-bar">
         <div class="progress-fill" id="progressFill"></div>
     </div>
     <div class="log-panel">
         <div class="log-header">
-            <span>运行日志</span>
-            <span id="logCount">0 行</span>
+            <span id="lblRunningLog"></span>
+            <span id="logCount"></span>
         </div>
         <div class="log-content" id="logContainer">
-            <div class="log-line info">准备就绪，点击"开始布线"开始自动布线</div>
+            <div class="log-line info" id="readyMsg"></div>
         </div>
     </div>
     <div class="statusbar">
-        <span>拓扑橡皮筋自动布线 | 本地算法</span>
+        <span id="lblStatusBar"></span>
     </div>
     <script>
+        var edaObj = (typeof eda !== 'undefined') ? eda : (window.parent && window.parent.eda);
+        function t(tag, ...args) {
+            if (edaObj && edaObj.sys_I18n) return edaObj.sys_I18n.text(tag, undefined, undefined, ...args);
+            return tag;
+        }
+
+        // Initialize i18n static text
+        document.getElementById('pageTitle').textContent = t('Routing Title');
+        document.getElementById('lblMaxPasses').textContent = t('Max Passes');
+        document.getElementById('btnStart').textContent = t('Start Routing');
+        document.getElementById('btnCancel').textContent = t('Cancel');
+        document.getElementById('lblRunningLog').textContent = t('Running Log');
+        document.getElementById('readyMsg').textContent = t('Ready Message');
+        document.getElementById('lblStatusBar').textContent = t('Status Bar');
+        document.getElementById('logCount').textContent = t('Log Lines', 0);
+
         let isRouting = false;
         let lineCount = 0;
         const MAX_LINES = 200;
@@ -158,14 +174,14 @@
                     }
                 }
             });
-            logCountEl.textContent = `${Math.min(lineCount, MAX_LINES)} 行`;
+            logCountEl.textContent = t('Log Lines', Math.min(lineCount, MAX_LINES));
             logContainer.scrollTop = logContainer.scrollHeight;
         }
 
         function clearLog() {
             logContainer.innerHTML = '';
             lineCount = 0;
-            logCountEl.textContent = '0 行';
+            logCountEl.textContent = t('Log Lines', 0);
         }
 
         function setRouting(routing) {
@@ -193,7 +209,7 @@
         if (parentEda && parentEda.sys_MessageBus) {
             // 监听布线开始
             parentEda.sys_MessageBus.subscribe('routing-started', (msg) => {
-                addLog('布线已开始...', 'success');
+                addLog(t('Routing Started'), 'success');
                 setRouting(true);
             });
 
@@ -219,9 +235,9 @@
                 setRouting(false);
                 setProgress(100);
                 if (msg.success) {
-                    addLog('布线完成！', 'success');
+                    addLog(t('Routing Complete'), 'success');
                 } else {
-                    addLog('布线失败', 'error');
+                    addLog(t('Routing Failed'), 'error');
                 }
             });
 
@@ -230,7 +246,7 @@
                 setRouting(false);
                 setProgress(0);
                 if (msg.error) {
-                    addLog(`错误: ${msg.error}`, 'error');
+                    addLog(t('Error Prefix', msg.error), 'error');
                 }
             });
         }
@@ -238,18 +254,18 @@
         btnStart.addEventListener('click', () => {
             clearLog();
             setProgress(0);
-            addLog('正在启动布线...', 'info');
+            addLog(t('Starting Routing'), 'info');
             setRouting(true);
 
             const options = collectOptions();
-            addLog(`最大轮数: ${options.maxPasses}`, 'info');
+            addLog(t('Max Passes Info', options.maxPasses), 'info');
 
             // 通知扩展开始布线
             sendToExtension('start', { options: options });
         });
 
         btnCancel.addEventListener('click', () => {
-            addLog('正在取消布线...', 'warn');
+            addLog(t('Cancelling Routing'), 'warn');
             setRouting(false);
             setProgress(0);
             sendToExtension('cancel', {});

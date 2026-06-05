@@ -1,4 +1,19 @@
 {
 	"About": "关于",
-	"EasyEDA extension SDK v": "嘉立创EDA 扩展 SDK v${1}"
+	"EasyEDA extension SDK v": "嘉立创EDA 扩展 SDK v${1}",
+	"Routing Title": "拓扑自动布线",
+	"Max Passes": "最大轮数:",
+	"Start Routing": "开始布线",
+	"Cancel": "取消",
+	"Running Log": "运行日志",
+	"Log Lines": "${1} 行",
+	"Ready Message": "准备就绪，点击\"开始布线\"开始自动布线",
+	"Status Bar": "拓扑橡皮筋自动布线 | 本地算法",
+	"Routing Started": "布线已开始...",
+	"Routing Complete": "布线完成！",
+	"Routing Failed": "布线失败",
+	"Error Prefix": "错误: ${1}",
+	"Starting Routing": "正在启动布线...",
+	"Max Passes Info": "最大轮数: ${1}",
+	"Cancelling Routing": "正在取消布线..."
 }

@@ -1,4 +1,19 @@
 {
 	"About": "About",
-	"EasyEDA extension SDK v": "EasyEDA extension SDK v${1}"
+	"EasyEDA extension SDK v": "EasyEDA extension SDK v${1}",
+	"Routing Title": "Topology Auto Router",
+	"Max Passes": "Max Passes:",
+	"Start Routing": "Start Routing",
+	"Cancel": "Cancel",
+	"Running Log": "Running Log",
+	"Log Lines": "${1} lines",
+	"Ready Message": "Ready, click \"Start Routing\" to begin auto routing",
+	"Status Bar": "Topology Rubberband Auto Router | Local Algorithm",
+	"Routing Started": "Routing started...",
+	"Routing Complete": "Routing complete!",
+	"Routing Failed": "Routing failed",
+	"Error Prefix": "Error: ${1}",
+	"Starting Routing": "Starting routing...",
+	"Max Passes Info": "Max passes: ${1}",
+	"Cancelling Routing": "Cancelling routing..."
 }

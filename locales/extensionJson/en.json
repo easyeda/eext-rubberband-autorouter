@@ -1,3 +1,10 @@
 {
-	"About...": "About..."
+	"About...": "About...",
+	"Rubberband Auto Router": "Rubberband Auto Router",
+	"Rubberband Auto Router Description": "PCB auto-routing tool based on topology rubberband algorithm, using local JavaScript algorithm",
+	"PCB": "PCB",
+	"AutoRoute": "AutoRoute",
+	"自动布线": "Auto Routing",
+	"拓扑路由": "Topological Routing",
+	"Topological": "Topological"
 }

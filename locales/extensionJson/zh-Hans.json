@@ -1,3 +1,10 @@
 {
-	"About...": "关于..."
+	"About...": "关于...",
+	"Rubberband Auto Router": "橡皮筋自动布线",
+	"Rubberband Auto Router Description": "基于拓扑橡皮筋算法的PCB自动布线工具，使用本地JavaScript算法完成布线",
+	"PCB": "PCB",
+	"AutoRoute": "自动布线",
+	"自动布线": "自动布线",
+	"拓扑路由": "拓扑路由",
+	"Topological": "拓扑"
 }
