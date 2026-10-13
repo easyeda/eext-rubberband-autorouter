@@ -319,6 +319,26 @@ export function padShapeToCircles(pad: { pad: any[]; hole?: any[] | null }): Arr
 		return [{ x: 0, y: 0, r: Math.max(w, h) / 2 }];
 	}
 
+	if (shapeName === 'RECT' && Math.abs(w - h) <= Math.min(w, h) * 0.3) {
+		// 近方形矩形焊盘：3 圆体覆盖主体 + 4 角圆覆盖角部
+		// （外接圆会封死相邻焊盘间隙；3 圆体的角部外露会造成 TH Pad 违规）
+		const rBody = w / 2;
+		const out = [
+			{ x: 0, y: h / 2 - rBody, r: rBody },
+			{ x: 0, y: 0, r: rBody },
+			{ x: 0, y: -(h / 2 - rBody), r: rBody },
+		];
+		const k = 0.65; // 角圆中心内缩系数
+		for (const sx of [-1, 1]) {
+			for (const sy of [-1, 1]) {
+				const cxp = (sx * w) / 2 * k;
+				const cyp = (sy * h) / 2 * k;
+				const rc = (1 - k) * Math.hypot(w / 2, h / 2);
+				out.push({ x: cxp, y: cyp, r: rc });
+			}
+		}
+		return out;
+	}
 	if (h >= w * 1.05) {
 		// 竖长焊盘（OVAL/RECT）：短边一半为半径，沿长轴三个圆（两端 + 中间）
 		const r = w / 2;

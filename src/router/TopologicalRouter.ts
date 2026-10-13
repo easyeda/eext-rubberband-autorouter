@@ -356,7 +356,7 @@ export class TopologicalRouter {
 	private padObstacles(pads: EnginePad[], drc: DRCRules, excludeNet: string): RBObstacle[] {
 		const out: RBObstacle[] = [];
 		let id = 0;
-		const infl = drc.trackToPadMil + drc.traceWidthMil / 2;
+		const infl = drc.trackToPadMil + drc.traceWidthMil / 2 + 0.3; // 安全余量
 		for (const p of pads) {
 			if (p.net === excludeNet) continue;
 			const layer = p.layer === 12 ? undefined : p.layer; // 通孔阻挡所有层
@@ -695,7 +695,8 @@ export class TopologicalRouter {
 						const sy = pr.cy + pr.r * Math.sin(pr.startAngle);
 						const ex = pr.cx + pr.r * Math.cos(pr.startAngle + pr.sweep);
 						const ey = pr.cy + pr.r * Math.sin(pr.startAngle + pr.sweep);
-						const deg = pr.sweep * 180 / Math.PI;
+								// EDA 两点式圆弧角度约定与数学正方向一致（实测：正角=逆时针凸向南）
+								const deg = pr.sweep * 180 / Math.PI;
 						if (Math.abs(deg) < 0.05 || Math.abs(Math.abs(deg) - 360) < 0.05) continue;
 						const createdArc = await eda.pcb_PrimitiveArc.create(net.name, routingLayer, sx, sy, ex, ey, deg, drc.traceWidthMil);
 						const pid = (createdArc as any)?.primitiveId;

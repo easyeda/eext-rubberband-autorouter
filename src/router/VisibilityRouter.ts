@@ -44,7 +44,7 @@ interface VGEdge {
 	cx?: number; cy?: number; r?: number; startAngle?: number; sweep?: number;
 }
 
-const EPS_TOUCH = 0.05;   // 允许与障碍圆相切接触的容差（mil）
+const EPS_TOUCH = 0.02;   // 相切容差（浮点误差）
 const GRID_CELL = 100;    // 阻挡查询网格（≥ 最大障碍半径即可）
 
 /**
