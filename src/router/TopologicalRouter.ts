@@ -10,7 +10,7 @@
 
 import {
 	RBObstacle, RBPrimitive, capsuleToCircles, padShapeToCircles,
-	buildPolylineObstacle, buildPolygonObstacle, computeEscapePoint, computeEscapeAlternatives, pointSegDist, fanoutFillet,
+	buildPolylineObstacle, buildPolygonObstacle, computeEscapePoint, computeEscapeAlternatives, pointSegDist, fanoutFillet, padExitModel,
 } from './RubberbandEngine';
 import { routeConnection } from './VisibilityRouter';
 import { RoutingOptions, RoutingProgress } from '../types';
@@ -374,8 +374,8 @@ export class TopologicalRouter {
 		return out;
 	}
 
-	/** 焊盘原始形状缓存（按位置键，含 pad 与 hole） */
-	private padShapeCache = new Map<string, { pad: any[]; hole: any[] | null }>();
+	/** 焊盘原始形状缓存（按位置键，含 pad 与 hole 与 rotation） */
+	private padShapeCache = new Map<string, { pad: any[]; hole: any[] | null; rotation: number }>();
 
 	/** 渲染图元 → 动态障碍（端点圆可绕行 + 沿线阻挡圆；弧按整圆可绕行） */
 	private addRenderedToObstacles(prims: RenderedPrim[], drc: DRCRules): void {
@@ -427,7 +427,7 @@ export class TopologicalRouter {
 					const p = sp as any;
 					if (Array.isArray(p.pad)) {
 						const key = `${(p.x ?? 0).toFixed(2)},${(p.y ?? 0).toFixed(2)}`;
-						this.padShapeCache.set(key, { pad: p.pad, hole: Array.isArray(p.hole) ? p.hole : null });
+						this.padShapeCache.set(key, { pad: p.pad, hole: Array.isArray(p.hole) ? p.hole : null, rotation: p.rotation ?? 0 });
 					}
 				}
 			} catch { /* 形状缓存失败则用默认圆 */ }
@@ -562,6 +562,39 @@ export class TopologicalRouter {
 		}
 	}
 
+	/**
+	 \* 单焊盘逃逸点：SMD 长焊盘从端帽沿长轴垂直出线（考虑长宽/旋转），
+	 \* 圆形/方形焊盘退回 scored 方向。返回 null 表示该方向被堵。
+	 */
+	private padEscape(
+		pad: { x: number; y: number; radius: number; layer: number },
+		shape: { pad: any[]; hole: any[] | null; rotation: number } | undefined,
+		obstacles: RBObstacle[],
+		net: string,
+		toward: { x: number; y: number },
+		escClear: number,
+		routingLayer: number,
+	): { x: number; y: number } | null {
+		if (shape) {
+			const em = padExitModel(pad.x, pad.y, { pad: shape.pad, hole: shape.hole, rotation: shape.rotation }, toward);
+			if (em) {
+				const tipX = em.capX + em.axisX * (em.r + escClear);
+				const tipY = em.capY + em.axisY * (em.r + escClear);
+				// 尖端与出线段不得侵入异网络障碍
+				let ok = true;
+				for (const o of obstacles) {
+					if (o.net === net) continue;
+					if (o.layer !== undefined && o.layer !== routingLayer) continue;
+					if (Math.hypot(tipX - o.x, tipY - o.y) < o.r - 0.05) { ok = false; break; }
+					if (pointSegDist(o.x, o.y, pad.x, pad.y, tipX, tipY) < o.r - 0.05) { ok = false; break; }
+				}
+				if (ok) return { x: tipX, y: tipY };
+				return null; // 轴向被堵：SMD 长焊盘不做斜出（保持垂直扇出美观）
+			}
+		}
+		return computeEscapePoint(pad.x, pad.y, pad.radius, obstacles, net, routingLayer, escClear, toward);
+	}
+
 	/** 逃逸通道预约：每个焊盘的出线段注册为该网络的专属阻挡（其他网络不得横穿） */
 	private escapeReservationCache: RBObstacle[] | null = null;
 	private getEscapeReservations(allPads: EnginePad[], drc: DRCRules): RBObstacle[] {
@@ -573,7 +606,11 @@ export class TopologicalRouter {
 		for (const p of allPads) {
 			const layer = p.layer === 12 ? undefined : p.layer;
 			const obs = padObstaclesAll.filter(o => o.layer === undefined || o.layer === layer);
-			const esc = computeEscapePoint(p.x, p.y, p.radius, obs, p.net, layer ?? 1, escClear);
+			const shape = this.padShapeCache.get(`${p.x.toFixed(2)},${p.y.toFixed(2)}`);
+			// 预约方向的 sideHint：暂无目标信息，取当前逃逸点方向（先 scored 再覆盖）
+			const esc0 = computeEscapePoint(p.x, p.y, p.radius, obs, p.net, layer ?? 1, escClear);
+			if (!esc0) continue;
+			const esc = this.padEscape(p, shape, obs, p.net, { x: esc0.x - p.x, y: esc0.y - p.y }, escClear, layer ?? 1) ?? esc0;
 			if (!esc) continue;
 			for (const c of capsuleToCircles(p.x, p.y, esc.x, esc.y, rRes)) {
 				out.push({ id: `res${out.length}`, kind: 'circle', x: c.x, y: c.y, r: rRes, net: p.net, layer, group: `res:${p.net}:${p.x},${p.y}`, blockerOnly: true });
@@ -608,10 +645,14 @@ export class TopologicalRouter {
 				...this.getEscapeReservations(allPads, drc),
 			].filter(o => o.layer === undefined || o.layer === routingLayer);
 
-			// 逃逸点：焊盘先沿净空最大方向出线（扇出效果，避免封死相邻焊盘）
+			// 逃逸点：SMD 长焊盘从端帽沿长轴垂直出线（扇出效果+防封死相邻焊盘）；圆形焊盘沿 scored 方向
 			const escClear = drc.trackToPadMil + drc.traceWidthMil + 20;
-			const escSrc = computeEscapePoint(src.x, src.y, src.radius, layerFiltered, net.name, routingLayer, escClear, dst);
-			const escDst = computeEscapePoint(dst.x, dst.y, dst.radius, layerFiltered, net.name, routingLayer, escClear, src);
+			const shapeSrc = this.padShapeCache.get(`${src.x.toFixed(2)},${src.y.toFixed(2)}`);
+			const shapeDst = this.padShapeCache.get(`${dst.x.toFixed(2)},${dst.y.toFixed(2)}`);
+			const escSrc = this.padEscape(src, shapeSrc, layerFiltered, net.name, dst, escClear, routingLayer)
+				?? computeEscapePoint(src.x, src.y, src.radius, layerFiltered, net.name, routingLayer, escClear, dst);
+			const escDst = this.padEscape(dst, shapeDst, layerFiltered, net.name, src, escClear, routingLayer)
+				?? computeEscapePoint(dst.x, dst.y, dst.radius, layerFiltered, net.name, routingLayer, escClear, src);
 
 			let stub1: RenderedPrim | null = null;
 			let stub2: RenderedPrim | null = null;
@@ -631,7 +672,7 @@ export class TopologicalRouter {
 					if (!stubsOK) break;
 				}
 				if (stubsOK) {
-					result = routeConnection(escSrc, escDst, layerFiltered, net.name, [150]);
+					result = routeConnection(escSrc, escDst, layerFiltered, net.name, [150, 500]);
 				}
 				// 首选逃逸方向失败：尝试备选逃逸方向（次优/第三优）
 				if ((!result.ok || result.prims.length === 0) && escSrc && escDst) {
@@ -739,7 +780,7 @@ export class TopologicalRouter {
 					const f1 = fanoutFillet(
 						{ x1: stub1.x1!, y1: stub1.y1!, x2: stub1.x2!, y2: stub1.y2! },
 						{ x1: (first as any).x1, y1: (first as any).y1, x2: (first as any).x2, y2: (first as any).y2 },
-						Math.min(20, drc.traceWidthMil * 2),
+						Math.min(30, drc.traceWidthMil * 3),
 					);
 					if (f1) {
 						const l0 = f1.prims[0], ar = f1.prims[1], l2 = f1.prims[2];
