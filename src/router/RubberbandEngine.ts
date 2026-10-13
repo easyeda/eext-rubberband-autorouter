@@ -528,3 +528,157 @@ export function computeEscapeAlternatives(
 	const scored = scoreEscapeDirections(padX, padY, padR, obstacles, net, layer, minClear, toward);
 	return scored.slice(0, n).filter(s2 => s2.score > 0.5).map(s2 => ({ x: s2.x, y: s2.y }));
 }
+
+// ─────────────────────────────────────────────
+// 角部圆角（fillet）：两条相交线段之间插入切线圆弧，实现 G1 光滑过渡
+// ─────────────────────────────────────────────
+
+export interface FilletResult {
+	/** 入线段截短后的终点 */
+	trimIn: { x: number; y: number };
+	/** 切线圆弧 */
+	arc: RBArc;
+	/** 出线段截短后的起点 */
+	trimOut: { x: number; y: number };
+}
+
+/**
+ * 在拐点 P 处计算圆角：入方向 d1（指向 P）、出方向 d2（离开 P）、圆���半径 R。
+ * A = P − d1·t，B = P + d2·t，t = R·tan(φ/2)（φ = 转向角）。
+ * 返回截短点与圆弧；无法圆角时返回 null。
+ */
+export function cornerFillet(
+	px: number, py: number,
+	dx1: number, dy1: number,
+	dx2: number, dy2: number,
+	radius: number,
+): FilletResult | null {
+	const l1 = Math.hypot(dx1, dy1), l2 = Math.hypot(dx2, dy2);
+	if (l1 < 1e-9 || l2 < 1e-9) return null;
+	const ux1 = dx1 / l1, uy1 = dy1 / l1;
+	const ux2 = dx2 / l2, uy2 = dy2 / l2;
+	const dot = Math.max(-1, Math.min(1, ux1 * ux2 + uy1 * uy2));
+	const phi = Math.acos(dot); // 转向角
+	if (phi < 0.06) return null;       // 近似直行：无需圆角
+	if (phi > Math.PI - 0.06) return null; // 掉头：无法圆角
+	const half = phi / 2;
+	const tanHalf = Math.tan(half);
+	if (tanHalf < 1e-6) return null;
+	const t = radius * tanHalf;
+	// 转向侧：cross(d1,d2) < 0 → 右转（顺时针），> 0 → 左转（逆时针）
+	const cross = ux1 * uy2 - uy1 * ux2;
+	const sgn = cross >= 0 ? 1 : -1;
+	// 切点
+	const ax = px - ux1 * t, ay = py - uy1 * t;
+	const bx = px + ux2 * t, by = py + uy2 * t;
+	// 圆心 = A + R×法线（转向侧法线：d1 旋转 sgn×90°）
+	const n1x = -sgn * uy1, n1y = sgn * ux1;
+	const cx = ax + radius * n1x;
+	const cy = ay + radius * n1y;
+	// 校验 B 在圆上（数值容差）
+	const rErr = Math.abs(Math.hypot(bx - cx, by - cy) - radius);
+	if (rErr > 0.5) return null;
+	const startAngle = Math.atan2(ay - cy, ax - cx);
+	const endAngle = Math.atan2(by - cy, bx - cx);
+	// 扫掠：转向侧决定方向，幅值 = φ
+	const sweep = sgn > 0 ? phi : -phi;
+	return {
+		trimIn: { x: ax, y: ay },
+		arc: { kind: 'arc', cx, cy, r: radius, startAngle, sweep },
+		trimOut: { x: bx, y: by },
+	};
+}
+
+/**
+ * 对「出线段→路径第一段」的拐点做圆角。
+ * stub 指向拐点（stub.x2/y2 = 拐点），first 从拐点出发（first.x1/y1 = 拐点）。
+ */
+export function fanoutFillet(
+	stub: { x1: number; y1: number; x2: number; y2: number },
+	first: { x1: number; y1: number; x2: number; y2: number },
+	radius: number,
+): { prims: RBPrimitive[] } | null {
+	const d1x = stub.x2 - stub.x1, d1y = stub.y2 - stub.y1;
+	const d2x = first.x2 - first.x1, d2y = first.y2 - first.y1;
+	const stubLen = Math.hypot(d1x, d1y);
+	const firstLen = Math.hypot(d2x, d2y);
+	if (stubLen < 2 || firstLen < 2) return null;
+	const dot = (d1x * d2x + d1y * d2y) / (stubLen * firstLen);
+	const phi = Math.acos(Math.max(-1, Math.min(1, dot)));
+	if (phi < 0.06 || phi > Math.PI - 0.06) return null;
+	const tanHalf = Math.tan(phi / 2);
+	// R 受两段长度限制（切点距拐点 t = R·tan(φ/2) 需 ≤ 段长 − 余量）
+	const R = Math.min(radius, (stubLen - 1) / tanHalf, (firstLen - 1) / tanHalf);
+	if (R < 1) return null;
+	const f = cornerFillet(stub.x2, stub.y2, d1x, d1y, d2x, d2y, R);
+	if (!f) return null;
+	return {
+		prims: [
+			{ kind: 'line', x1: stub.x1, y1: stub.y1, x2: f.trimIn.x, y2: f.trimIn.y },
+			f.arc,
+			{ kind: 'line', x1: f.trimOut.x, y1: f.trimOut.y, x2: first.x2, y2: first.y2 },
+		],
+	};
+}
+
+// ─────────────────────────────────────────────
+// 焊盘出线模型：SMD 长焊盘从端帽沿长轴出线
+// ─────────────────────────────────────────────
+
+export interface PadExitModel {
+	/** 端帽圆心（绝对坐标）：走线从此处沿轴向离开 */
+	capX: number;
+	capY: number;
+	/** 轴向单位向量（指向出线侧） */
+	axisX: number;
+	axisY: number;
+	/** 短轴半径（端帽圆半径，未膨胀） */
+	r: number;
+}
+
+/**
+ * 计算焊盘的出线模型：长圆形/矩形焊盘从端帽沿长轴出线（考虑焊盘长宽与旋转角），
+ * 近圆形焊盘返回 null（走 scored 方向出线）。
+ * sideHint: 期望出线侧（目标方向），用于选择沿轴的正/负方向。
+ */
+export function padExitModel(
+	padX: number,
+	padY: number,
+	pad: { pad: any[]; hole?: any[] | null; rotation?: number },
+	sideHint: { x: number; y: number },
+): PadExitModel | null {
+	const shape = Array.isArray(pad.pad) ? pad.pad : [];
+	const w = shape[1] ?? 0;
+	const h = shape[2] ?? 0;
+	const shapeName = String(shape[0] ?? 'ELLIPSE').toUpperCase();
+	// 通孔圆焊盘：无轴向
+	if (Array.isArray(pad.hole) && pad.hole.length >= 2 && pad.hole[1] > 0) return null;
+	// 长宽比不足：无明确轴向
+	const longAx = Math.max(w, h), shortAx = Math.min(w, h);
+	if (longAx < shortAx * 1.4 || shortAx < 1e-6) return null;
+
+	// 长轴方向：本地 +Y 旋转 rotation 度（EDA 角度约定：逆时针为正）
+	const rot = ((pad.rotation ?? 0) * Math.PI) / 180;
+	// 本地长轴：h >= w 时沿 Y，否则沿 X
+	let axLocal: number, ayLocal: number;
+	if (h >= w) { axLocal = 0; ayLocal = 1; } else { axLocal = 1; ayLocal = 0; }
+	// 旋转（屏幕坐标 y 向上，逆时针为正）
+	const cosR = Math.cos(rot), sinR = Math.sin(rot);
+	let axisX = axLocal * cosR - ayLocal * sinR;
+	let axisY = axLocal * sinR + ayLocal * cosR;
+	const al = Math.hypot(axisX, axisY);
+	if (al < 1e-9) return null;
+	axisX /= al; axisY /= al;
+
+	// 轴向选择：与 sideHint 同侧
+	if (axisX * sideHint.x + axisY * sideHint.y < 0) { axisX = -axisX; axisY = -axisY; }
+
+	// 端帽圆心：焊盘中心沿轴偏移 (longAx/2 − shortAx/2)
+	const off = longAx / 2 - shortAx / 2;
+	const r = shortAx / 2;
+	return {
+		capX: padX + axisX * off,
+		capY: padY + axisY * off,
+		axisX, axisY, r,
+	};
+}

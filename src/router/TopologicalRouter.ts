@@ -10,7 +10,7 @@
 
 import {
 	RBObstacle, RBPrimitive, capsuleToCircles, padShapeToCircles,
-	buildPolylineObstacle, buildPolygonObstacle, computeEscapePoint, computeEscapeAlternatives, pointSegDist,
+	buildPolylineObstacle, buildPolygonObstacle, computeEscapePoint, computeEscapeAlternatives, pointSegDist, fanoutFillet,
 } from './RubberbandEngine';
 import { routeConnection } from './VisibilityRouter';
 import { RoutingOptions, RoutingProgress } from '../types';
@@ -730,6 +730,46 @@ export class TopologicalRouter {
 					console.warn(`[TopologicalRouter] 创建过孔失败 (${net.name}):`, err);
 				}
 			}
+
+			// 扇出圆角：出线段/入线段与路径首末段之间插入切线圆弧
+			try {
+				const first = rendered.find(r2 => r2.kind === 'line' && r2 !== stub1 && r2 !== stub2);
+				if (stub1 && first && (first as any).x1 === stub1.x2 && (first as any).y1 === stub1.y2) {
+					const f1 = fanoutFillet(
+						{ x1: stub1.x1!, y1: stub1.y1!, x2: stub1.x2!, y2: stub1.y2! },
+						{ x1: (first as any).x1, y1: (first as any).y1, x2: (first as any).x2, y2: (first as any).y2 },
+						Math.min(20, drc.traceWidthMil * 2),
+					);
+					if (f1) {
+						const l0 = f1.prims[0], ar = f1.prims[1], l2 = f1.prims[2];
+						if (l0.kind === 'line' && ar.kind === 'arc' && l2.kind === 'line') {
+							const fi = rendered.indexOf(first);
+							rendered[fi] = { kind: 'line', net: net.name, layer: routingLayer, x1: l0.x1, y1: l0.y1, x2: l0.x2, y2: l0.y2 };
+							rendered.splice(fi + 1, 0,
+								{ kind: 'arc', net: net.name, layer: routingLayer, cx: ar.cx, cy: ar.cy, r: ar.r, startAngle: ar.startAngle, sweep: ar.sweep },
+								{ kind: 'line', net: net.name, layer: routingLayer, x1: l2.x1, y1: l2.y1, x2: l2.x2, y2: l2.y2 });
+							// EDA 侧同步：删旧首段，画圆角新段
+							const oldId = primIds.shift();
+							if (oldId) { try { await eda.pcb_PrimitiveLine.delete(oldId); } catch { /* ignore */ } }
+							for (const nl of [l0, l2]) {
+								const cl = await eda.pcb_PrimitiveLine.create(net.name, routingLayer, nl.x1, nl.y1, nl.x2, nl.y2, drc.traceWidthMil, false);
+								const nid = (cl as any)?.primitiveId;
+								if (nid) primIds.unshift(nid);
+								createdCounter.lines++;
+							}
+							const ca = await (eda as any).pcb_PrimitiveArc.create(net.name, routingLayer,
+								ar.cx + ar.r * Math.cos(ar.startAngle),
+								ar.cy + ar.r * Math.sin(ar.startAngle),
+								ar.cx + ar.r * Math.cos(ar.startAngle + ar.sweep),
+								ar.cy + ar.r * Math.sin(ar.startAngle + ar.sweep),
+								ar.sweep * 180 / Math.PI, drc.traceWidthMil);
+							const caid = (ca as any)?.primitiveId;
+							if (caid) primIds.splice(1, 0, caid);
+							createdCounter.lines++;
+						}
+					}
+				}
+			} catch { /* 圆角失败不影响主流程 */ }
 
 			// 记录并加入动态障碍
 			const ids = this.netPrimIds.get(net.name) ?? [];

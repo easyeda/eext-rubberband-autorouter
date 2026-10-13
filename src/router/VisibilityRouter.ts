@@ -158,6 +158,9 @@ export function routeConnection(
 			}
 		}
 	}
+	// 规范化排序：与障碍收集顺序无关的确定性 tie-break
+	// （EDA 与离线的收集顺序不同，等长路径的选择会随顺序漂移）
+	all.sort((a, b) => a.x - b.x || a.y - b.y || a.r - b.r || (a.net || '').localeCompare(b.net || ''));
 
 	// 走廊剪枝：先只保留直连线附近窄带内的圆（大幅提速），
 	// 求解失败再逐级放宽范围重试。
