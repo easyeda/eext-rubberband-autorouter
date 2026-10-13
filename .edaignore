@@ -29,4 +29,5 @@ debug.log
 CLAUDE.md
 QWEN.md
 REQUIREMENT.md
-Agent.md
+AGENTS.md
+/case/

@@ -6,6 +6,7 @@
 /node_modules/
 /.eslintcache
 debug.log
-/doc
+/docs/
 /build/
-
+/case/
+/tmp/
