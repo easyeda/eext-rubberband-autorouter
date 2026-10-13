@@ -402,7 +402,45 @@ function solve(
 				const u = stack.pop()!;
 				for (const e of nodes[u].adj) if (!seen[e.to]) { seen[e.to] = true; stack.push(e.to); }
 			}
-			console.log(`[VR] 无路径: wrappable=${n} blockers=${blockers.length} nodes=${total} src可达=${seen.filter(Boolean).length} src出边=${nodes[0].adj.length} dst出边=${nodes[1].adj.length}`);
+			// 双向可达集 + 边界包围盒：定位堵点
+			const seen2 = new Array<boolean>(total).fill(false);
+			const stack2 = [1];
+			seen2[1] = true;
+			while (stack2.length) {
+				const u = stack2.pop()!;
+				for (const e of nodes[u].adj) if (!seen2[e.to]) { seen2[e.to] = true; stack2.push(e.to); }
+			}
+			const bbox = (pred: (k: number) => boolean) => {
+				let mnx = Infinity, mny = Infinity, mxx = -Infinity, mxy = -Infinity, cnt = 0;
+				for (let k = 0; k < total; k++) {
+					if (!pred(k) || nodes[k].circle < 0) continue;
+					cnt++;
+					mnx = Math.min(mnx, nodes[k].x); mxx = Math.max(mxx, nodes[k].x);
+					mny = Math.min(mny, nodes[k].y); mxy = Math.max(mxy, nodes[k].y);
+				}
+				return cnt ? `n=${cnt} x[${mnx.toFixed(0)},${mxx.toFixed(0)}] y[${mny.toFixed(0)},${mxy.toFixed(0)}]` : '空';
+			};
+			console.log(`[VR] 无路径: wrappable=${n} blockers=${blockers.length} nodes=${total} src出边=${nodes[0].adj.length} dst出边=${nodes[1].adj.length}`);
+			console.log(`[VR]   src分量: ${bbox(k => seen[k])}`);
+			console.log(`[VR]   dst分量: ${bbox(k => seen2[k])}`);
+			// 两分量之间的"缝隙"障碍：与 src 分量的节点相切距离近、且自身不在任一分量的切点中
+			const srcSet = new Set<number>(), dstSet = new Set<number>();
+			for (let k = 0; k < total; k++) { if (seen[k]) srcSet.add(k); if (seen2[k]) dstSet.add(k); }
+			const seam = new Map<string, number>();
+			for (let k = 0; k < total; k++) {
+				if (!seen[k] && !seen2[k]) continue;
+				const nd = nodes[k];
+				if (nd.circle < 0) continue;
+				for (const e of nd.adj) {
+					const other = nodes[e.to];
+					if (seen[k] !== seen2[e.to] && seen[k] !== seen[e.to]) {
+						const c = circles[nd.circle];
+						const key = `${c.group ?? c.id}`;
+						seam.set(key, (seam.get(key) ?? 0) + 1);
+					}
+				}
+			}
+			console.log(`[VR]   缝隙障碍: ${[...seam.entries()].slice(0, 8).map(([k, v]) => k + 'x' + v).join(', ')}`);
 		}
 		return { ok: false, prims: [] };
 	}

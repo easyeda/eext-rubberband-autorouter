@@ -461,9 +461,26 @@ export function computeEscapePoint(
 	minClear: number,
 	toward?: { x: number; y: number },
 ): { x: number; y: number } | null {
+	const scored = scoreEscapeDirections(padX, padY, padR, obstacles, net, layer, minClear, toward);
+	if (!scored.length || scored[0].score <= 0.5) return null; // 各方向都被堵死
+	return { x: scored[0].x, y: scored[0].y };
+}
+
+/**
+ * 对 16 个候选逃逸方向评分（净空 + 朝向目标奖励 + 轴向平手奖励），降序返回
+ */
+function scoreEscapeDirections(
+	padX: number,
+	padY: number,
+	padR: number,
+	obstacles: RBObstacle[],
+	net: string,
+	layer: number,
+	minClear: number,
+	toward?: { x: number; y: number },
+): Array<{ score: number; x: number; y: number }> {
 	const d = (padR || 0) + minClear;
-	let best: { x: number; y: number } | null = null;
-	let bestScore = -Infinity;
+	const scored: Array<{ score: number; x: number; y: number }> = [];
 	for (let k = 0; k < 16; k++) {
 		const a = (k * Math.PI) / 8;
 		const ex = padX + d * Math.cos(a);
@@ -488,11 +505,26 @@ export function computeEscapePoint(
 		}
 		// 平手时优先水平/垂直方向（k 为 4 的倍数是轴向）
 		const axisBonus = k % 4 === 0 ? 0.5 : 0;
-		if (score + towardBonus + axisBonus > bestScore) {
-			bestScore = score + towardBonus + axisBonus;
-			best = { x: ex, y: ey };
-		}
+		scored.push({ score: score + towardBonus + axisBonus, x: ex, y: ey });
 	}
-	if (bestScore <= 0.5) return null; // 各方向都被堵死
-	return best;
+	scored.sort((a, b) => b.score - a.score);
+	return scored;
+}
+
+/**
+ * 计算焊盘的前 N 个逃逸点备选（评分降序），用于首选方向被堵时的重试
+ */
+export function computeEscapeAlternatives(
+	padX: number,
+	padY: number,
+	padR: number,
+	obstacles: RBObstacle[],
+	net: string,
+	layer: number,
+	minClear: number,
+	toward: { x: number; y: number },
+	n: number,
+): Array<{ x: number; y: number }> {
+	const scored = scoreEscapeDirections(padX, padY, padR, obstacles, net, layer, minClear, toward);
+	return scored.slice(0, n).filter(s2 => s2.score > 0.5).map(s2 => ({ x: s2.x, y: s2.y }));
 }

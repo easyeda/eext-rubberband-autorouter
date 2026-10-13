@@ -10,7 +10,7 @@
 
 import {
 	RBObstacle, RBPrimitive, capsuleToCircles, padShapeToCircles,
-	buildPolylineObstacle, buildPolygonObstacle, computeEscapePoint, pointSegDist,
+	buildPolylineObstacle, buildPolygonObstacle, computeEscapePoint, computeEscapeAlternatives, pointSegDist,
 } from './RubberbandEngine';
 import { routeConnection } from './VisibilityRouter';
 import { RoutingOptions, RoutingProgress } from '../types';
@@ -478,11 +478,11 @@ export class TopologicalRouter {
 				const next: typeof pendingNets = [];
 				for (const net of pendingNets) {
 					if (this.shouldCancel) break;
-					const srcPad = net.pads[0];
+					const ends = [net.pads[0], net.pads[net.pads.length - 1]];
 					const seals = new Set<string>();
 					for (const o of this.dynamicObstacles) {
 						if (o.net && o.net !== net.name &&
-							Math.hypot(o.x - srcPad.x, o.y - srcPad.y) < o.r + 70) {
+							ends.some(e => Math.hypot(o.x - e.x, o.y - e.y) < o.r + 70)) {
 							seals.add(o.net);
 						}
 					}
@@ -503,6 +503,42 @@ export class TopologicalRouter {
 				}
 				pendingNets.length = 0;
 				pendingNets.push(...next);
+			}
+
+			// 最终成组重布：拆除所有封路网，失败网按外向优先（maxX 降序）重布，再重布被拆网
+			if (pendingNets.length) {
+				const sealsAll = new Set<string>();
+				for (const net of pendingNets) {
+					const [pa, pb] = [net.pads[0], net.pads[net.pads.length - 1]];
+					for (const o of this.dynamicObstacles) {
+						if (o.net && o.net !== net.name &&
+							(Math.hypot(o.x - pa.x, o.y - pa.y) < o.r + 70 ||
+							 Math.hypot(o.x - pb.x, o.y - pb.y) < o.r + 70)) {
+							sealsAll.add(o.net);
+						}
+					}
+				}
+				for (const n of [...sealsAll]) if (pendingNets.some(pn => pn.name === n)) sealsAll.delete(n);
+				const rip = this.routedOrder.filter(n => sealsAll.has(n));
+				if (rip.length) {
+					this.onLog?.(`成组重布：拆除 ${rip.join(', ')}`, 'warn');
+					for (const n of rip) await this.ripupNet(n);
+					const ordered = [...pendingNets].sort((na, nb) => {
+						const xa = Math.max(...na.pads.map(p => p.x));
+						const xb = Math.max(...nb.pads.map(p => p.x));
+						return xb - xa;
+					});
+					for (const net of ordered) {
+						if (await this.routeNetEdges(net, staticObstacles, allPads, drc, createdCounter)) routedNets++;
+						else { failedNets.push(net.name); this.onLog?.(`成组重布：${net.name} 仍失败`, 'error'); }
+					}
+					for (const n of rip) {
+						const ripped = networks.find(nn => nn.name === n)!;
+						if (await this.routeNetEdges(ripped, staticObstacles, allPads, drc, createdCounter)) routedNets++;
+						else { failedNets.push(ripped.name); this.onLog?.(`成组重布：重布 ${n} 失败`, 'error'); }
+					}
+					pendingNets.length = 0;
+				}
 			}
 			for (const net of pendingNets) failedNets.push(net.name);
 
@@ -596,6 +632,32 @@ export class TopologicalRouter {
 				}
 				if (stubsOK) {
 					result = routeConnection(escSrc, escDst, layerFiltered, net.name, [150]);
+				}
+				// 首选逃逸方向失败：尝试备选逃逸方向（次优/第三优）
+				if ((!result.ok || result.prims.length === 0) && escSrc && escDst) {
+					const alts = computeEscapeAlternatives(src.x, src.y, src.radius, layerFiltered, net.name, routingLayer, escClear, dst, 3);
+					const altsD = computeEscapeAlternatives(dst.x, dst.y, dst.radius, layerFiltered, net.name, routingLayer, escClear, src, 3);
+					outer: for (const a1 of alts.slice(1)) {
+						for (const a2 of altsD.slice(1)) {
+							const s1 = { kind: 'line' as const, net: net.name, layer: routingLayer, x1: src.x, y1: src.y, x2: a1.x, y2: a1.y };
+							const s2 = { kind: 'line' as const, net: net.name, layer: routingLayer, x1: a2.x, y1: a2.y, x2: dst.x, y2: dst.y };
+							let ok2 = true;
+							for (const st of [s1, s2]) {
+								for (const o of layerFiltered) {
+									if (o.net === net.name) continue;
+									if (pointSegDist(o.x, o.y, st.x1!, st.y1!, st.x2!, st.y2!) < o.r - 0.05) { ok2 = false; break; }
+								}
+								if (!ok2) break;
+							}
+							if (ok2) {
+								const r2 = routeConnection(a1, a2, layerFiltered, net.name, [150]);
+								if (r2.ok && r2.prims.length > 0) {
+									stub1 = s1; stub2 = s2; result = r2;
+									break outer;
+								}
+							}
+						}
+					}
 				}
 			}
 			if (!result.ok || result.prims.length === 0) {
