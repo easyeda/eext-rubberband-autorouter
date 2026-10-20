@@ -140,13 +140,51 @@ function makeArcChecker(circles: RBObstacle[], grid: CircleGrid, net = '') {
  * 计算单条连接（src→dst）的橡皮筋路径（可视图 Dijkstra）
  * obstacles: 障碍（圆或胶囊；胶囊转为圆群）。网络/层过滤由调用方完成。
  */
-export function routeConnection(
+/**
+ * 让出主线程（协作式调度）。
+ * 可视图求解是重 CPU 的同步计算，若不主动让出，EDA 主线程会被独占，
+ * 表现为「整个 EDA 卡死 + console 无报错」（阻塞而非异常）。
+ *
+ * 注意：不能用 requestAnimationFrame——EDA 窗口在后台/无头时 rAF 会被节流到
+ * 约 1fps，会让总耗时爆炸。MessageChannel 是没有任何节流的宏任务让出方式。
+ */
+let __yieldChannel: MessageChannel | null = null;
+let __yieldResolvers: Array<() => void> = [];
+function ensureYieldChannel(): MessageChannel | null {
+	if (__yieldChannel) return __yieldChannel;
+	if (typeof MessageChannel !== 'function') return null;
+	const ch = new MessageChannel();
+	ch.port1.onmessage = () => {
+		const rs = __yieldResolvers;
+		__yieldResolvers = [];
+		for (const r of rs) r();
+	};
+	__yieldChannel = ch;
+	return ch;
+}
+
+function yieldToHost(): Promise<void> {
+	const ch = ensureYieldChannel();
+	if (!ch) return new Promise<void>(resolve => setTimeout(resolve, 0));
+	return new Promise<void>(resolve => {
+		__yieldResolvers.push(resolve);
+		ch.port2.postMessage(0);
+	});
+}
+
+/** 单次求解的时间预算（毫秒）。超出则放弃该走廊级别，避免长时间独占主线程 */
+const SOLVE_BUDGET_MS = 3000;
+/** 协作让出的最小间隔（毫秒） */
+const YIELD_INTERVAL_MS = 16;
+
+export async function routeConnection(
 	src: { x: number; y: number },
 	dst: { x: number; y: number },
 	obstacles: RBObstacle[],
 	net = '',
-	expands: number[] = [150, 500, Infinity],
-): RouteConnectionResult {
+	expands: number[] = [150, 500],
+	budgetMs: number = SOLVE_BUDGET_MS,
+): Promise<RouteConnectionResult> {
 	// 圆障碍列表（胶囊兜底转为圆群）
 	const all: RBObstacle[] = [];
 	for (const o of obstacles) {
@@ -166,16 +204,34 @@ export function routeConnection(
 	// 求解失败再逐级放宽范围重试。
 	// noPrune（填充/板框等实心障碍）始终保留——否则窄走廊会把内部网格圆剪掉，
 	// 导致"穿过填充"的假合法路径。
-	for (const expand of expands) {
+	for (let ei = 0; ei < expands.length; ei++) {
+		const expand = expands[ei];
 		let subset = all;
 		if (expand !== Infinity) {
-			subset = all.filter(c =>
-				c.noPrune ||
-				pointSegDist(c.x, c.y, src.x, src.y, dst.x, dst.y) < c.r + expand ||
-				dist(c.x, c.y, src.x, src.y) < c.r + expand ||
-				dist(c.x, c.y, dst.x, dst.y) < c.r + expand);
+			const kept: RBObstacle[] = [];
+			const candidates: Array<{ o: RBObstacle; d: number }> = [];
+			for (const c of all) {
+				if (c.noPrune) { kept.push(c); continue; }
+				const dSeg = pointSegDist(c.x, c.y, src.x, src.y, dst.x, dst.y);
+				if (dSeg < c.r + expand || dist(c.x, c.y, src.x, src.y) < c.r + expand || dist(c.x, c.y, dst.x, dst.y) < c.r + expand) {
+					candidates.push({ o: c, d: dSeg });
+				}
+			}
+			// 规模上限：只保留离直连线最近的障碍，防止走廊放宽后图爆炸
+			const MAX_SUBSET = 1400;
+			if (candidates.length > MAX_SUBSET) {
+				candidates.sort((a, b) => a.d - b.d);
+				candidates.length = MAX_SUBSET;
+			}
+			subset = kept.concat(candidates.map(c => c.o));
 		}
-		const res = solve(src, dst, subset, net);
+		// 每一级之间主动让出，保证 EDA 主线程始终可响应
+		if (ei > 0) await yieldToHost();
+
+		const deadline = Date.now() + budgetMs;
+		(globalThis as any).__RB_PHASE__ = 'vr:solve';
+		const res = await solve(src, dst, subset, net, deadline);
+		(globalThis as any).__RB_PHASE__ = 'vr:validate';
 		if (res.ok && validatePrimsAgainst(res.prims, all, net)) return res;
 	}
 	return { ok: false, prims: [] };
@@ -211,13 +267,14 @@ function validatePrimsAgainst(prims: RBPrimitive[], all: RBObstacle[], net = '')
 	return true;
 }
 
-/** 对给定圆集合求解橡皮筋路径 */
-function solve(
+/** 对给定圆集合求解橡皮筋路径（协作式：定期让出主线程，超时放弃） */
+async function solve(
 	src: { x: number; y: number },
 	dst: { x: number; y: number },
 	obstacles: RBObstacle[],
 	net = '',
-): RouteConnectionResult {
+	deadline: number = Date.now() + SOLVE_BUDGET_MS,
+): Promise<RouteConnectionResult> {
 	// 拆分：可绕行圆（建图）与纯阻挡圆（填充内部网格，只参与碰撞检查）
 	const circles: RBObstacle[] = [];
 	const blockers: RBObstacle[] = [];
@@ -241,6 +298,8 @@ function solve(
 
 	// 切点去重：键 = 圆下标 + 角度量化
 	const ptIndex = new Map<string, number>();
+	// 按圆分桶（避免弧边循环里对全部切点做字符串扫描：那是 O(n×切点数)）
+	const ptsByCircle: number[][] = Array.from({ length: n }, () => []);
 	const getOrCreatePt = (ci: number, x: number, y: number): number => {
 		const angle = Math.atan2(y - circles[ci].y, x - circles[ci].x);
 		const key = `${ci}:${Math.round(angle * 1000)}`;
@@ -254,14 +313,34 @@ function solve(
 			angle, adj: [],
 		});
 		ptIndex.set(key, idx);
+		ptsByCircle[ci].push(idx);
 		return idx;
 	};
 
 	// 1. 圆-圆公切线（4 种侧别组合）
-	for (let i = 0; i < n; i++) {
+	//    配对数是 O(n²)，是本求解器的主要开销：定期让出主线程并在超预算时提前收手
+	let lastYield = Date.now();
+	let timedOut = false;
+	for (let i = 0; i < n && !timedOut; i++) {
 		const ci = circles[i];
 		if (net && ci.net === net) continue;
+		{
+			const now = Date.now();
+			if (now > deadline) { timedOut = true; break; }
+			if (now - lastYield >= YIELD_INTERVAL_MS) {
+				lastYield = now;
+				await yieldToHost();
+			}
+		}
 		for (let j = i + 1; j < n; j++) {
+			if ((j & 31) === 0) {
+				const now = Date.now();
+				if (now > deadline) { timedOut = true; break; }
+				if (now - lastYield >= YIELD_INTERVAL_MS) {
+					lastYield = now;
+					await yieldToHost();
+				}
+			}
 			const cj = circles[j];
 			const d = dist(ci.x, ci.y, cj.x, cj.y);
 			for (const [l1, l2] of [[true, true], [true, false], [false, true], [false, false]] as const) {
@@ -279,6 +358,7 @@ function solve(
 			}
 		}
 	}
+	if (timedOut) return { ok: false, prims: [] };
 
 	// 2. 终端 ↔ 圆切线
 	const connectTerminal = (termIdx: number) => {
@@ -308,10 +388,15 @@ function solve(
 
 	// 4. 同圆弧边：切点按角度排序，相邻切点之间双向连弧（弧几何合法即建边）
 	for (let i = 0; i < n; i++) {
-		const pts: number[] = [];
-		for (const [key, idx] of ptIndex) {
-			if (key.startsWith(`${i}:`)) pts.push(idx);
+		{
+			const now = Date.now();
+			if (now > deadline) return { ok: false, prims: [] };
+			if (now - lastYield >= YIELD_INTERVAL_MS) {
+				lastYield = now;
+				await yieldToHost();
+			}
 		}
+		const pts = ptsByCircle[i];
 		if (pts.length < 2) continue;
 		pts.sort((a, b) => nodes[a].angle - nodes[b].angle);
 		const m = pts.length;
@@ -339,6 +424,11 @@ function solve(
 			}
 		}
 	}
+
+	// 图规模上限：节点过多时该走廊级别已失去意义（Dijkstra/重建都会过重），
+	// 直接放弃，让调用方尝试更窄走廊或降级
+	const MAX_GRAPH_NODES = 250000;
+	if (nodes.length > MAX_GRAPH_NODES) return { ok: false, prims: [] };
 
 	// 5. Dijkstra（二叉堆，O(E log V)）
 	const total = nodes.length;
@@ -377,7 +467,17 @@ function solve(
 		}
 		return top;
 	};
+	let dijkstraPops = 0;
 	for (;;) {
+		// Dijkstra 也是 O(E log V) 的重计算，必须同样让出主线程并受预算约束
+		if ((++dijkstraPops & 4095) === 0) {
+			const now = Date.now();
+			if (now > deadline) return { ok: false, prims: [] };
+			if (now - lastYield >= YIELD_INTERVAL_MS) {
+				lastYield = now;
+				await yieldToHost();
+			}
+		}
 		const top = heapPop();
 		if (!top) break;
 		const [du, u] = top;

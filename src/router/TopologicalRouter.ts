@@ -21,6 +21,9 @@ export type StatusCallback = (status: 'connected' | 'disconnected') => void;
 
 // PCB 单位：1mil = 0.0254mm
 const MM_TO_MIL = 39.3701;
+// 整轮布线的时间预算：超过后停止重试与撕毁重布，直接收尾。
+// 协作式让出保证 UI 不冻结，但长尾重试仍会拖长总时长，需要硬上限。
+const ROUTE_BUDGET_MS = 120000;
 
 // DRC 回退默认值
 const FALLBACK_TRACE_WIDTH_MIL = 8;
@@ -456,25 +459,47 @@ export class TopologicalRouter {
 				return aMax - bMax;
 			});
 
+			// 心跳监测：记录主线程被同步阻塞超过 300ms 的阶段（诊断卡死用）
+			{
+				const blocks: Array<{ gap: number; phase: string }> = [];
+				(globalThis as any).__RB_BLOCKS__ = blocks;
+				let lastBeat = Date.now();
+				const hb = setInterval(() => {
+					const now = Date.now();
+					const gap = now - lastBeat;
+					if (gap > 300) blocks.push({ gap, phase: (globalThis as any).__RB_PHASE__ ?? '?' });
+					lastBeat = now;
+				}, 100);
+				(globalThis as any).__RB_HB__ = hb;
+			}
+
 			// Step 4: 逐网络布线
-			let routedNets = 0;
 			const createdCounter = { lines: 0, vias: 0 };
-			const failedNets: string[] = [];
+			const routeDeadline = Date.now() + ROUTE_BUDGET_MS;
 			const pendingNets: Array<{ name: string; pads: EnginePad[] }> = [];
 
 			for (let ni = 0; ni < networks.length; ni++) {
 				if (this.shouldCancel) break;
+				if (Date.now() > routeDeadline) {
+					this.onLog?.('布线时间预算用尽，跳过剩余网络', 'warn');
+					break;
+				}
 				const net = networks[ni];
+				(globalThis as any).__RB_PHASE__ = 'router:net:' + net.name;
 				const pct = 20 + Math.floor((ni / networks.length) * 55);
 				this.onProgress?.({ stage: '布线中', percentage: pct, message: `布线网络 ${ni + 1}/${networks.length}: ${net.name}` });
 
+				(globalThis as any).__RB_PHASE__ = 'router:' + net.name;
 				const ok = await this.routeNetEdges(net, staticObstacles, allPads, drc, createdCounter);
-				if (ok) routedNets++;
-				else pendingNets.push(net);
+				if (!ok) pendingNets.push(net);
 			}
 
 			// 多轮撕毁重布
 			for (let pass = 0; pass < 2 && pendingNets.length; pass++) {
+				if (Date.now() > routeDeadline) {
+					this.onLog?.('布线时间预算用尽，停止撕毁重布', 'warn');
+					break;
+				}
 				const next: typeof pendingNets = [];
 				for (const net of pendingNets) {
 					if (this.shouldCancel) break;
@@ -490,14 +515,13 @@ export class TopologicalRouter {
 					if (!rip.length) { next.push(net); continue; }
 					this.onLog?.(`第 ${pass + 1} 轮：网络 ${net.name} 撕毁 ${rip.join(', ')} 重试`, 'warn');
 					for (const n of rip) await this.ripupNet(n);
-					const ok = await this.routeNetEdges(net, staticObstacles, allPads, drc, createdCounter);
+					(globalThis as any).__RB_PHASE__ = 'router:' + net.name;
+				const ok = await this.routeNetEdges(net, staticObstacles, allPads, drc, createdCounter);
 					let routed = ok;
-					if (ok) routedNets++;
 					for (let i = rip.length - 1; i >= 0; i--) {
 						const ripped = networks.find(nn => nn.name === rip[i])!;
 						const rok = await this.routeNetEdges(ripped, staticObstacles, allPads, drc, createdCounter);
-						if (rok) routedNets++;
-						else next.push(ripped);
+						if (!rok) next.push(ripped);
 					}
 					if (!routed) next.push(net);
 				}
@@ -506,7 +530,7 @@ export class TopologicalRouter {
 			}
 
 			// 最终成组重布：拆除所有封路网，失败网按外向优先（maxX 降序）重布，再重布被拆网
-			if (pendingNets.length) {
+			if (pendingNets.length && Date.now() <= routeDeadline) {
 				const sealsAll = new Set<string>();
 				for (const net of pendingNets) {
 					const [pa, pb] = [net.pads[0], net.pads[net.pads.length - 1]];
@@ -529,18 +553,24 @@ export class TopologicalRouter {
 						return xb - xa;
 					});
 					for (const net of ordered) {
-						if (await this.routeNetEdges(net, staticObstacles, allPads, drc, createdCounter)) routedNets++;
-						else { failedNets.push(net.name); this.onLog?.(`成组重布：${net.name} 仍失败`, 'error'); }
+						if (!(await this.routeNetEdges(net, staticObstacles, allPads, drc, createdCounter))) {
+							this.onLog?.(`成组重布：${net.name} 仍失败`, 'error');
+						}
 					}
 					for (const n of rip) {
 						const ripped = networks.find(nn => nn.name === n)!;
-						if (await this.routeNetEdges(ripped, staticObstacles, allPads, drc, createdCounter)) routedNets++;
-						else { failedNets.push(ripped.name); this.onLog?.(`成组重布：重布 ${n} 失败`, 'error'); }
+						if (!(await this.routeNetEdges(ripped, staticObstacles, allPads, drc, createdCounter))) {
+							this.onLog?.(`成组重布：重布 ${n} 失败`, 'error');
+						}
 					}
 					pendingNets.length = 0;
 				}
 			}
-			for (const net of pendingNets) failedNets.push(net.name);
+			try { const hb = (globalThis as any).__RB_HB__; if (hb) clearInterval(hb); } catch { /* ignore */ }
+
+			// 以实际已布网络集合为准统计（撕毁重布不会重复计数）
+			const routedNets = this.routedOrder.length;
+			const failedNets = networks.filter(n => !this.routedOrder.includes(n.name)).map(n => n.name);
 
 			this.onProgress?.({ stage: '布线完成', percentage: 98, message: '布线完成' });
 			this.onLog?.(
@@ -672,7 +702,7 @@ export class TopologicalRouter {
 					if (!stubsOK) break;
 				}
 				if (stubsOK) {
-					result = routeConnection(escSrc, escDst, layerFiltered, net.name, [150, 500]);
+					result = await routeConnection(escSrc, escDst, layerFiltered, net.name, [150, 500]);
 				}
 				// 首选逃逸方向失败：尝试备选逃逸方向（次优/第三优）
 				if ((!result.ok || result.prims.length === 0) && escSrc && escDst) {
@@ -691,7 +721,7 @@ export class TopologicalRouter {
 								if (!ok2) break;
 							}
 							if (ok2) {
-								const r2 = routeConnection(a1, a2, layerFiltered, net.name, [150]);
+								const r2 = await routeConnection(a1, a2, layerFiltered, net.name, [150]);
 								if (r2.ok && r2.prims.length > 0) {
 									stub1 = s1; stub2 = s2; result = r2;
 									break outer;
@@ -703,7 +733,7 @@ export class TopologicalRouter {
 			}
 			if (!result.ok || result.prims.length === 0) {
 				stub1 = stub2 = null;
-				result = routeConnection({ x: src.x, y: src.y }, { x: dst.x, y: dst.y }, layerFiltered, net.name);
+				result = await routeConnection({ x: src.x, y: src.y }, { x: dst.x, y: dst.y }, layerFiltered, net.name);
 			}
 
 			if (!result.ok || result.prims.length === 0) {
