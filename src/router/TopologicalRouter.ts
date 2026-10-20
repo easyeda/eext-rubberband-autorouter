@@ -23,7 +23,7 @@ export type StatusCallback = (status: 'connected' | 'disconnected') => void;
 const MM_TO_MIL = 39.3701;
 // 整轮布线的时间预算：超过后停止重试与撕毁重布，直接收尾。
 // 协作式让出保证 UI 不冻结，但长尾重试仍会拖长总时长，需要硬上限。
-const ROUTE_BUDGET_MS = 120000;
+const ROUTE_BUDGET_MS = 300000;
 
 // DRC 回退默认值
 const FALLBACK_TRACE_WIDTH_MIL = 8;
@@ -108,6 +108,10 @@ export class TopologicalRouter {
 	private netRendered = new Map<string, RenderedPrim[]>();
 	/** 已布网络顺序 */
 	private routedOrder: string[] = [];
+	/** 规划阶段的过孔（布线结束后统一写入） */
+	private plannedVias: Array<{ net: string; x: number; y: number; dia: number; hole: number }> = [];
+	/** 布线前飞线是否处于启用状态（结束后需恢复） */
+	private ratlineWasActive = false;
 
 	constructor(
 		onProgress?: ProgressCallback,
@@ -415,7 +419,13 @@ export class TopologicalRouter {
 		this.netPrimIds.clear();
 		this.netRendered.clear();
 		this.routedOrder = [];
+		this.plannedVias = [];
 		this.escapeReservationCache = null;
+		this.ratlineWasActive = false;
+
+		// 注意：不要 stopCalculatingRatline。实测（v4.1.80）在暂停飞线期间创建的图元
+		// 不会被加入连通性图，恢复后也不补算，导致所有网络报「未连接」。
+		// 延迟写入已经保证求解期间没有任何文档变更，飞线本来就不会重算。
 
 		try {
 			// Step 0: DRC 规则
@@ -566,6 +576,109 @@ export class TopologicalRouter {
 					pendingNets.length = 0;
 				}
 			}
+			// Step 5: 统一写入画布（规划完成后一次写入，避免边算边重绘）
+			this.onProgress?.({ stage: '导入走线', percentage: 92, message: '正在写入走线...' });
+			let writtenLines = 0, writtenArcs = 0;
+			let writeWaits = 0;
+
+			/** 合并同圆相邻弧与共线相邻线段：减少接缝（编辑器坐标取整会造成 0.1mil 级断点） */
+			const mergePrims = (prims: RenderedPrim[]): RenderedPrim[] => {
+				const out: RenderedPrim[] = [];
+				for (const p of prims) {
+					const last = out[out.length - 1];
+					if (p.kind === 'arc' && last && last.kind === 'arc' &&
+						Math.abs((last.cx ?? 0) - (p.cx ?? 0)) < 0.01 &&
+						Math.abs((last.cy ?? 0) - (p.cy ?? 0)) < 0.01 &&
+						Math.abs((last.r ?? 0) - (p.r ?? 0)) < 0.01) {
+						const lastEnd = (last.startAngle ?? 0) + (last.sweep ?? 0);
+						let diff = Math.abs(lastEnd - (p.startAngle ?? 0)) % (Math.PI * 2);
+						if (diff > Math.PI) diff = Math.PI * 2 - diff;
+						if (diff < 0.03) {
+							out[out.length - 1] = { ...last, sweep: (last.sweep ?? 0) + (p.sweep ?? 0) };
+							continue;
+						}
+					}
+					if (p.kind === 'line' && last && last.kind === 'line') {
+						const sameEnd = Math.hypot((last.x2 ?? 0) - (p.x1 ?? 0), (last.y2 ?? 0) - (p.y1 ?? 0)) < 0.3;
+						if (sameEnd) {
+							const ax = (p.x2 ?? 0) - (p.x1 ?? 0), ay = (p.y2 ?? 0) - (p.y1 ?? 0);
+							const bx = (last.x2 ?? 0) - (last.x1 ?? 0), by = (last.y2 ?? 0) - (last.y1 ?? 0);
+							const cross = ax * by - ay * bx;
+							const dot = ax * bx + ay * by;
+							const la = Math.hypot(ax, ay), lb = Math.hypot(bx, by);
+							if (la > 1e-6 && lb > 1e-6 && Math.abs(cross) / (la * lb) < 0.01 && dot > 0) {
+								out[out.length - 1] = { ...last, x2: p.x2, y2: p.y2 };
+								continue;
+							}
+						}
+					}
+					out.push(p);
+				}
+				return out;
+			};
+
+			for (const [netName, primsRaw] of this.netRendered) {
+				const prims = mergePrims(primsRaw as RenderedPrim[]);
+				// 接续：用前一个图元的实际终点作为下一个���元的起点（消除编辑器取整造成的断点）
+				let lastEnd: { x: number; y: number } | null = null;
+				for (const pr of prims) {
+					if (this.shouldCancel) break;
+					try {
+						if (pr.kind === 'line') {
+							// 注意：即使是极短线段也不能丢——它是切线链的接续段，丢了会断网
+							let sx = pr.x1!, sy = pr.y1!, ex = pr.x2!, ey = pr.y2!;
+							if (lastEnd && Math.hypot(sx - lastEnd.x, sy - lastEnd.y) < 0.5) { sx = lastEnd.x; sy = lastEnd.y; }
+							const created = await eda.pcb_PrimitiveLine.create(netName, pr.layer, sx, sy, ex, ey, drc.traceWidthMil, false);
+							const ce = created as any;
+							lastEnd = (ce && typeof ce.endX === 'number') ? { x: ce.endX, y: ce.endY } : { x: ex, y: ey };
+							writtenLines++;
+						} else {
+							// EDA 两点式圆弧角度约定与数学正方向一致（实测：正角=逆时针凸向南）
+							const deg = pr.sweep! * 180 / Math.PI;
+							let sx = pr.cx! + pr.r! * Math.cos(pr.startAngle!);
+							let sy = pr.cy! + pr.r! * Math.sin(pr.startAngle!);
+							// 极小的弧：降级为等效直线段（不能跳过，否则切线链断网）
+							if (Math.abs(deg) < 0.05) {
+								const ex0 = pr.cx! + pr.r! * Math.cos(pr.startAngle! + pr.sweep!);
+								const ey0 = pr.cy! + pr.r! * Math.sin(pr.startAngle! + pr.sweep!);
+								if (lastEnd && Math.hypot(sx - lastEnd.x, sy - lastEnd.y) < 0.5) { sx = lastEnd.x; sy = lastEnd.y; }
+								const createdL = await eda.pcb_PrimitiveLine.create(netName, pr.layer, sx, sy, ex0, ey0, drc.traceWidthMil, false);
+								const ceL = createdL as any;
+								lastEnd = (ceL && typeof ceL.endX === 'number') ? { x: ceL.endX, y: ceL.endY } : { x: ex0, y: ey0 };
+								writtenLines++;
+								continue;
+							}
+							// 近整圆的弧无法用两点式表达：跳过（起终点几乎重合，不影响连通）
+							if (Math.abs(Math.abs(deg) - 360) < 0.05) continue;
+							const ex = pr.cx! + pr.r! * Math.cos(pr.startAngle! + pr.sweep!);
+							const ey = pr.cy! + pr.r! * Math.sin(pr.startAngle! + pr.sweep!);
+							if (lastEnd && Math.hypot(sx - lastEnd.x, sy - lastEnd.y) < 0.5) { sx = lastEnd.x; sy = lastEnd.y; }
+							const created = await eda.pcb_PrimitiveArc.create(netName, pr.layer, sx, sy, ex, ey, deg, drc.traceWidthMil);
+							const ce = created as any;
+							lastEnd = (ce && typeof ce.endX === 'number') ? { x: ce.endX, y: ce.endY } : { x: ex, y: ey };
+							writtenArcs++;
+						}
+					} catch (err) {
+						console.warn(`[TopologicalRouter] 写入图元失败 (${netName}):`, err);
+					}
+					// 每 64 个图元让渲染器呼吸一次
+					if (((writtenLines + writtenArcs) & 63) === 0) {
+						writeWaits++;
+						await new Promise<void>(r => setTimeout(r, 0));
+					}
+				}
+				if (this.shouldCancel) break;
+			}
+			// 过孔
+			for (const via of this.plannedVias) {
+				try {
+					await eda.pcb_PrimitiveVia.create(via.net, via.x, via.y, via.hole, via.dia);
+				} catch (err) {
+					console.warn(`[TopologicalRouter] 创建过孔失败 (${via.net}):`, err);
+				}
+			}
+			this.onProgress?.({ stage: '写入完成', percentage: 98, message: `已写入 ${writtenLines + writtenArcs} 段走线` });
+
 			try { const hb = (globalThis as any).__RB_HB__; if (hb) clearInterval(hb); } catch { /* ignore */ }
 
 			// 以实际已布网络集合为准统计（撕毁重布不会重复计数）
@@ -574,14 +687,14 @@ export class TopologicalRouter {
 
 			this.onProgress?.({ stage: '布线完成', percentage: 98, message: '布线完成' });
 			this.onLog?.(
-				`布线完成：${routedNets}/${networks.length} 个网络，写入 ${createdCounter.lines} 段走线，${createdCounter.vias} 个过孔` +
+				`布线完成：${routedNets}/${networks.length} 个网络，写入 ${writtenLines + writtenArcs} 段走线，${this.plannedVias.length} 个过孔` +
 				(failedNets.length ? `；失败网络：${failedNets.join(', ')}` : ''),
 				failedNets.length ? 'warn' : 'success',
 			);
 
 			this.isRouting = false;
 			this.onStatus?.('disconnected');
-			return failedNets.length === 0 && createdCounter.lines > 0;
+			return failedNets.length === 0 && (writtenLines + writtenArcs) > 0;
 
 		} catch (error) {
 			console.error('[TopologicalRouter] 布线错误:', error);
@@ -741,115 +854,89 @@ export class TopologicalRouter {
 				return false;
 			}
 
-			// 写入 EDA
+			// ── 仅规划，不写 EDA ─────────────────────────────
+			// 边算边写会让画布每写一段就重绘，GUI 下求解被拖慢数十倍
+			// （v0.0.22 在 GUI 只布了 2 个网络就是被 120s 预算截断）。
+			// 这里只把图元记录在内存中，布线全部结束后一次性写入。
+			// 按链式顺序存储：stub1 → 路径各段 → stub2（写入时才能逐段接续）
 			const rendered: RenderedPrim[] = [];
-			const primIds: string[] = [];
-			try {
-				for (const st of [stub1, stub2]) {
-					if (!st) continue;
-					const createdLine = await eda.pcb_PrimitiveLine.create(net.name, routingLayer, st.x1!, st.y1!, st.x2!, st.y2!, drc.traceWidthMil, false);
-					const pid = (createdLine as any)?.primitiveId;
-					if (pid) primIds.push(pid);
-					rendered.push(st);
-					createdCounter.lines++;
+			if (stub1) { rendered.push(stub1); createdCounter.lines++; }
+			for (const pr of result.prims) {
+				if (pr.kind === 'line') {
+					rendered.push({ kind: 'line', net: net.name, layer: routingLayer, x1: pr.x1, y1: pr.y1, x2: pr.x2, y2: pr.y2 });
+				} else {
+					const deg = pr.sweep * 180 / Math.PI;
+					if (Math.abs(deg) < 0.05 || Math.abs(Math.abs(deg) - 360) < 0.05) continue;
+					rendered.push({ kind: 'arc', net: net.name, layer: routingLayer, cx: pr.cx, cy: pr.cy, r: pr.r, startAngle: pr.startAngle, sweep: pr.sweep });
 				}
-				for (const pr of result.prims) {
-					if (pr.kind === 'line') {
-						const createdLine = await eda.pcb_PrimitiveLine.create(
-							net.name, routingLayer, pr.x1, pr.y1, pr.x2, pr.y2, drc.traceWidthMil, false,
-						);
-						const pid = (createdLine as any)?.primitiveId;
-						if (pid) primIds.push(pid);
-						rendered.push({ kind: 'line', net: net.name, layer: routingLayer, x1: pr.x1, y1: pr.y1, x2: pr.x2, y2: pr.y2 });
-					} else {
-						const sx = pr.cx + pr.r * Math.cos(pr.startAngle);
-						const sy = pr.cy + pr.r * Math.sin(pr.startAngle);
-						const ex = pr.cx + pr.r * Math.cos(pr.startAngle + pr.sweep);
-						const ey = pr.cy + pr.r * Math.sin(pr.startAngle + pr.sweep);
-								// EDA 两点式圆弧角度约定与数学正方向一致（实测：正角=逆时针凸向南）
-								const deg = pr.sweep * 180 / Math.PI;
-						if (Math.abs(deg) < 0.05 || Math.abs(Math.abs(deg) - 360) < 0.05) continue;
-						const createdArc = await eda.pcb_PrimitiveArc.create(net.name, routingLayer, sx, sy, ex, ey, deg, drc.traceWidthMil);
-						const pid = (createdArc as any)?.primitiveId;
-						if (pid) primIds.push(pid);
-						rendered.push({ kind: 'arc', net: net.name, layer: routingLayer, cx: pr.cx, cy: pr.cy, r: pr.r, startAngle: pr.startAngle, sweep: pr.sweep });
-					}
-					createdCounter.lines++;
-				}
-			} catch (err) {
-				const emsg = err instanceof Error ? err.message : String(err);
-				console.warn(`[TopologicalRouter] 创建走线失败 (${net.name}):`, err);
-				this.onLog?.(`网络 ${net.name}: 走线写入失败: ${emsg.slice(0, 120)}`, 'error');
-				// 回滚本次已创建的图元，避免残留孤儿走线变成障碍
-				for (const pid of primIds) {
-					try { await eda.pcb_PrimitiveLine.delete(pid); } catch {
-						try { await (eda as any).pcb_PrimitiveArc.delete(pid); } catch { /* 忽略 */ }
-					}
-				}
-				return false;
+				createdCounter.lines++;
 			}
+			if (stub2) { rendered.push(stub2); createdCounter.lines++; }
 
-			// 过孔：跨层时在终点创建
+			// 过孔：跨层时在终点规划一个过孔（统一在最后写入）
 			const srcLayer = src.layer === 12 ? routingLayer : src.layer;
 			const dstLayer = dst.layer === 12 ? routingLayer : dst.layer;
 			if (srcLayer !== dstLayer) {
-				try {
-					const viaD = Math.max(20, drc.traceWidthMil * 2);
-					const viaHole = Math.max(10, drc.traceWidthMil);
-					await eda.pcb_PrimitiveVia.create(net.name, dst.x, dst.y, viaHole, viaD);
-					createdCounter.vias++;
-				} catch (err) {
-					console.warn(`[TopologicalRouter] 创建过孔失败 (${net.name}):`, err);
-				}
+				this.plannedVias.push({
+					net: net.name, x: dst.x, y: dst.y,
+					dia: Math.max(20, drc.traceWidthMil * 2),
+					hole: Math.max(10, drc.traceWidthMil),
+				});
+				createdCounter.vias++;
 			}
 
-			// 扇出圆角：出线段/入线段与路径首末段之间插入切线圆弧
+			// 扇出圆角（纯内存）：出线段→路径首段、路径末段→入线段
 			try {
-				const first = rendered.find(r2 => r2.kind === 'line' && r2 !== stub1 && r2 !== stub2);
-				if (stub1 && first && (first as any).x1 === stub1.x2 && (first as any).y1 === stub1.y2) {
+				const R = Math.min(30, drc.traceWidthMil * 3);
+				const first = rendered.find(r2 => r2.kind === 'line' && r2 !== stub1 && r2 !== stub2) as
+					{ kind: 'line'; x1: number; y1: number; x2: number; y2: number } | undefined;
+				if (stub1 && first && first.x1 === stub1.x2 && first.y1 === stub1.y2) {
 					const f1 = fanoutFillet(
 						{ x1: stub1.x1!, y1: stub1.y1!, x2: stub1.x2!, y2: stub1.y2! },
-						{ x1: (first as any).x1, y1: (first as any).y1, x2: (first as any).x2, y2: (first as any).y2 },
-						Math.min(30, drc.traceWidthMil * 3),
+						first, R,
 					);
 					if (f1) {
 						const l0 = f1.prims[0], ar = f1.prims[1], l2 = f1.prims[2];
 						if (l0.kind === 'line' && ar.kind === 'arc' && l2.kind === 'line') {
-							const fi = rendered.indexOf(first);
-							rendered[fi] = { kind: 'line', net: net.name, layer: routingLayer, x1: l0.x1, y1: l0.y1, x2: l0.x2, y2: l0.y2 };
-							rendered.splice(fi + 1, 0,
-								{ kind: 'arc', net: net.name, layer: routingLayer, cx: ar.cx, cy: ar.cy, r: ar.r, startAngle: ar.startAngle, sweep: ar.sweep },
-								{ kind: 'line', net: net.name, layer: routingLayer, x1: l2.x1, y1: l2.y1, x2: l2.x2, y2: l2.y2 });
-							// EDA 侧同步：删旧首段，画圆角新段
-							const oldId = primIds.shift();
-							if (oldId) { try { await eda.pcb_PrimitiveLine.delete(oldId); } catch { /* ignore */ } }
-							for (const nl of [l0, l2]) {
-								const cl = await eda.pcb_PrimitiveLine.create(net.name, routingLayer, nl.x1, nl.y1, nl.x2, nl.y2, drc.traceWidthMil, false);
-								const nid = (cl as any)?.primitiveId;
-								if (nid) primIds.unshift(nid);
-								createdCounter.lines++;
+							const fi = rendered.indexOf(first as any);
+							const si = rendered.indexOf(stub1 as any);
+							if (fi >= 0) rendered[fi] = { kind: 'line', net: net.name, layer: routingLayer, x1: l2.x1, y1: l2.y1, x2: l2.x2, y2: l2.y2 };
+							if (si >= 0) {
+								rendered[si] = { kind: 'line', net: net.name, layer: routingLayer, x1: l0.x1, y1: l0.y1, x2: l0.x2, y2: l0.y2 };
+								rendered.splice(si + 1, 0, { kind: 'arc', net: net.name, layer: routingLayer, cx: ar.cx, cy: ar.cy, r: ar.r, startAngle: ar.startAngle, sweep: ar.sweep });
 							}
-							const ca = await (eda as any).pcb_PrimitiveArc.create(net.name, routingLayer,
-								ar.cx + ar.r * Math.cos(ar.startAngle),
-								ar.cy + ar.r * Math.sin(ar.startAngle),
-								ar.cx + ar.r * Math.cos(ar.startAngle + ar.sweep),
-								ar.cy + ar.r * Math.sin(ar.startAngle + ar.sweep),
-								ar.sweep * 180 / Math.PI, drc.traceWidthMil);
-							const caid = (ca as any)?.primitiveId;
-							if (caid) primIds.splice(1, 0, caid);
-							createdCounter.lines++;
+						}
+					}
+				}
+				// 终点端圆角：路径末段 → 入线段（链序中 stub2 的前一个）
+				const s2idx = stub2 ? rendered.indexOf(stub2 as any) : -1;
+				if (stub2 && s2idx > 0) {
+					const lastPath = rendered[s2idx - 1] as any;
+					if (lastPath && lastPath.kind === 'line' && lastPath.x2 === stub2.x1 && lastPath.y2 === stub2.y1) {
+						const f2 = fanoutFillet(
+							{ x1: lastPath.x1, y1: lastPath.y1, x2: lastPath.x2, y2: lastPath.y2 },
+							{ x1: stub2.x1!, y1: stub2.y1!, x2: stub2.x2!, y2: stub2.y2! },
+							R,
+						);
+						if (f2) {
+							const l0 = f2.prims[0], ar = f2.prims[1], l2 = f2.prims[2];
+							if (l0.kind === 'line' && ar.kind === 'arc' && l2.kind === 'line') {
+								const li = rendered.indexOf(lastPath);
+								const s2i = rendered.indexOf(stub2 as any);
+								if (li >= 0) rendered[li] = { kind: 'line', net: net.name, layer: routingLayer, x1: l0.x1, y1: l0.y1, x2: l0.x2, y2: l0.y2 };
+								if (s2i >= 0) rendered[s2i] = { kind: 'line', net: net.name, layer: routingLayer, x1: l2.x1, y1: l2.y1, x2: l2.x2, y2: l2.y2 };
+								if (li >= 0) rendered.splice(li + 1, 0, { kind: 'arc', net: net.name, layer: routingLayer, cx: ar.cx, cy: ar.cy, r: ar.r, startAngle: ar.startAngle, sweep: ar.sweep });
+							}
 						}
 					}
 				}
 			} catch { /* 圆角失败不影响主流程 */ }
 
-			// 记录并加入动态障碍
-			const ids = this.netPrimIds.get(net.name) ?? [];
-			ids.push(...primIds);
-			this.netPrimIds.set(net.name, ids);
+			// 记录规划结果并加入动态障碍
 			const rds = this.netRendered.get(net.name) ?? [];
 			rds.push(...rendered);
 			this.netRendered.set(net.name, rds);
+			this.addRenderedToObstacles(rendered, drc);
 			this.addRenderedToObstacles(rendered, drc);
 		}
 
@@ -861,19 +948,22 @@ export class TopologicalRouter {
 	 * 撕毁网络：删除其 EDA 图元与动态障碍
 	 */
 	private async ripupNet(netName: string): Promise<void> {
-		const ids = this.netPrimIds.get(netName) ?? [];
-		for (const pid of ids) {
-			try {
-				await eda.pcb_PrimitiveLine.delete(pid);
-			} catch {
-				try { await (eda as any).pcb_PrimitiveArc.delete(pid); } catch { /* 已删除 */ }
-			}
-		}
-		this.netPrimIds.delete(netName);
+		// 规划阶段只撤销内存记录：画布尚未写入，无需删除 EDA 图元
 		this.netRendered.delete(netName);
+		this.plannedVias = this.plannedVias.filter(v => v.net !== netName);
 		this.dynamicObstacles = this.dynamicObstacles.filter(o => o.net !== netName);
 		const ro = this.routedOrder.indexOf(netName);
 		if (ro >= 0) this.routedOrder.splice(ro, 1);
+	}
+
+	/** 恢复飞线计算（若布线前处于启用状态） */
+	private async restoreRatline(): Promise<void> {
+		if (!this.ratlineWasActive) return;
+		this.ratlineWasActive = false;
+		try {
+			await eda.pcb_Document.startCalculatingRatline();
+			this.onLog?.('已恢复飞线计算', 'info');
+		} catch { /* 忽略 */ }
 	}
 
 	private isPowerNet(name: string): boolean {
