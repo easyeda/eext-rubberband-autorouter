@@ -42,8 +42,21 @@ export class AutoRouterFacade {
 		const opts = { ...DEFAULT_OPTIONS, ...options };
 		this.cancelled = false;
 
+		// 点击菜单后立刻给用户反馈（此时还没开始重计算）
+		showInfo('橡皮筋自动布线：开始布线...');
+
+		// 心跳 Toast：每 5 秒提示一次当前阶段与耗时，
+		// 避免长时间计算期间界面"看起来没反应"
+		const startedAt = Date.now();
+		let lastMessage = '正在初始化...';
+		const heartbeat = setInterval(() => {
+			const sec = Math.round((Date.now() - startedAt) / 1000);
+			showInfo(`布线中 ${sec}s：${lastMessage}`);
+		}, 5000);
+
 		this.progress.onUpdate((info) => {
-			showInfo(`[${info.percent}%] ${info.message}`);
+			lastMessage = `[${info.percent}%] ${info.message}`;
+			showInfo(lastMessage);
 		});
 
 		this.logger.info('开始布线...');
@@ -65,6 +78,8 @@ export class AutoRouterFacade {
 				netsTotal: 0,
 				message: msg,
 			};
+		} finally {
+			clearInterval(heartbeat);
 		}
 	}
 

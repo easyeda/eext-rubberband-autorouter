@@ -164,11 +164,9 @@ function ensureYieldChannel(): MessageChannel | null {
 }
 
 function yieldToHost(): Promise<void> {
-	const g: any = globalThis as any;
-	// scheduler.yield 在 EDA 渲染器里最快（实测 0.06ms/次；setTimeout(0) 后台约 15ms）
-	if (g.scheduler && typeof g.scheduler.yield === 'function') {
-		try { return g.scheduler.yield(); } catch { /* 退回 MessageChannel */ }
-	}
+	// 注意：不要用 scheduler.yield——EDA 的 Electron 版本里它是假让出
+	// （立即 resolve，实测 0.03ms，不把控制权交还事件循环，UI 仍会冻结）。
+	// MessageChannel 是唯一既无节流又真正让出的原语；退路用 setTimeout。
 	const ch = ensureYieldChannel();
 	if (!ch) return new Promise<void>(resolve => setTimeout(resolve, 0));
 	return new Promise<void>(resolve => {
@@ -237,17 +235,22 @@ export async function routeConnection(
 		(globalThis as any).__RB_PHASE__ = 'vr:solve';
 		const res = await solve(src, dst, subset, net, deadline);
 		(globalThis as any).__RB_PHASE__ = 'vr:validate';
-		if (res.ok && validatePrimsAgainst(res.prims, all, net)) return res;
+		if (res.ok && await validatePrimsAgainst(res.prims, all, net)) return res;
 	}
 	return { ok: false, prims: [] };
 }
 
 /** 用全量障碍复验路径图元（防止走廊剪枝造成的假合法路径） */
-function validatePrimsAgainst(prims: RBPrimitive[], all: RBObstacle[], net = ''): boolean {
+async function validatePrimsAgainst(prims: RBPrimitive[], all: RBObstacle[], net = ''): Promise<boolean> {
 	const grid = new CircleGrid(all);
 	const segOK = makeSegmentChecker(all, grid, net);
 	const arcOK = makeArcChecker(all, grid, net);
+	let vLastYield = Date.now();
 	for (let i = 0; i < prims.length; i++) {
+		if ((i & 15) === 0) {
+			const now = Date.now();
+			if (now - vLastYield >= YIELD_INTERVAL_MS) { vLastYield = now; await yieldToHost(); }
+		}
 		const pr = prims[i];
 		if (pr.kind === 'line') {
 			if (!segOK(pr.x1, pr.y1, pr.x2, pr.y2, -1, -1)) {
@@ -475,7 +478,7 @@ async function solve(
 	let dijkstraPops = 0;
 	for (;;) {
 		// Dijkstra 也是 O(E log V) 的重计算，必须同样让出主线程并受预算约束
-		if ((++dijkstraPops & 4095) === 0) {
+		if ((++dijkstraPops & 511) === 0) {
 			const now = Date.now();
 			if (now > deadline) return { ok: false, prims: [] };
 			if (now - lastYield >= YIELD_INTERVAL_MS) {
