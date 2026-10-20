@@ -887,7 +887,7 @@ export class TopologicalRouter {
 
 			// 扇出圆角（纯内存）：出线段→路径首段、路径末段→入线段
 			try {
-				const R = Math.min(30, drc.traceWidthMil * 3);
+				const R = Math.min(40, drc.traceWidthMil * 4);
 				const first = rendered.find(r2 => r2.kind === 'line' && r2 !== stub1 && r2 !== stub2) as
 					{ kind: 'line'; x1: number; y1: number; x2: number; y2: number } | undefined;
 				if (stub1 && first && first.x1 === stub1.x2 && first.y1 === stub1.y2) {

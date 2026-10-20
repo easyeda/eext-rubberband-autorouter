@@ -164,6 +164,11 @@ function ensureYieldChannel(): MessageChannel | null {
 }
 
 function yieldToHost(): Promise<void> {
+	const g: any = globalThis as any;
+	// scheduler.yield 在 EDA 渲染器里最快（实测 0.06ms/次；setTimeout(0) 后台约 15ms）
+	if (g.scheduler && typeof g.scheduler.yield === 'function') {
+		try { return g.scheduler.yield(); } catch { /* 退回 MessageChannel */ }
+	}
 	const ch = ensureYieldChannel();
 	if (!ch) return new Promise<void>(resolve => setTimeout(resolve, 0));
 	return new Promise<void>(resolve => {
