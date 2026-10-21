@@ -209,7 +209,7 @@
 			</div>
 		</div>
 		<div class="top-right">
-			<span class="version" id="version">v-</span>
+			<span class="version" id="version">v__RB_VERSION__</span>
 			<div class="timer" id="timer">00:00</div>
 		</div>
 	</div>
@@ -429,6 +429,8 @@
 		}, 250);
 		ready();
 		startTimer();
+		var versionPlaceholder = '__RB_' + 'VERSION__';
+		if ($('version').textContent.indexOf(versionPlaceholder) >= 0) $('version').textContent = 'v-dev';
 	})();
 </script>
 </body>

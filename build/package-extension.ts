@@ -79,6 +79,13 @@ function main() {
 
 	const zip = new JSZip();
 	for (const file of fileList) {
+		// 把版本号写进内联框架 HTML，弹窗打开第一帧就能显示
+		if (file === 'iframe/params.html' || file === 'iframe/progress.html') {
+			const content = fs.readFileSync(__dirname + '/../' + file, { encoding: 'utf-8' })
+				.replace(/__RB_VERSION__/g, extensionConfig.version);
+			zip.file(file, content);
+			continue;
+		}
 		zip.file(file, fs.createReadStream(__dirname + '/../' + file));
 	}
 

@@ -63,6 +63,15 @@
 	}
 	h1 { margin: 0; font-size: 17px; font-weight: 700; letter-spacing: 0.2px; }
 	.hero p { margin: 3px 0 0; font-size: 12px; color: var(--muted); }
+	.hero-meta { display: flex; align-items: center; gap: 8px; }
+	.version-chip {
+		font-size: 11px; font-weight: 700; color: var(--muted);
+		background: var(--card);
+		border: 1px solid var(--card-border);
+		padding: 6px 10px; border-radius: 999px;
+		white-space: nowrap;
+		font-variant-numeric: tabular-nums;
+	}
 	.badge {
 		font-size: 11px; font-weight: 600; color: var(--accent);
 		background: var(--accent-soft);
@@ -252,7 +261,10 @@
 				<p>拓扑拉紧 · 圆润扇出 · Worker 并行计算</p>
 			</div>
 		</div>
-		<div class="badge" id="versionBadge">参数设置</div>
+		<div class="hero-meta">
+			<span class="version-chip" id="versionBadge">v__RB_VERSION__</span>
+			<span class="badge">参数设置</span>
+		</div>
 	</header>
 
 	<div class="error-bar" id="errorBar"></div>
@@ -518,7 +530,7 @@
 			if (data.type === 'defaults') {
 				responded = true;
 				if (data.version) {
-					$('versionBadge').textContent = 'v' + data.version + ' · 参数设置';
+					$('versionBadge').textContent = 'v' + data.version;
 				}
 				defaults = Object.assign({}, DEFAULTS, data.options || {});
 				applyOptions(defaults);
@@ -541,6 +553,9 @@
 			ready();
 		}, 250);
 		ready();
+		var badge = $('versionBadge');
+		var placeholder = '__RB_' + 'VERSION__';
+		if (badge.textContent.indexOf(placeholder) >= 0) badge.textContent = 'v-dev';
 		applyOptions(defaults);
 	})();
 </script>
