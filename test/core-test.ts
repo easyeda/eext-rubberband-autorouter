@@ -1,6 +1,6 @@
 /**
  * 核心算法单元测试
- * 运行方式：npx tsx test/core.test.ts
+ * 运行方式：npx tsx test/core-test.ts
  */
 
 // ─── 简单断言工具 ───────────────────────────────────────────────────────────
@@ -25,7 +25,7 @@ function describe(name: string, fn: () => void): void {
 
 // ─── RoutingOrchestrator 测试 ───────────────────────────────────────────────
 
-import { RoutingOrchestrator } from '../src/router/RoutingOrchestrator';
+import { RoutingOrchestrator } from '../src/router/routing-orchestrator';
 
 describe('RoutingOrchestrator.sortNetworks', () => {
 	const orch = new RoutingOrchestrator();
@@ -76,7 +76,7 @@ describe('RoutingOrchestrator.buildMST', () => {
 
 // ─── PathOptimizer 测试 ────────────────────────────────────────────────────
 
-import { PathOptimizer } from '../src/router/PathOptimizer';
+import { PathOptimizer } from '../src/router/path-optimizer';
 
 describe('PathOptimizer.countVias', () => {
 	const opt = new PathOptimizer();
@@ -123,7 +123,7 @@ describe('PathOptimizer.optimize - 共线点合并', () => {
 
 describe('ObstacleBypasser - 直接路径安全时返回直线', () => {
 	// 动态导入避免类型问题
-	const { ObstacleBypasser } = require('../src/router/ObstacleBypasser');
+	const { ObstacleBypasser } = require('../src/router/obstacle-bypasser');
 	const bypasser = new ObstacleBypasser(6, 8);
 
 	const start = { x: 0, y: 0 };
@@ -136,7 +136,7 @@ describe('ObstacleBypasser - 直接路径安全时返回直线', () => {
 });
 
 describe('ObstacleBypasser - 有障碍物时绕行', () => {
-	const { ObstacleBypasser } = require('../src/router/ObstacleBypasser');
+	const { ObstacleBypasser } = require('../src/router/obstacle-bypasser');
 	const bypasser = new ObstacleBypasser(6, 8);
 
 	const start = { x: 0, y: 0 };

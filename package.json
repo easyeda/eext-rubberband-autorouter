@@ -1,13 +1,13 @@
 {
   "name": "rubberband-autorouter",
-  "version": "0.0.33",
+  "version": "0.0.39",
   "description": "基于拓扑橡皮筋算法的PCB自动布线工具，使用本地JavaScript算法完成布线",
   "main": "dist/index.js",
   "scripts": {
-    "build": "node scripts/bump-version.js && tsx config/esbuild.prod.ts && npm run package",
-    "watch": "tsx config/esbuild.prod.ts --watch",
-    "package": "node -e \"const fs=require('fs');fs.rmSync('build/dist',{recursive:true,force:true});fs.mkdirSync('build/dist',{recursive:true})\" && tsx build/packaged.ts",
-    "test": "tsx test/core.test.ts"
+    "build": "node scripts/bump-version.js && tsx config/esbuild-prod.ts && npm run package",
+    "watch": "tsx config/esbuild-prod.ts --watch",
+    "package": "node -e \"const fs=require('fs');fs.rmSync('build/dist',{recursive:true,force:true});fs.mkdirSync('build/dist',{recursive:true})\" && tsx build/package-extension.ts",
+    "test": "tsx test/core-test.ts"
   },
   "keywords": [
     "pcb",

@@ -5,22 +5,22 @@
 ## 特性
 
 - ✅ **本地算法** - 纯 JavaScript 实现，无需启动外部服务
-- ✅ **拓扑路由** - 基于 Delaunay 三角剖分的拓扑橡皮筋算法
-- ✅ **实时反馈** - 进度条和日志实时更新
-- ✅ **简洁界面** - 简化的配置面板，易于使用
-- ✅ **高性能** - 直接执行，无通信延迟
+- ✅ **拓扑橡皮筋** - 可视图 + Dijkstra 求精确切线圆弧路径，凸包拉紧效果
+- ✅ **Worker 并行** - 规划在 Web Worker 中执行，不阻塞 EDA 界面
+- ✅ **参数弹窗** - 线宽、间距、逃逸长度、圆角、撕毁轮数等可视化调整
+- ✅ **实时进度** - 进度、统计、日志实时刷新，可随时手动停止
+- ✅ **实时写入** - 每个网络完成后立即刷新到 PCB 画布
+- ✅ **圆润扇出** - 根据焊盘长宽/旋转从端帽出线，切线圆角过渡
 - ✅ **增强焊盘识别** - 支持 TH、SMD、Via 多种焊盘类型
 - ✅ **过孔生成** - 自动检测层变化并创建过孔
-- ✅ **路径优化** - 橡皮筋算法优化路径，减少拐点
-- ✅ **智能避障** - 动态障碍物检测，自动绕行
-- ✅ **错误处理** - 完善的错误分类和自动重试机制
-- ✅ **DRC 检查** - 走线间距验证，避免 DRC 错误
+- ✅ **智能避障** - 圆形障碍群 + 动态走线障碍，严格满足 DRC 间距
+- ✅ **撕毁重布** - 失败网络自动拆除封路网络后重试
 
 ## 安装
 
 ### 方法 1：从 .eext 文件安装
 
-1. 下载 `rubberband-autorouter_v2.7.0.eext` 文件
+1. 下载 `rubberband-autorouter_v0.0.39.eext` 文件
 2. 打开嘉立创 EDA 专业版
 3. 进入 **扩展管理** (Extensions)
 4. 点击 **从本地安装** (Install from local)
@@ -50,112 +50,80 @@ npm run package
 
 ## 使用方法
 
-### 快速布线
-
 1. 打开 PCB 文档
 2. 菜单栏 → **橡皮筋自动布线** → **开始自动布线**
-3. 等待布线完成
+3. 在弹出的参数窗口中调整参数，点击 **开始布线**
+4. 进度窗口会实时显示进度、统计与日志；可随时点击 **停止布线**
+5. 布线过程中每个网络完成后立即写入画布，实时可见
 
-使用默认参数（10 轮），直接开始布线。
+### 参数说明
 
-### 自定义布线
-
-1. 打开 PCB 文档
-2. 菜单栏 → **橡皮筋自动布线** → **关于** 查看版本信息
-3. 在配置面板中设置参数：
-   - **最大轮数**：布线的最大迭代次数（1-1000）
-4. 点击 **开始布线**
-5. 查看实时日志和进度条
-6. 等待布线完成
+| 参数 | 默认值 | 说明 |
+|------|--------|------|
+| 走线宽度 | DRC 默认 | 同时影响障碍外扩半径 |
+| 额外安全间距 | 0 | 在 DRC 规则之上增加的余量 |
+| 逃逸线长度 | Pad 间距 + 线宽 + 20mil | 焊盘出线后的直行距离 |
+| 扇出圆角半径 | min(40, 线宽×4) | 出线段与路径之间的切线圆角，0 = 直角 |
+| 撕毁重布轮数 | 2 | 失败网络拆除封路网络后重试的轮数 |
+| 时间预算 | 300 秒 | 超时后停止重试；可在进度窗口手动停止 |
+| 电源网络优先 | 开 | GND/VCC/VDD 等网络先布 |
+| 实时预览 | 开 | 每布完一个网络立即刷新 PCB |
 
 ---
 
 ## 核心算法
 
-### 三级寻路策略
+### 拓扑橡皮筋（可视图 + Dijkstra）
 
-本扩展使用三级寻路策略，确保最佳布线效果：
+1. 焊盘/走线/填充/板框转为圆形障碍群（胶囊、多边形角点、内部阻挡网格）
+2. 构建圆与圆之间的公切线、圆自身的圆弧边，形成可视图
+3. 在可视图上运行 Dijkstra，得到严格满足间距的最短路径
+4. 路径输出为精确图元（直线 + 圆弧），形成“绳子拉紧”的凸包效果
 
-```
-1. A* 寻路（Delaunay 图）
-   ↓ 失败
-2. 障碍物绕行算法
-   ↓ 失败
-3. 降级直连（最后手段）
-```
+### 焊盘扇出
 
-#### 1. A* 寻路
+- `padExitModel` 根据焊盘长宽与旋转，从端帽沿长轴垂直出线
+- 出线段与路径首/末段之间插入 `fanoutFillet` 切线圆角
+- 每个焊盘的逃逸通道注册为网络专属预约，避免其他网络横穿
 
-基于 Delaunay 三角剖分生成的拓扑图，使用改进的 A* 算法：
-- 改进的启发式函数
-- 动态障碍物检测
-- 边代价优化（异网络 +50%，异层 +20%，朝向目标奖励 30%）
+### 撕毁重布
 
-#### 2. 障碍物绕行算法
+失败网络会识别封路的已布网络，拆除后按外向优先顺序重布，再重布被拆网络；
+支持多轮迭代与最终成组重布。
 
-当 A* 失败时，使用橡皮筋绕行算法：
-- 检测阻挡的障碍物
-- 在障碍物两侧 45° 方向生成绕行点
-- 尝试左侧和右侧绕行
-- 多点绕行（复杂障碍物）
-- 路径优化（移除不必要的点）
+### Worker 并行
 
-#### 3. 降级直连
-
-当前两种方法都失败时，尝试直接连接。
-
----
-
-### 算法流程
-
-```
-PCB 数据解析
-    ↓
-DRC 规则读取
-    ↓
-焊盘收集 + 障碍物构建
-    ↓
-Delaunay 三角剖分
-    ↓
-三级寻路（A* → 绕行 → 直连）
-    ↓
-路径优化
-    ↓
-过孔生成
-    ↓
-走线创建
-```
+- 纯几何规划（MST、逃逸点、可视图、圆角、撕毁重布）在 Web Worker 中执行
+- 主线程只负责 EDA API 读写、画布刷新与统计
+- Worker 不可用时自动回退到主线程（协作式让出，界面仍可响应）
 
 ---
 
 ## 技术架构
 
 ```
-EDA 扩展
-    ↓
-TopologicalRouter (主路由器)
-    ├── DRCChecker (DRC 检查器)
-    ├── ObstacleBypasser (障碍物绕行器)
-    ├── PathOptimizer (路径优化器)
-    └── ErrorHandler (错误处理器)
-    ↓
-router-core (核心算法)
-    ├── Delaunay 三角剖分
-    ├── A* 路径搜索
-    └── 几何计算工具
-    ↓
-布线结果导入
+主线程 (EDA 宿主)
+  ├── 读取 DRC / 焊盘 / 静态障碍
+  ├── 逐网络写入图元（实时刷新）与删除（撕毁）
+  └── 参数弹窗 / 进度弹窗（postMessage 通信）
+        │  结构化数据
+        ▼
+Web Worker
+  ├── PlanningEngine（MST / 逃逸点 / 撕毁重布）
+  ├── VisibilityRouter（可视图 + Dijkstra）
+  └── RubberbandEngine（切线 / 圆群 / 圆角）
 ```
 
 ### 核心模块
 
 | 模块 | 文件 | 功能 |
 |------|------|------|
-| **主路由器** | `TopologicalRouter.ts` | 协调布线流程 |
-| **DRC 检查器** | `DRCChecker.ts` | 碰撞检测 |
-| **障碍物绕行器** | `ObstacleBypasser.ts` | 生成绕行路径 |
-| **路径优化器** | `PathOptimizer.ts` | 优化路径质量 |
-| **错误处理器** | `ErrorHandler.ts` | 错误分类和重试 |
+| **EDA 路由宿主** | `src/router/topological-router.ts` | 数据收集、Worker 调度、实时写入/删除、统计 |
+| **规划引擎** | `src/router/planning-engine.ts` | 纯几何规划（零 EDA 依赖） |
+| **可视图路由** | `src/router/visibility-router.ts` | 切线图 + Dijkstra |
+| **几何原语** | `src/router/rubberband-engine.ts` | 障碍圆群、逃逸点、圆角 |
+| **Worker 入口** | `src/worker/planning-worker.ts` | 规划消息协议与进度 |
+| **弹窗桥** | `src/ui/dialog-bridge.ts` | 主线程 ↔ iframe 消息 |
 
 ---
 
@@ -165,24 +133,28 @@ router-core (核心算法)
 eext-rubberband-autorouter/
 ├── src/
 │   ├── router/
-│   │   ├── TopologicalRouter.ts    # 主路由器
-│   │   ├── DRCChecker.ts           # DRC 检查器
-│   │   ├── ObstacleBypasser.ts     # 障碍物绕行器
-│   │   └── PathOptimizer.ts        # 路径优化器
-│   ├── router-core/                # 核心算法
-│   │   ├── core/                   # Router, Vertex, Region...
-│   │   ├── algorithms/             # Delaunay, FibonacciQueue
-│   │   ├── geometry/               # GeometryUtils, Tangents...
-│   │   ├── parsers/                # PCBParser, StyleParser
-│   │   └── utils/                  # Constants, Units
+│   │   ├── topological-router.ts   # EDA 读写 + Worker 调度 + 实时写入
+│   │   ├── planning-engine.ts      # 纯几何规划引擎（零 EDA 依赖）
+│   │   ├── rubberband-engine.ts    # 切线/障碍圆群/圆角等几何原语
+│   │   ├── visibility-router.ts    # 可视图 + Dijkstra
+│   │   ├── drc-rules.ts            # DRC 规则读取与参数覆盖
+│   │   └── worker-source.ts        # Worker 源码内联与创建
+│   ├── worker/
+│   │   └── planning-worker.ts      # Worker 入口（规划与进度消息）
+│   ├── ui/
+│   │   └── dialog-bridge.ts        # 主线程 ↔ 内联框架消息桥
 │   ├── types/
-│   │   └── index.ts                # 类型定义
+│   │   ├── index.ts                # 基础类型
+│   │   └── router-params.ts        # 用户可调参数与统计
 │   ├── utils/
-│   │   ├── ErrorHandler.ts         # 错误处理
+│   │   ├── error-handler.ts        # 错误处理
+│   │   ├── logger.ts               # 日志
 │   │   └── toast.ts                # 吐司通知
+│   ├── auto-router-facade.ts       # 参数弹窗 / 进度弹窗 / 布线调度
 │   └── index.ts                    # 主入口
 ├── iframe/
-│   └── routing.html                # 配置界面
+│   ├── params.html                 # 参数设置弹窗
+│   └── progress.html               # 实时进度与日志弹窗
 ├── extension.json                  # 扩展配置
 ├── package.json                    # 项目配置
 └── tsconfig.json                   # TS 配置

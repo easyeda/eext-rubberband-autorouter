@@ -15,7 +15,7 @@
  */
 import {
 	RBObstacle, RBPrimitive, getTangents, capsuleToCircles, pointSegDist, dist,
-} from './RubberbandEngine';
+} from './rubberband-engine';
 
 export interface RouteConnectionResult {
 	ok: boolean;

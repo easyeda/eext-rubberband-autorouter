@@ -1,0 +1,435 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>橡皮筋自动布线 · 进度</title>
+<style>
+	:root {
+		--bg: #f4f6fb;
+		--card: rgba(255, 255, 255, 0.88);
+		--card-border: rgba(15, 23, 42, 0.08);
+		--text: #0f172a;
+		--muted: #64748b;
+		--faint: #94a3b8;
+		--accent: #4f7cff;
+		--accent2: #8b5cf6;
+		--accent-soft: rgba(79, 124, 255, 0.12);
+		--track: rgba(15, 23, 42, 0.08);
+		--shadow: 0 18px 50px rgba(15, 23, 42, 0.10);
+		--log-bg: #0e1526;
+		--log-text: #cbd5e1;
+		--danger: #ef4444;
+		--success: #10b981;
+	}
+	@media (prefers-color-scheme: dark) {
+		:root {
+			--bg: #0b1020;
+			--card: rgba(23, 30, 51, 0.84);
+			--card-border: rgba(148, 163, 184, 0.14);
+			--text: #eef2ff;
+			--muted: #a5b0c6;
+			--faint: #7c89a3;
+			--accent: #6d8dff;
+			--accent2: #a78bfa;
+			--accent-soft: rgba(109, 141, 255, 0.18);
+			--track: rgba(148, 163, 184, 0.18);
+			--shadow: 0 22px 60px rgba(0, 0, 0, 0.45);
+			--log-bg: #070b14;
+			--log-text: #cbd5e1;
+		}
+	}
+	* { box-sizing: border-box; }
+	html, body { height: 100%; }
+	body {
+		margin: 0;
+		font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "Microsoft YaHei", "PingFang SC", sans-serif;
+		color: var(--text);
+		background:
+			radial-gradient(760px 340px at -10% -10%, rgba(79, 124, 255, 0.18), transparent 60%),
+			radial-gradient(560px 300px at 110% 0%, rgba(139, 92, 246, 0.16), transparent 55%),
+			var(--bg);
+		overflow: hidden;
+	}
+	.app { height: 100%; display: grid; grid-template-rows: auto auto auto auto 1fr auto; gap: 12px; padding: 18px 20px 16px; }
+
+	/* ── 顶部状态 ── */
+	.top { display: flex; align-items: center; justify-content: space-between; gap: 14px; }
+	.status { display: flex; align-items: center; gap: 12px; min-width: 0; }
+	.pulse {
+		position: relative; width: 12px; height: 12px; border-radius: 50%;
+		background: var(--accent); flex: none;
+		box-shadow: 0 0 0 0 rgba(79, 124, 255, 0.55);
+		animation: pulse 1.6s ease-out infinite;
+	}
+	.pulse.done { background: var(--success); animation: none; box-shadow: 0 0 0 4px rgba(16, 185, 129, 0.16); }
+	.pulse.error { background: var(--danger); animation: none; box-shadow: 0 0 0 4px rgba(239, 68, 68, 0.16); }
+	@keyframes pulse {
+		0% { box-shadow: 0 0 0 0 rgba(79, 124, 255, 0.55); }
+		70% { box-shadow: 0 0 0 10px rgba(79, 124, 255, 0); }
+		100% { box-shadow: 0 0 0 0 rgba(79, 124, 255, 0); }
+	}
+	.title-wrap { min-width: 0; }
+	h1 { margin: 0; font-size: 17px; font-weight: 700; letter-spacing: 0.2px; }
+	.subtitle {
+		margin: 3px 0 0; font-size: 12px; color: var(--muted);
+		white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+		max-width: 430px;
+	}
+	.top-right { display: flex; align-items: center; gap: 8px; }
+	.version {
+		font-size: 11px; font-weight: 650; color: var(--faint);
+		background: var(--card); border: 1px solid var(--card-border);
+		padding: 7px 9px; border-radius: 9px;
+	}
+	.timer {
+		font-size: 13px; font-weight: 700; color: var(--muted);
+		font-variant-numeric: tabular-nums;
+		background: var(--card); border: 1px solid var(--card-border);
+		padding: 8px 12px; border-radius: 10px;
+		box-shadow: var(--shadow);
+	}
+
+	/* ── 进度条 ── */
+	.progress-card {
+		background: var(--card); border: 1px solid var(--card-border);
+		border-radius: 16px; box-shadow: var(--shadow);
+		padding: 14px 16px 16px;
+	}
+	.progress-head {
+		display: flex; align-items: baseline; justify-content: space-between;
+		margin-bottom: 9px;
+	}
+	.percent {
+		font-size: 26px; font-weight: 800; letter-spacing: -0.5px;
+		background: linear-gradient(135deg, var(--accent), var(--accent2));
+		-webkit-background-clip: text; background-clip: text; color: transparent;
+		font-variant-numeric: tabular-nums;
+	}
+	.stage { font-size: 12px; font-weight: 600; color: var(--muted); }
+	.bar {
+		height: 9px; border-radius: 999px; background: var(--track);
+		overflow: hidden; position: relative;
+	}
+	.fill {
+		height: 100%; width: 0%;
+		border-radius: 999px;
+		background: linear-gradient(90deg, var(--accent), var(--accent2));
+		transition: width 0.35s cubic-bezier(0.2, 0.8, 0.2, 1);
+		position: relative; overflow: hidden;
+	}
+	.fill::after {
+		content: ""; position: absolute; inset: 0;
+		background: linear-gradient(90deg, transparent, rgba(255,255,255,0.45), transparent);
+		transform: translateX(-100%);
+		animation: shimmer 1.5s linear infinite;
+	}
+	.bar.idle .fill::after { animation: none; }
+	@keyframes shimmer { to { transform: translateX(100%); } }
+
+	/* ── 统计 ── */
+	.stats { display: grid; grid-template-columns: repeat(4, 1fr); gap: 10px; }
+	.stat {
+		background: var(--card); border: 1px solid var(--card-border);
+		border-radius: 14px; box-shadow: var(--shadow);
+		padding: 11px 12px; text-align: center;
+	}
+	.stat b {
+		display: block; font-size: 20px; font-weight: 800;
+		font-variant-numeric: tabular-nums; letter-spacing: -0.3px;
+	}
+	.stat span { display: block; margin-top: 3px; font-size: 11px; color: var(--faint); font-weight: 600; }
+
+	/* ── 日志 ── */
+	.log-head {
+		display: flex; align-items: center; justify-content: space-between;
+		font-size: 11px; font-weight: 700; letter-spacing: 0.5px;
+		color: var(--muted); text-transform: uppercase;
+		padding: 0 4px;
+	}
+	.log-head span { color: var(--faint); font-weight: 600; letter-spacing: 0; text-transform: none; }
+	.log {
+		background: var(--log-bg);
+		border-radius: 14px;
+		border: 1px solid rgba(148, 163, 184, 0.16);
+		box-shadow: var(--shadow);
+		overflow-y: auto;
+		padding: 10px 12px;
+		font-family: "Cascadia Code", "JetBrains Mono", Consolas, "SFMono-Regular", monospace;
+		font-size: 11.5px; line-height: 1.65;
+		color: var(--log-text);
+		min-height: 120px;
+	}
+	.log::-webkit-scrollbar { width: 8px; }
+	.log::-webkit-scrollbar-thumb { background: rgba(148, 163, 184, 0.25); border-radius: 999px; }
+	.line { display: flex; gap: 9px; padding: 1px 0; animation: fadeIn 0.18s ease; }
+	@keyframes fadeIn { from { opacity: 0; transform: translateY(2px); } to { opacity: 1; transform: none; } }
+	.line .t { color: #64748b; flex: none; }
+	.line .m { white-space: pre-wrap; word-break: break-word; }
+	.line.info .m { color: #cbd5e1; }
+	.line.success .m { color: #34d399; }
+	.line.warn .m { color: #fbbf24; }
+	.line.error .m { color: #f87171; }
+	.empty { color: #475569; font-style: italic; }
+
+	/* ── 底部 ── */
+	footer { display: flex; align-items: center; gap: 10px; }
+	.spacer { flex: 1; }
+	button {
+		font-family: inherit; font-size: 13px; font-weight: 650;
+		border-radius: 11px; padding: 10px 16px;
+		cursor: pointer; border: 1px solid transparent;
+		transition: transform 0.12s ease, box-shadow 0.2s ease, opacity 0.2s ease;
+	}
+	button:active { transform: translateY(1px) scale(0.99); }
+	button.danger {
+		background: rgba(239, 68, 68, 0.10);
+		color: var(--danger);
+		border-color: rgba(239, 68, 68, 0.35);
+	}
+	button.danger:hover { background: rgba(239, 68, 68, 0.16); }
+	button.primary {
+		color: #fff; border: 0;
+		background: linear-gradient(135deg, var(--accent), var(--accent2));
+		box-shadow: 0 12px 26px rgba(79, 124, 255, 0.35);
+	}
+	button.primary:hover { box-shadow: 0 16px 32px rgba(79, 124, 255, 0.45); }
+	button:disabled { opacity: 0.55; cursor: default; }
+	.hidden { display: none !important; }
+</style>
+</head>
+<body>
+<div class="app">
+	<div class="top">
+		<div class="status">
+			<span class="pulse" id="pulse"></span>
+			<div class="title-wrap">
+				<h1 id="title">正在布线</h1>
+				<p class="subtitle" id="subtitle">正在初始化...</p>
+			</div>
+		</div>
+		<div class="top-right">
+			<span class="version" id="version">v-</span>
+			<div class="timer" id="timer">00:00</div>
+		</div>
+	</div>
+
+	<div class="progress-card">
+		<div class="progress-head">
+			<span class="percent" id="percent">0%</span>
+			<span class="stage" id="stage">准备中</span>
+		</div>
+		<div class="bar" id="bar"><div class="fill" id="fill"></div></div>
+	</div>
+
+	<div class="stats">
+		<div class="stat"><b id="routed">0</b><span>已布网络</span></div>
+		<div class="stat"><b id="failed">0</b><span>失败网络</span></div>
+		<div class="stat"><b id="segments">0</b><span>走线段</span></div>
+		<div class="stat"><b id="vias">0</b><span>过孔</span></div>
+	</div>
+
+	<div class="log-head">运行日志 <span id="logCount">0 条</span></div>
+	<div class="log" id="log"><div class="empty">等待布线开始...</div></div>
+
+	<footer>
+		<button class="danger" id="stopBtn">停止布线</button>
+		<div class="spacer"></div>
+		<button class="primary hidden" id="closeBtn">关闭窗口</button>
+	</footer>
+</div>
+
+<script>
+	(function () {
+		'use strict';
+
+		var startedAt = Date.now();
+		var timerHandle = null;
+		var logCount = 0;
+		var finished = false;
+		var responded = false;
+
+		function $(id) { return document.getElementById(id); }
+
+		function post(msg) {
+			var payload = Object.assign({ source: 'rb-ui', dialog: 'progress' }, msg);
+			try { parent.postMessage(payload, '*'); } catch (e) { /* ignore */ }
+			try { if (window.top && window.top !== parent) window.top.postMessage(payload, '*'); } catch (e) { /* ignore */ }
+		}
+
+		function ready() {
+			post({ type: 'ready' });
+		}
+
+		function pad2(n) { return n < 10 ? '0' + n : String(n); }
+
+		function elapsedText() {
+			var s = Math.max(0, Math.floor((Date.now() - startedAt) / 1000));
+			var h = Math.floor(s / 3600);
+			var m = Math.floor((s % 3600) / 60);
+			var sec = s % 60;
+			return h > 0 ? h + ':' + pad2(m) + ':' + pad2(sec) : pad2(m) + ':' + pad2(sec);
+		}
+
+		function startTimer() {
+			if (timerHandle) return;
+			timerHandle = setInterval(function () {
+				$('timer').textContent = elapsedText();
+			}, 500);
+		}
+
+		function stopTimer() {
+			if (timerHandle) { clearInterval(timerHandle); timerHandle = null; }
+			$('timer').textContent = elapsedText();
+		}
+
+		function fmtTime(ts) {
+			var d = ts ? new Date(ts) : new Date();
+			return pad2(d.getHours()) + ':' + pad2(d.getMinutes()) + ':' + pad2(d.getSeconds());
+		}
+
+		function appendLog(level, message, time) {
+			var box = $('log');
+			var empty = box.querySelector('.empty');
+			if (empty) empty.remove();
+			var row = document.createElement('div');
+			row.className = 'line ' + (level || 'info');
+			var t = document.createElement('span');
+			t.className = 't';
+			t.textContent = fmtTime(time);
+			var m = document.createElement('span');
+			m.className = 'm';
+			m.textContent = message;
+			row.appendChild(t);
+			row.appendChild(m);
+
+			var nearBottom = box.scrollTop + box.clientHeight >= box.scrollHeight - 24;
+			box.appendChild(row);
+			logCount++;
+			$('logCount').textContent = logCount + ' 条';
+			// 控制内存与渲染规模
+			while (box.children.length > 500) box.removeChild(box.firstChild);
+			if (nearBottom) box.scrollTop = box.scrollHeight;
+		}
+
+		function setStats(stats) {
+			if (!stats) return;
+			$('routed').textContent = String(stats.routedNets || 0);
+			$('failed').textContent = String(stats.failedNets || 0);
+			$('segments').textContent = String(stats.segments || 0);
+			$('vias').textContent = String(stats.vias || 0);
+		}
+
+		function setProgress(percentage, message, stage) {
+			var pct = Math.max(0, Math.min(100, Number(percentage) || 0));
+			$('fill').style.width = pct + '%';
+			$('percent').textContent = Math.round(pct) + '%';
+			if (stage) $('stage').textContent = stage;
+			if (message) $('subtitle').textContent = message;
+		}
+
+		function setState(kind, title) {
+			var pulse = $('pulse');
+			pulse.className = 'pulse' + (kind === 'done' ? ' done' : kind === 'error' ? ' error' : '');
+			$('title').textContent = title;
+		}
+
+		function finish(summary, errorMessage) {
+			finished = true;
+			stopTimer();
+			$('bar').classList.add('idle');
+			$('stopBtn').classList.add('hidden');
+			$('closeBtn').classList.remove('hidden');
+
+			if (errorMessage) {
+				setState('error', '布线失败');
+				$('subtitle').textContent = errorMessage;
+				appendLog('error', errorMessage);
+				return;
+			}
+
+			if (summary) {
+				setStats(summary);
+				var ok = !summary.cancelled && (summary.failedNets === 0);
+				setState(ok ? 'done' : (summary.cancelled ? 'done' : 'error'),
+					summary.cancelled ? '布线已停止' : (ok ? '布线完成' : '布线完成（部分失败）'));
+				setProgress(summary.cancelled ? Number($('percent').textContent.replace('%', '')) : 100,
+					summary.cancelled ? '已保留当前已写入的走线' : '全部网络处理结束',
+					summary.cancelled ? '已停止' : '完成');
+				appendLog(ok ? 'success' : 'warn',
+					'结果：' + summary.routedNets + '/' + summary.totalNets + ' 个网络，走线 ' +
+					summary.segments + ' 段，过孔 ' + summary.vias + ' 个，用时 ' +
+					Math.round((summary.elapsedMs || 0) / 1000) + ' 秒' +
+					(summary.failed && summary.failed.length ? '，失败：' + summary.failed.join(', ') : ''),
+					Date.now());
+			}
+		}
+
+		$('stopBtn').addEventListener('click', function () {
+			if (finished) return;
+			var btn = $('stopBtn');
+			btn.disabled = true;
+			btn.textContent = '正在停止...';
+			$('subtitle').textContent = '正在安全停止，已写入的走线会保留';
+			post({ type: 'cancel' });
+		});
+
+		$('closeBtn').addEventListener('click', function () {
+			post({ type: 'close' });
+		});
+
+		window.addEventListener('message', function (event) {
+			var data = event && event.data;
+			if (!data || data.source !== 'rb-host') return;
+
+			switch (data.type) {
+				case 'begin':
+					if (data.version) $('version').textContent = 'v' + data.version;
+					startedAt = data.startedAt || Date.now();
+					startTimer();
+					$('timer').textContent = elapsedText();
+					$('log').innerHTML = '';
+					logCount = 0;
+					$('logCount').textContent = '0 条';
+					setStats(data.stats || {});
+					if (data.options) {
+						$('subtitle').textContent =
+							'线宽 ' + data.options.traceWidthMil + ' mil · 圆角 ' + data.options.filletRadiusMil +
+							' mil · ' + (data.options.livePreview ? '实时预览' : '完成后写入');
+					}
+					appendLog('info', '布线任务已启动（Web Worker 规划）', Date.now());
+					break;
+				case 'progress':
+					if (finished) break;
+					setProgress(data.percentage, data.message, data.stage);
+					break;
+				case 'stats':
+					if (finished) break;
+					setStats(data.stats);
+					break;
+				case 'log':
+					if (finished && data.level !== 'error') break;
+					appendLog(data.level, data.message, data.time);
+					break;
+				case 'done':
+					finish(data.summary, null);
+					break;
+				case 'error':
+					finish(null, data.message || '未知错误');
+					break;
+				default:
+					break;
+			}
+		});
+
+		var tries = 0;
+		var handshake = setInterval(function () {
+			if (finished || tries++ > 12) { clearInterval(handshake); return; }
+			ready();
+		}, 250);
+		ready();
+		startTimer();
+	})();
+</script>
+</body>
+</html>

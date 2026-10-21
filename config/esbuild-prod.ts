@@ -1,6 +1,6 @@
 import esbuild from 'esbuild';
 
-import common from './esbuild.common';
+import common from './esbuild-common';
 
 (async () => {
 	const ctx = await esbuild.context(common);

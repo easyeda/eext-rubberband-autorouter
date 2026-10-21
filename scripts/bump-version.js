@@ -18,11 +18,11 @@ const extensionPath = path.join(__dirname, '..', 'extension.json');
 const extensionJson = JSON.parse(fs.readFileSync(extensionPath, 'utf8'));
 extensionJson.version = newVersion;
 
-// 更新 About 菜单项
+// 菜单不显示版本号（版本信息保留在“关于”弹窗中）
 if (extensionJson.headerMenus?.pcb?.[0]?.menuItems) {
     const aboutItem = extensionJson.headerMenus.pcb[0].menuItems.find(item => item.id === 'About');
     if (aboutItem) {
-        aboutItem.title = `关于 v${newVersion}`;
+        aboutItem.title = '关于';
     }
 }
 
