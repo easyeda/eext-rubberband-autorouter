@@ -38,6 +38,8 @@ export interface RBObstacle {
 	noPrune?: boolean;
 	/** 仅阻挡不建图（填充内部网格圆）：路径不能绕它们转，只需被挡住 */
 	blockerOnly?: boolean;
+	/** 即使与当前网络同名也要阻挡（焊盘自身的外扩轮廓：走线不得压过本网络焊盘） */
+	forceBlock?: boolean;
 }
 
 /** 路径节点：障碍物圆或终端（焊盘，r=0）。rgt = 绳子从该圆的右侧（顺时针侧）绕过 */
@@ -313,10 +315,12 @@ export function padShapeToCircles(pad: { pad: any[]; hole?: any[] | null }): Arr
 	const h = shape[2] ?? 0;
 	const shapeName = String(shape[0] ?? 'ELLIPSE').toUpperCase();
 
-	// 通孔焊盘：圆形，半径取焊盘外径一半
+	// 通孔焊盘的铜皮外形仍按 pad 形状建模：孔只影响钻孔，不应缩小铜皮障碍。
+	// （旧逻辑把带孔焊盘一律当圆，RECT 角部会漏出 ~1mil，造成贴边 DRC）
 	const hole = pad.hole;
-	if (Array.isArray(hole) && hole.length >= 2 && hole[1] > 0) {
-		return [{ x: 0, y: 0, r: Math.max(w, h) / 2 }];
+	if (w === 0 || h === 0) {
+		const r = Array.isArray(hole) && hole.length >= 2 ? Math.max(0, hole[1] ?? 0) / 2 : 0;
+		return r > 0 ? [{ x: 0, y: 0, r }] : [];
 	}
 
 	if (shapeName === 'RECT' && Math.abs(w - h) <= Math.min(w, h) * 0.3) {

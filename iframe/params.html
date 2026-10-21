@@ -183,10 +183,7 @@
 	.switch input:checked + span::after { transform: translateX(18px); }
 
 	/* 摘要 */
-	.summary {
-		display: flex; flex-wrap: wrap; gap: 8px;
-		padding: 0 4px 4px;
-	}
+	.summary { display: none; }
 	.chip {
 		font-size: 11px; color: var(--muted);
 		background: var(--card);
@@ -301,12 +298,12 @@
 
 			<div class="row">
 				<div class="label">
-					<span>逃逸线长度</span>
-					<small>焊盘出线后直行的距离，用于避开相邻焊盘</small>
+					<span>出线额外余量</span>
+					<small>焊盘边界之外再外扩的距离，0 = 严格按最小距离出线</small>
 				</div>
 				<div class="control">
-					<input type="range" id="escapeClearanceMil" min="10" max="150" step="1">
-					<div class="num"><input type="number" id="escapeClearanceMilNum" min="10" max="150" step="1"><span>mil</span></div>
+					<input type="range" id="escapeClearanceMil" min="0" max="40" step="1">
+					<div class="num"><input type="number" id="escapeClearanceMilNum" min="0" max="40" step="1"><span>mil</span></div>
 				</div>
 			</div>
 
@@ -377,6 +374,26 @@
 					<label class="switch"><input type="checkbox" id="livePreview" checked><span></span></label>
 				</div>
 			</div>
+
+			<div class="row">
+				<div class="label">
+					<span>最后凸包优化</span>
+					<small>先用最短路径保证连通，全部布通后再做端帽/圆角/拉紧优化</small>
+				</div>
+				<div class="control">
+					<label class="switch"><input type="checkbox" id="finalOptimize" checked><span></span></label>
+				</div>
+			</div>
+
+			<div class="row">
+				<div class="label">
+					<span>过孔换层兜底</span>
+					<small>顶层布不通的网络，尝试绕到底层并用过孔连接</small>
+				</div>
+				<div class="control">
+					<label class="switch"><input type="checkbox" id="viaFallback" checked><span></span></label>
+				</div>
+			</div>
 		</section>
 
 		<div class="summary" id="summary"></div>
@@ -401,11 +418,13 @@
 			traceWidthMil: 10,
 			extraClearanceMil: 0,
 			filletRadiusMil: 40,
-			escapeClearanceMil: 50,
+			escapeClearanceMil: 0,
 			ripupRounds: 2,
 			powerNetsFirst: true,
 			budgetMs: 300000,
-			livePreview: true
+			livePreview: true,
+			finalOptimize: true,
+			viaFallback: true
 		};
 		var defaults = Object.assign({}, DEFAULTS);
 		var responded = false;
@@ -441,6 +460,8 @@
 			$('budgetSec').value = String(Math.round(o.budgetMs / 1000));
 			$('powerNetsFirst').checked = !!o.powerNetsFirst;
 			$('livePreview').checked = o.livePreview !== false;
+			$('finalOptimize').checked = o.finalOptimize !== false;
+			$('viaFallback').checked = o.viaFallback !== false;
 			updateSummary();
 		}
 
@@ -448,12 +469,14 @@
 			return {
 				traceWidthMil: clamp($('traceWidthMilNum').value, 4, 40),
 				extraClearanceMil: clamp($('extraClearanceMilNum').value, 0, 20),
-				escapeClearanceMil: clamp($('escapeClearanceMilNum').value, 10, 150),
+				escapeClearanceMil: clamp($('escapeClearanceMilNum').value, 0, 40),
 				filletRadiusMil: clamp($('filletRadiusMilNum').value, 0, 120),
 				ripupRounds: parseInt($('ripupRounds').value, 10) || 0,
 				powerNetsFirst: $('powerNetsFirst').checked,
 				budgetMs: (parseInt($('budgetSec').value, 10) || 0) * 1000,
-				livePreview: $('livePreview').checked
+				livePreview: $('livePreview').checked,
+				finalOptimize: $('finalOptimize').checked,
+				viaFallback: $('viaFallback').checked
 			};
 		}
 
@@ -463,7 +486,9 @@
 				'<span class="chip">线宽 <b>' + o.traceWidthMil + '</b> mil</span>',
 				'<span class="chip">圆角 <b>' + (o.filletRadiusMil > 0 ? o.filletRadiusMil + ' mil' : '直角') + '</b></span>',
 				'<span class="chip">撕毁重布 <b>' + (o.ripupRounds > 0 ? o.ripupRounds + ' 轮' : '关闭') + '</b></span>',
-				'<span class="chip">' + (o.livePreview ? '实时预览' : '完成后写入') + '</span>'
+				'<span class="chip">' + (o.livePreview ? '实时预览' : '完成后写入') + '</span>',
+				'<span class="chip">' + (o.finalOptimize ? '最后凸包优化' : '仅连通') + '</span>',
+				'<span class="chip">' + (o.viaFallback ? '允许过孔换层' : '仅单层') + '</span>'
 			];
 			$('summary').innerHTML = chips.join('');
 		}
@@ -507,6 +532,8 @@
 		$('budgetSec').addEventListener('change', updateSummary);
 		$('powerNetsFirst').addEventListener('change', updateSummary);
 		$('livePreview').addEventListener('change', updateSummary);
+		$('finalOptimize').addEventListener('change', updateSummary);
+		$('viaFallback').addEventListener('change', updateSummary);
 
 		$('resetBtn').addEventListener('click', function () {
 			applyOptions(defaults);

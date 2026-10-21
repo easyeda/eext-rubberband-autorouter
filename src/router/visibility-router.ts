@@ -8,9 +8,14 @@
  *
  * 输出：精确图元序列（直线 + 圆弧），几何与 Dijkstra 选择的边完全一致。
  *
+ * 多端点（multi-endpoint）：源/目标各给一组候选出线点，Dijkstra 以全部
+ * 源候选为起点（初始代价 = 引出段长度）、全部目标候选为终点（再叠加
+ * 引入段长度），取全局最小者。这样「从焊盘哪一侧出线」不再由启发式决定，
+ * 而是由路径总长决定 —— 直线可连时总长即等于两焊盘直线距离。
+ *
  * 性能：
  *  - 走廊剪枝（只保留直连线附近的圆，实心障碍 noPrune 除外）
- *  - blockerOnly 圆（填充内部网格）只参与阻挡判定，不生成切点/边
+ *  - blockerOnly 圆（填充内部网格、焊盘自身轮廓）只参与阻挡判定，不生成切点/边
  *  - 均匀网格 + DDA 加速线段/圆弧的阻挡查询
  */
 import {
@@ -21,6 +26,23 @@ export interface RouteConnectionResult {
 	ok: boolean;
 	/** 精确图元序列（直线 + 圆弧） */
 	prims: RBPrimitive[];
+}
+
+/** 端点候选：位置 + 附加代价（引出/引入段长度，参与最短路比较） */
+export interface RouteEndpoint {
+	x: number;
+	y: number;
+	cost: number;
+}
+
+/** 多端点寻路结果 */
+export interface CandidateRouteResult {
+	ok: boolean;
+	/** 中间路径图元（不含首尾引出/引入段） */
+	prims: RBPrimitive[];
+	/** 实际选中的源/目标候选 */
+	src?: RouteEndpoint;
+	dst?: RouteEndpoint;
 }
 
 /** 视图节点：圆上的切点或终端 */
@@ -73,8 +95,8 @@ class CircleGrid {
 	/** 遍历线段附近（距离 < 半径可达）的所有圆下标（可能重复） */
 	nearSegment(x1: number, y1: number, x2: number, y2: number, cb: (idx: number) => void): void {
 		const stampId = ++this.curStamp;
-		const dist = Math.hypot(x2 - x1, y2 - y1);
-		const steps = Math.max(1, Math.ceil(dist / (GRID_CELL * 0.8)));
+		const d = Math.hypot(x2 - x1, y2 - y1);
+		const steps = Math.max(1, Math.ceil(d / (GRID_CELL * 0.8)));
 		for (let s = 0; s <= steps; s++) {
 			const t = s / steps;
 			const px = x1 + (x2 - x1) * t, py = y1 + (y2 - y1) * t;
@@ -108,7 +130,7 @@ function makeSegmentChecker(circles: RBObstacle[], grid: CircleGrid, net = '') {
 		grid.nearSegment(x1, y1, x2, y2, (k) => {
 			if (blocked || k === touchedA || k === touchedB) return;
 			const c = circles[k];
-			if (net && c.net === net) return;
+			if (net && c.net === net && !c.forceBlock) return;
 			if (pointSegDist(c.x, c.y, x1, y1, x2, y2) < c.r - EPS_TOUCH) blocked = true;
 		});
 		return !blocked;
@@ -128,7 +150,7 @@ function makeArcChecker(circles: RBObstacle[], grid: CircleGrid, net = '') {
 			grid.nearPoint(px, py, (k) => {
 				if (blocked || k === selfIdx) return;
 				const o = circles[k];
-				if (net && o.net === net) return;
+				if (net && o.net === net && !o.forceBlock) return;
 				if (Math.hypot(px - o.x, py - o.y) < o.r - EPS_TOUCH) blocked = true;
 			});
 		}
@@ -136,10 +158,6 @@ function makeArcChecker(circles: RBObstacle[], grid: CircleGrid, net = '') {
 	};
 }
 
-/**
- * 计算单条连接（src→dst）的橡皮筋路径（可视图 Dijkstra）
- * obstacles: 障碍（圆或胶囊；胶囊转为圆群）。网络/层过滤由调用方完成。
- */
 /**
  * 让出主线程（协作式调度）。
  * 可视图求解是重 CPU 的同步计算，若不主动让出，EDA 主线程会被独占，
@@ -180,6 +198,7 @@ const SOLVE_BUDGET_MS = 3000;
 /** 协作让出的最小间隔（毫秒） */
 const YIELD_INTERVAL_MS = 16;
 
+/** 单端点寻路（兼容旧接口）：src→dst 最短路径 */
 export async function routeConnection(
 	src: { x: number; y: number },
 	dst: { x: number; y: number },
@@ -188,6 +207,30 @@ export async function routeConnection(
 	expands: number[] = [150, 500],
 	budgetMs: number = SOLVE_BUDGET_MS,
 ): Promise<RouteConnectionResult> {
+	const res = await routeBetweenEndpoints(
+		[{ x: src.x, y: src.y, cost: 0 }],
+		[{ x: dst.x, y: dst.y, cost: 0 }],
+		obstacles, net, expands, budgetMs,
+	);
+	return { ok: res.ok, prims: res.prims };
+}
+
+/**
+ * 多端点寻路：源/目标各一组候选点，求「引出段 + 路径 + 引入段」总长最小的走线。
+ *
+ * refA/refB：走廊剪枝用的参考线段（通常是两焊盘中心）；缺省用首个候选点。
+ */
+export async function routeBetweenEndpoints(
+	srcCands: RouteEndpoint[],
+	dstCands: RouteEndpoint[],
+	obstacles: RBObstacle[],
+	net = '',
+	expands: number[] = [150, 500],
+	budgetMs: number = SOLVE_BUDGET_MS,
+	refA?: { x: number; y: number },
+	refB?: { x: number; y: number },
+): Promise<CandidateRouteResult> {
+	if (!srcCands.length || !dstCands.length) return { ok: false, prims: [] };
 	// 圆障碍列表（胶囊兜底转为圆群）
 	const all: RBObstacle[] = [];
 	for (const o of obstacles) {
@@ -203,6 +246,9 @@ export async function routeConnection(
 	// （EDA 与离线的收集顺序不同，等长路径的选择会随顺序漂移）
 	all.sort((a, b) => a.x - b.x || a.y - b.y || a.r - b.r || (a.net || '').localeCompare(b.net || ''));
 
+	const ax = refA ?? { x: srcCands[0].x, y: srcCands[0].y };
+	const bx = refB ?? { x: dstCands[0].x, y: dstCands[0].y };
+
 	// 走廊剪枝：先只保留直连线附近窄带内的圆（大幅提速），
 	// 求解失败再逐级放宽范围重试。
 	// noPrune（填充/板框等实心障碍）始终保留——否则窄走廊会把内部网格圆剪掉，
@@ -215,8 +261,8 @@ export async function routeConnection(
 			const candidates: Array<{ o: RBObstacle; d: number }> = [];
 			for (const c of all) {
 				if (c.noPrune) { kept.push(c); continue; }
-				const dSeg = pointSegDist(c.x, c.y, src.x, src.y, dst.x, dst.y);
-				if (dSeg < c.r + expand || dist(c.x, c.y, src.x, src.y) < c.r + expand || dist(c.x, c.y, dst.x, dst.y) < c.r + expand) {
+				const dSeg = pointSegDist(c.x, c.y, ax.x, ax.y, bx.x, bx.y);
+				if (dSeg < c.r + expand || dist(c.x, c.y, ax.x, ax.y) < c.r + expand || dist(c.x, c.y, bx.x, bx.y) < c.r + expand) {
 					candidates.push({ o: c, d: dSeg });
 				}
 			}
@@ -233,7 +279,7 @@ export async function routeConnection(
 
 		const deadline = Date.now() + budgetMs;
 		(globalThis as any).__RB_PHASE__ = 'vr:solve';
-		const res = await solve(src, dst, subset, net, deadline);
+		const res = await solveMulti(srcCands, dstCands, subset, net, deadline);
 		(globalThis as any).__RB_PHASE__ = 'vr:validate';
 		if (res.ok && await validatePrimsAgainst(res.prims, all, net)) return res;
 	}
@@ -241,7 +287,7 @@ export async function routeConnection(
 }
 
 /** 用全量障碍复验路径图元（防止走廊剪枝造成的假合法路径） */
-async function validatePrimsAgainst(prims: RBPrimitive[], all: RBObstacle[], net = ''): Promise<boolean> {
+export async function validatePrimsAgainst(prims: RBPrimitive[], all: RBObstacle[], net = ''): Promise<boolean> {
 	const grid = new CircleGrid(all);
 	const segOK = makeSegmentChecker(all, grid, net);
 	const arcOK = makeArcChecker(all, grid, net);
@@ -275,15 +321,18 @@ async function validatePrimsAgainst(prims: RBPrimitive[], all: RBObstacle[], net
 	return true;
 }
 
-/** 对给定圆集合求解橡皮筋路径（协作式：定期让出主线程，超时放弃） */
-async function solve(
-	src: { x: number; y: number },
-	dst: { x: number; y: number },
+/**
+ * 多端点求解：全部源候选为起点，全部目标候选为终点，求总代价最小者。
+ * 节点布局：0..S-1 = 源候选，S..S+D-1 = 目标候选，其后是圆上的切点。
+ */
+async function solveMulti(
+	srcCands: RouteEndpoint[],
+	dstCands: RouteEndpoint[],
 	obstacles: RBObstacle[],
 	net = '',
 	deadline: number = Date.now() + SOLVE_BUDGET_MS,
-): Promise<RouteConnectionResult> {
-	// 拆分：可绕行圆（建图）与纯阻挡圆（填充内部网格，只参与碰撞检查）
+): Promise<CandidateRouteResult> {
+	// 拆分：可绕行圆（建图）与纯阻挡圆（填充内部网格 / 焊盘自身轮廓，只参与碰撞检查）
 	const circles: RBObstacle[] = [];
 	const blockers: RBObstacle[] = [];
 	for (const o of obstacles) {
@@ -296,13 +345,12 @@ async function solve(
 	const grid = new CircleGrid(everything);
 	const segOK = makeSegmentChecker(everything, grid, net);
 	const arcOK = makeArcChecker(everything, grid, net);
-	// 圆下标在 everything 中的偏移：circles 下标一致，blockers 偏移 n
-	// （下面的 touched 下标均相对 everything）
 
 	const nodes: VGNode[] = [];
-	// node 0 = src, node 1 = dst
-	nodes.push({ circle: -1, x: src.x, y: src.y, angle: 0, adj: [] });
-	nodes.push({ circle: -1, x: dst.x, y: dst.y, angle: 0, adj: [] });
+	// 0 .. S-1 源候选；S .. S+D-1 目标候选
+	for (const c of srcCands) nodes.push({ circle: -1, x: c.x, y: c.y, angle: 0, adj: [] });
+	for (const c of dstCands) nodes.push({ circle: -1, x: c.x, y: c.y, angle: 0, adj: [] });
+	const S = srcCands.length, D = dstCands.length;
 
 	// 切点去重：键 = 圆下标 + 角度量化
 	const ptIndex = new Map<string, number>();
@@ -331,7 +379,7 @@ async function solve(
 	let timedOut = false;
 	for (let i = 0; i < n && !timedOut; i++) {
 		const ci = circles[i];
-		if (net && ci.net === net) continue;
+		if (net && ci.net === net && !ci.forceBlock) continue;
 		{
 			const now = Date.now();
 			if (now > deadline) { timedOut = true; break; }
@@ -350,6 +398,7 @@ async function solve(
 				}
 			}
 			const cj = circles[j];
+			if (net && cj.net === net && !cj.forceBlock) continue;
 			const d = dist(ci.x, ci.y, cj.x, cj.y);
 			for (const [l1, l2] of [[true, true], [true, false], [false, true], [false, false]] as const) {
 				const adjR2 = cj.r * (l1 === l2 ? 1 : -1);
@@ -368,13 +417,13 @@ async function solve(
 	}
 	if (timedOut) return { ok: false, prims: [] };
 
-	// 2. 终端 ↔ 圆切线
+	// 2. 终端（出线候选）↔ 圆切线
 	const connectTerminal = (termIdx: number) => {
 		const term = nodes[termIdx];
 		for (let i = 0; i < n; i++) {
 			const ci = circles[i];
-			if (net && ci.net === net) continue;
-			if (dist(term.x, term.y, ci.x, ci.y) < ci.r - EPS_TOUCH) continue; // 终端在圆内
+			if (net && ci.net === net && !ci.forceBlock) continue;
+			if (dist(term.x, term.y, ci.x, ci.y) < ci.r + EPS_TOUCH) continue; // 终端在圆内/圆上：切线退化
 			for (const l of [true, false] as const) {
 				const [tx1, ty1, tx2, ty2] = getTangents(term.x, term.y, 0, false, ci.x, ci.y, ci.r, l);
 				if (!segOK(tx1, ty1, tx2, ty2, -1, i)) continue;
@@ -386,12 +435,19 @@ async function solve(
 			}
 		}
 	};
-	connectTerminal(0);
-	connectTerminal(1);
+	for (let k = 0; k < S + D; k++) connectTerminal(k);
 
-	// 3. 直连（无障碍阻挡时）
-	if (segOK(src.x, src.y, dst.x, dst.y, -1, -1)) {
-		nodes[0].adj.push({ to: 1, cost: dist(src.x, src.y, dst.x, dst.y), isArc: false, x1: src.x, y1: src.y, x2: dst.x, y2: dst.y });
+	// 3. 源候选 ↔ 目标候选 直连（无障碍阻挡时）—— 最短路径的常见情形
+	for (let i = 0; i < S; i++) {
+		const a = nodes[i];
+		for (let j = 0; j < D; j++) {
+			const b = nodes[S + j];
+			if (!segOK(a.x, a.y, b.x, b.y, -1, -1)) continue;
+			const len = Math.hypot(b.x - a.x, b.y - a.y);
+			if (len < 1e-6) continue;
+			a.adj.push({ to: S + j, cost: len, isArc: false, x1: a.x, y1: a.y, x2: b.x, y2: b.y });
+			nodes[S + j].adj.push({ to: i, cost: len, isArc: false, x1: b.x, y1: b.y, x2: a.x, y2: a.y });
+		}
 	}
 
 	// 4. 同圆弧边：切点按角度排序，相邻切点之间双向连弧（弧几何合法即建边）
@@ -438,14 +494,13 @@ async function solve(
 	const MAX_GRAPH_NODES = 250000;
 	if (nodes.length > MAX_GRAPH_NODES) return { ok: false, prims: [] };
 
-	// 5. Dijkstra（二叉堆，O(E log V)）
+	// 5. Dijkstra（二叉堆，O(E log V)）：多源（全部源候选），多目标
 	const total = nodes.length;
 	const distArr = new Array<number>(total).fill(Infinity);
 	const prevNode = new Array<number>(total).fill(-1);
 	const prevEdge = new Array<VGEdge | null>(total).fill(null);
 	const settled = new Array<boolean>(total).fill(false);
-	distArr[0] = 0;
-	const heap: Array<[number, number]> = [[0, 0]];
+	const heap: Array<[number, number]> = [];
 	const heapPush = (d: number, v: number) => {
 		heap.push([d, v]);
 		let i = heap.length - 1;
@@ -475,7 +530,13 @@ async function solve(
 		}
 		return top;
 	};
+	for (let i = 0; i < S; i++) {
+		distArr[i] = srcCands[i].cost;
+		heapPush(srcCands[i].cost, i);
+	}
 	let dijkstraPops = 0;
+	let bestDst = -1;
+	let bestTotal = Infinity;
 	for (;;) {
 		// Dijkstra 也是 O(E log V) 的重计算，必须同样让出主线程并受预算约束
 		if ((++dijkstraPops & 511) === 0) {
@@ -491,7 +552,12 @@ async function solve(
 		const [du, u] = top;
 		if (settled[u]) continue;
 		settled[u] = true;
-		if (u === 1) break;
+		// 剩余路径代价不可能小于当前弹出距离 → 无更优解
+		if (du >= bestTotal) break;
+		if (u >= S && u < S + D) {
+			const cand = du + dstCands[u - S].cost;
+			if (cand < bestTotal) { bestTotal = cand; bestDst = u; }
+		}
 		for (const e of nodes[u].adj) {
 			if (settled[e.to]) continue;
 			const nd = du + e.cost;
@@ -504,69 +570,23 @@ async function solve(
 		}
 	}
 
-	if (!isFinite(distArr[1])) {
+	if (bestDst < 0) {
 		if ((globalThis as any).__RB_VERBOSE__) {
-			const seen = new Array<boolean>(total).fill(false);
-			const stack = [0];
-			seen[0] = true;
-			while (stack.length) {
-				const u = stack.pop()!;
-				for (const e of nodes[u].adj) if (!seen[e.to]) { seen[e.to] = true; stack.push(e.to); }
-			}
-			// 双向可达集 + 边界包围盒：定位堵点
-			const seen2 = new Array<boolean>(total).fill(false);
-			const stack2 = [1];
-			seen2[1] = true;
-			while (stack2.length) {
-				const u = stack2.pop()!;
-				for (const e of nodes[u].adj) if (!seen2[e.to]) { seen2[e.to] = true; stack2.push(e.to); }
-			}
-			const bbox = (pred: (k: number) => boolean) => {
-				let mnx = Infinity, mny = Infinity, mxx = -Infinity, mxy = -Infinity, cnt = 0;
-				for (let k = 0; k < total; k++) {
-					if (!pred(k) || nodes[k].circle < 0) continue;
-					cnt++;
-					mnx = Math.min(mnx, nodes[k].x); mxx = Math.max(mxx, nodes[k].x);
-					mny = Math.min(mny, nodes[k].y); mxy = Math.max(mxy, nodes[k].y);
-				}
-				return cnt ? `n=${cnt} x[${mnx.toFixed(0)},${mxx.toFixed(0)}] y[${mny.toFixed(0)},${mxy.toFixed(0)}]` : '空';
-			};
-			console.log(`[VR] 无路径: wrappable=${n} blockers=${blockers.length} nodes=${total} src出边=${nodes[0].adj.length} dst出边=${nodes[1].adj.length}`);
-			console.log(`[VR]   src分量: ${bbox(k => seen[k])}`);
-			console.log(`[VR]   dst分量: ${bbox(k => seen2[k])}`);
-			// 两分量之间的"缝隙"障碍：与 src 分量的节点相切距离近、且自身不在任一分量的切点中
-			const srcSet = new Set<number>(), dstSet = new Set<number>();
-			for (let k = 0; k < total; k++) { if (seen[k]) srcSet.add(k); if (seen2[k]) dstSet.add(k); }
-			const seam = new Map<string, number>();
-			for (let k = 0; k < total; k++) {
-				if (!seen[k] && !seen2[k]) continue;
-				const nd = nodes[k];
-				if (nd.circle < 0) continue;
-				for (const e of nd.adj) {
-					const other = nodes[e.to];
-					if (seen[k] !== seen2[e.to] && seen[k] !== seen[e.to]) {
-						const c = circles[nd.circle];
-						const key = `${c.group ?? c.id}`;
-						seam.set(key, (seam.get(key) ?? 0) + 1);
-					}
-				}
-			}
-			console.log(`[VR]   缝隙障碍: ${[...seam.entries()].slice(0, 8).map(([k, v]) => k + 'x' + v).join(', ')}`);
+			console.log(`[VR] 无路径: wrappable=${n} blockers=${blockers.length} nodes=${total} src=${S} dst=${D}`);
 		}
 		return { ok: false, prims: [] };
 	}
 
 	// 6. 回溯路径 → 精确图元（边自带几何，无需重算）
-	if ((globalThis as any).__RB_VERBOSE__ && prevNode[1] === -1) {
-		console.log(`[VR] dist[1]=${distArr[1]} 但 prevNode[1]=-1（异常）`);
-	}
 	const prims: RBPrimitive[] = [];
+	let srcNode = bestDst;
 	{
 		const revEdges: VGEdge[] = [];
-		for (let cur = 1; cur !== 0; cur = prevNode[cur]) {
+		for (let cur = bestDst; prevNode[cur] !== -1; cur = prevNode[cur]) {
 			const e = prevEdge[cur];
 			if (!e) break;
 			revEdges.push(e);
+			srcNode = prevNode[cur];
 		}
 		for (let k = revEdges.length - 1; k >= 0; k--) {
 			const e = revEdges[k];
@@ -582,5 +602,10 @@ async function solve(
 		}
 	}
 
-	return { ok: true, prims };
+	return {
+		ok: true,
+		prims,
+		src: srcCands[srcNode],
+		dst: dstCands[bestDst - S],
+	};
 }

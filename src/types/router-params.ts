@@ -10,7 +10,7 @@ export interface RouterUiOptions {
 	extraClearanceMil: number;
 	/** 扇出圆角半径（mil），0 = 直角 */
 	filletRadiusMil: number;
-	/** 焊盘逃逸线长度（mil） */
+	/** 出线额外余量（mil）：在焊盘边界之外再外扩的量，0 = 严格按最小距离出线 */
 	escapeClearanceMil: number;
 	/** 撕毁重布轮数（0 = 关闭） */
 	ripupRounds: number;
@@ -20,17 +20,23 @@ export interface RouterUiOptions {
 	budgetMs: number;
 	/** 实时预览：每布完一个网络立即写入画布 */
 	livePreview: boolean;
+	/** 最后阶段做凸包拉紧/端帽/圆角优化（失败保留原走线） */
+	finalOptimize: boolean;
+	/** 失败网络允许过孔换层（底层兜底） */
+	viaFallback: boolean;
 }
 
 export const DEFAULT_ROUTER_OPTIONS: RouterUiOptions = {
 	traceWidthMil: 10,
 	extraClearanceMil: 0,
 	filletRadiusMil: 40,
-	escapeClearanceMil: 50,
+	escapeClearanceMil: 0,
 	ripupRounds: 2,
 	powerNetsFirst: true,
 	budgetMs: 300000,
 	livePreview: true,
+	finalOptimize: true,
+	viaFallback: true,
 };
 
 export function normalizeRouterOptions(input: Partial<RouterUiOptions> | undefined): RouterUiOptions {
@@ -44,11 +50,13 @@ export function normalizeRouterOptions(input: Partial<RouterUiOptions> | undefin
 		traceWidthMil: clamp(o.traceWidthMil, 4, 60, DEFAULT_ROUTER_OPTIONS.traceWidthMil),
 		extraClearanceMil: clamp(o.extraClearanceMil, 0, 40, DEFAULT_ROUTER_OPTIONS.extraClearanceMil),
 		filletRadiusMil: clamp(o.filletRadiusMil, 0, 200, DEFAULT_ROUTER_OPTIONS.filletRadiusMil),
-		escapeClearanceMil: clamp(o.escapeClearanceMil, 10, 200, DEFAULT_ROUTER_OPTIONS.escapeClearanceMil),
+		escapeClearanceMil: clamp(o.escapeClearanceMil, 0, 40, DEFAULT_ROUTER_OPTIONS.escapeClearanceMil),
 		ripupRounds: Math.round(clamp(o.ripupRounds, 0, 6, DEFAULT_ROUTER_OPTIONS.ripupRounds)),
 		powerNetsFirst: !!o.powerNetsFirst,
 		budgetMs: clamp(o.budgetMs, 0, 1800000, DEFAULT_ROUTER_OPTIONS.budgetMs),
 		livePreview: o.livePreview !== false,
+		finalOptimize: o.finalOptimize !== false,
+		viaFallback: o.viaFallback !== false,
 	};
 }
 

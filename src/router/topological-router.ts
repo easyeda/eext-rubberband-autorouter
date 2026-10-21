@@ -140,10 +140,12 @@ export class TopologicalRouter {
 					if (padType === 'smd' && (rawLayer === 12 || rawLayer > 2)) layer = 1;
 
 					const padRadius = Math.max(wMil / 2, hMil / 2, holeMil / 2);
+					const bodyRadius = Math.max(Math.min(wMil, hMil) / 2, holeMil / 2);
 					const info: EnginePad = {
 						x, y, net: netName, id, layer,
 						padType, holeDiameter: holeMil,
 						radius: padRadius,
+						bodyRadius,
 						index: allPads.length,
 					};
 					allPads.push(info);
@@ -158,6 +160,30 @@ export class TopologicalRouter {
 
 		this.onLog?.(`解析完成：${allPads.length} 个焊盘，${padMap.size} 个可布线网络`, 'info');
 		return { padMap, allPads };
+	}
+
+	/**
+	 * 探测板子的铜层数：单面板不能往底层（layer 2）出图。
+	 *
+	 * `getAllLayers()` 会把**停用的内层**也返回（16 铜层板可能返回 34 个 SIGNAL），
+	 * 真正在用的铜层要按 `layerStatus === 1` 过滤。
+	 * API 为 BETA，取不到时按双面板处理（保持历史行为）。
+	 */
+	private async detectCopperLayers(): Promise<number> {
+		try {
+			const layers = await eda.pcb_Layer.getAllLayers();
+			if (Array.isArray(layers)) {
+				const copper = layers.filter(l =>
+					l?.type === 'SIGNAL' && (l as any).layerStatus === 1);
+				if (copper.length >= 1) {
+					this.onLog?.(`铜层数：${copper.length}`, 'info');
+					return copper.length;
+				}
+			}
+		} catch (err) {
+			this.onLog?.('无法读取铜层数，按双面板处理', 'info');
+		}
+		return 2;
 	}
 
 	/** 收集静态铜层障碍（折线/线条/填充/板框），不含焊盘 */
@@ -201,7 +227,8 @@ export class TopologicalRouter {
 				continue;
 			}
 			if (layer !== 1 && layer !== 2 && layer !== 12) continue;
-			const r = lw / 2 + drc.trackToLineMil + drc.traceWidthMil / 2;
+			const lineClear = Math.max(drc.trackToLineMil, 8);
+			const r = lw / 2 + lineClear + drc.traceWidthMil / 2 + 2;
 			const pts = parsePath(p.polygon?.polygon ?? p.polygon ?? []);
 			if (pts.length >= 2) {
 				obstacles.push(...buildPolylineObstacle(pts, r, net || undefined, layer, `poly:${pts[0]?.x},${pts[0]?.y}`));
@@ -216,7 +243,8 @@ export class TopologicalRouter {
 			const layer: number = l.layerId ?? l.layer ?? 1;
 			if (layer !== 1 && layer !== 2 && layer !== 12) continue;
 			const lw = l.lineWidth ?? 10;
-			const r = lw / 2 + drc.trackToLineMil + drc.traceWidthMil / 2;
+			const lineClear = Math.max(drc.trackToLineMil, 8);
+			const r = lw / 2 + lineClear + drc.traceWidthMil / 2 + 2;
 			obstacles.push(...buildPolylineObstacle(
 				[{ x: l.startX ?? 0, y: l.startY ?? 0 }, { x: l.endX ?? 0, y: l.endY ?? 0 }],
 				r, net || undefined, layer, `line:${l.primitiveId ?? ''}`,
@@ -231,7 +259,8 @@ export class TopologicalRouter {
 			if (layer !== 1 && layer !== 2 && layer !== 12) continue;
 			const lw = f.lineWidth ?? 0;
 			const net: string = f.net ?? '';
-			const r = lw / 2 + drc.trackToFillMil + drc.traceWidthMil / 2;
+			const fillClear = Math.max(drc.trackToFillMil, 10);
+			const r = lw / 2 + fillClear + drc.traceWidthMil / 2 + 2;
 			const poly = f.complexPolygon?.polygon ?? f.complexPolygon ?? f.polygon?.polygon ?? f.polygon ?? [];
 			const pts = parsePath(poly);
 			if (pts.length >= 3) {
@@ -305,7 +334,13 @@ export class TopologicalRouter {
 				staticObstacles,
 				padShapes,
 				budgetMs: options.budgetMs,
+				copperLayers: await this.detectCopperLayers(),
 				options: {
+					// 首轮只求连通：通用逃逸、不预约全局通道、不做圆角
+					connectivityFirst: true,
+					// 连通完成后再做凸包拉紧/端帽/圆角优化
+					optimize: options.finalOptimize !== false,
+					allowViaFallback: options.viaFallback !== false,
 					filletRadiusMil: options.filletRadiusMil,
 					escapeClearanceMil: options.escapeClearanceMil,
 					ripupRounds: options.ripupRounds,
@@ -561,9 +596,9 @@ export class TopologicalRouter {
 			try {
 				const lines = await eda.pcb_PrimitiveLine.getAll();
 				const ids = lines
-					.filter(l => (l as any).net === name)
-					.map(l => (l as any).primitiveId)
-					.filter((id): id is string => typeof id === 'string' && !!id);
+					.filter((l: any) => l.net === name)
+					.map((l: any) => l.primitiveId)
+					.filter((id: any): id is string => typeof id === 'string' && !!id);
 				if (ids.length) {
 					await eda.pcb_PrimitiveLine.delete(ids);
 					batch += ids.length;
@@ -572,9 +607,9 @@ export class TopologicalRouter {
 			try {
 				const arcs = await eda.pcb_PrimitiveArc.getAll();
 				const ids = arcs
-					.filter(l => (l as any).net === name)
-					.map(l => (l as any).primitiveId)
-					.filter((id): id is string => typeof id === 'string' && !!id);
+					.filter((l: any) => l.net === name)
+					.map((l: any) => l.primitiveId)
+					.filter((id: any): id is string => typeof id === 'string' && !!id);
 				if (ids.length) {
 					await eda.pcb_PrimitiveArc.delete(ids);
 					batch += ids.length;
@@ -583,9 +618,9 @@ export class TopologicalRouter {
 			try {
 				const vias = await eda.pcb_PrimitiveVia.getAll();
 				const ids = vias
-					.filter(l => (l as any).net === name)
-					.map(l => (l as any).primitiveId)
-					.filter((id): id is string => typeof id === 'string' && !!id);
+					.filter((l: any) => l.net === name)
+					.map((l: any) => l.primitiveId)
+					.filter((id: any): id is string => typeof id === 'string' && !!id);
 				if (ids.length) {
 					await eda.pcb_PrimitiveVia.delete(ids);
 					batch += ids.length;
@@ -607,6 +642,17 @@ export class TopologicalRouter {
 		const prims = mergePrims(primsRaw);
 		const rec: PrimIdRecord = { lines: [], arcs: [], vias: [] };
 		this.netPrimIds.set(name, rec);
+
+		// 先建过孔再建走线：EDA 不会把已存在的走线自动连接到后创建的过孔
+		for (const via of vias) {
+			try {
+				const created = await eda.pcb_PrimitiveVia.create(via.net, via.x, via.y, via.hole, via.dia);
+				const id = primitiveIdOf(created);
+				if (created) rec.vias.push(id || created);
+			} catch (err) {
+				console.warn(`[TopologicalRouter] 创建过孔失败 (${via.net}):`, err);
+			}
+		}
 
 		let lastEnd: { x: number; y: number } | null = null;
 		let count = 0;
@@ -665,16 +711,6 @@ export class TopologicalRouter {
 
 			// 每写 32 个图元让渲染器呼吸一次，实现动态刷新
 			if ((++count & 31) === 0) await breathe();
-		}
-
-		for (const via of vias) {
-			try {
-				const created = await eda.pcb_PrimitiveVia.create(via.net, via.x, via.y, via.hole, via.dia);
-				const id = primitiveIdOf(created);
-				if (created) rec.vias.push(id || created);
-			} catch (err) {
-				console.warn(`[TopologicalRouter] 创建过孔失败 (${via.net}):`, err);
-			}
 		}
 
 		this.netGeom.set(name, { segments: written, vias: rec.vias.length });

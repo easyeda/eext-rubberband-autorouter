@@ -133,6 +133,6 @@ export function deriveDefaultOptions(drc: DRCRules): RouterUiOptions {
 		...DEFAULT_ROUTER_OPTIONS,
 		traceWidthMil: Math.round(drc.traceWidthMil * 10) / 10,
 		filletRadiusMil: Math.round(Math.min(40, drc.traceWidthMil * 4)),
-		escapeClearanceMil: Math.round(drc.trackToPadMil + drc.traceWidthMil + 20),
+		escapeClearanceMil: 0,   // 默认严格按最小距离出线
 	};
 }
