@@ -306,17 +306,6 @@
 					<div class="num"><input type="number" id="escapeClearanceMilNum" min="0" max="40" step="1"><span>mil</span></div>
 				</div>
 			</div>
-
-			<div class="row">
-				<div class="label">
-					<span>扇出圆角半径</span>
-					<small>出线段与路径之间的圆角，0 = 保留直角</small>
-				</div>
-				<div class="control">
-					<input type="range" id="filletRadiusMil" min="0" max="120" step="1">
-					<div class="num"><input type="number" id="filletRadiusMilNum" min="0" max="120" step="1"><span>mil</span></div>
-				</div>
-			</div>
 		</section>
 
 		<section class="card">
@@ -417,7 +406,6 @@
 		var DEFAULTS = {
 			traceWidthMil: 10,
 			extraClearanceMil: 0,
-			filletRadiusMil: 40,
 			escapeClearanceMil: 0,
 			ripupRounds: 2,
 			powerNetsFirst: true,
@@ -433,8 +421,7 @@
 		var bindings = [
 			['traceWidthMil', 'traceWidthMilNum', function (v) { return v; }],
 			['extraClearanceMil', 'extraClearanceMilNum', function (v) { return v; }],
-			['escapeClearanceMil', 'escapeClearanceMilNum', function (v) { return v; }],
-			['filletRadiusMil', 'filletRadiusMilNum', function (v) { return v; }]
+			['escapeClearanceMil', 'escapeClearanceMilNum', function (v) { return v; }]
 		];
 
 		function $(id) { return document.getElementById(id); }
@@ -455,7 +442,6 @@
 			setNumberPair('traceWidthMil', 'traceWidthMilNum', o.traceWidthMil);
 			setNumberPair('extraClearanceMil', 'extraClearanceMilNum', o.extraClearanceMil);
 			setNumberPair('escapeClearanceMil', 'escapeClearanceMilNum', o.escapeClearanceMil);
-			setNumberPair('filletRadiusMil', 'filletRadiusMilNum', o.filletRadiusMil);
 			$('ripupRounds').value = String(o.ripupRounds);
 			$('budgetSec').value = String(Math.round(o.budgetMs / 1000));
 			$('powerNetsFirst').checked = !!o.powerNetsFirst;
@@ -470,7 +456,6 @@
 				traceWidthMil: clamp($('traceWidthMilNum').value, 4, 40),
 				extraClearanceMil: clamp($('extraClearanceMilNum').value, 0, 20),
 				escapeClearanceMil: clamp($('escapeClearanceMilNum').value, 0, 40),
-				filletRadiusMil: clamp($('filletRadiusMilNum').value, 0, 120),
 				ripupRounds: parseInt($('ripupRounds').value, 10) || 0,
 				powerNetsFirst: $('powerNetsFirst').checked,
 				budgetMs: (parseInt($('budgetSec').value, 10) || 0) * 1000,
@@ -484,7 +469,6 @@
 			var o = collect();
 			var chips = [
 				'<span class="chip">线宽 <b>' + o.traceWidthMil + '</b> mil</span>',
-				'<span class="chip">圆角 <b>' + (o.filletRadiusMil > 0 ? o.filletRadiusMil + ' mil' : '直角') + '</b></span>',
 				'<span class="chip">撕毁重布 <b>' + (o.ripupRounds > 0 ? o.ripupRounds + ' 轮' : '关闭') + '</b></span>',
 				'<span class="chip">' + (o.livePreview ? '实时预览' : '完成后写入') + '</span>',
 				'<span class="chip">' + (o.finalOptimize ? '最后凸包优化' : '仅连通') + '</span>',

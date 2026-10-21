@@ -121,21 +121,28 @@ export class TopologicalRouter {
 					if (x === 0 && y === 0 && !p.center) continue;
 					const id: string = p.globalIndex || p.uuid || `${netName}_${allPads.length}`;
 
-					const padShape = p.pad ?? [];
+					// 焊盘形状：pcb_Net.getAllPrimitivesByNet 的原语没有 pad/hole 字段，
+					// 但带 defaultPadShapeAspect/holeAspect（[形状, 宽, 高]，单位与坐标一致），
+					// 取不到时再靠 pcb_PrimitivePad.getAll 的位置缓存兜底。
+					const padShape = p.pad ?? p.defaultPadShapeAspect ?? [];
 					let wMil = 0, hMil = 0;
 					if (Array.isArray(padShape) && padShape.length >= 3) {
 						wMil = padShape[1] ?? 0;
 						hMil = padShape[2] ?? 0;
 					}
-					const hole = p.hole ?? [];
+					const hole = p.hole ?? p.holeAspect ?? [];
 					const holeMil = Array.isArray(hole) && hole.length >= 2 ? (hole[1] ?? 0) : 0;
 					if (wMil === 0 && hMil === 0) { wMil = 32; hMil = 34; }
 
+					const rawLayer: number = p.layerId ?? p.layer ?? 1;
+					// 通孔焊盘：有钻孔，或层号为 12（多层贯穿）。只看钻孔会把
+					// getAllPrimitivesByNet 里缺 hole 字段的 TH 焊盘误判成 SMD，
+					// 进而被下面的强制改层压成顶层——底层从此对它不设防，
+					// 过孔兜底也把它当顶层 SMD 处理（多打一个过孔）。
 					let padType: 'th' | 'smd' | 'via' = 'smd';
-					if (holeMil > 0) padType = 'th';
+					if (holeMil > 0 || rawLayer === 12) padType = 'th';
 					else if (p.isVia || p.type === 'via') padType = 'via';
 
-					const rawLayer: number = p.layerId ?? p.layer ?? 1;
 					let layer: number = rawLayer;
 					if (padType === 'smd' && (rawLayer === 12 || rawLayer > 2)) layer = 1;
 
@@ -336,12 +343,10 @@ export class TopologicalRouter {
 				budgetMs: options.budgetMs,
 				copperLayers: await this.detectCopperLayers(),
 				options: {
-					// 首轮只求连通：通用逃逸、不预约全局通道、不做圆角
+					// 首轮只求连通；连通完成后再做中心到中心最短路拉紧优化
 					connectivityFirst: true,
-					// 连通完成后再做凸包拉紧/端帽/圆角优化
 					optimize: options.finalOptimize !== false,
 					allowViaFallback: options.viaFallback !== false,
-					filletRadiusMil: options.filletRadiusMil,
 					escapeClearanceMil: options.escapeClearanceMil,
 					ripupRounds: options.ripupRounds,
 					powerNetsFirst: options.powerNetsFirst,
@@ -375,6 +380,20 @@ export class TopologicalRouter {
 					continue;
 				}
 				await this.deleteNet(name);
+			}
+
+			// 收尾对账：EDA 的批量删除偶发不生效，运行中途被替换掉的尝试走线
+			// 可能残留在画布上（与最终走线叠画、引发 DRC 冲突）。规划结束后
+			// 文档已空闲，按最终规划逐网清写一遍，保证画布与引擎终态一致。
+			if (options.livePreview !== false && !this.shouldCancel) {
+				for (const name of new Set([...this.routedNames, ...this.failedNames])) {
+					const planned = this.pendingPlanned.get(name);
+					if (planned && planned.prims.length) {
+						await this.writeNet(name, planned.prims, planned.vias, true);
+					} else {
+						await this.purgeNetFromDocument(name);
+					}
+				}
 			}
 
 			if (!options.livePreview) {
@@ -536,8 +555,9 @@ export class TopologicalRouter {
 			else this.pendingPlanned.delete(name);
 			return;
 		}
+		// 记录该网最终规划（收尾对账用它全量清写，见 run() 末尾）
+		this.pendingPlanned.set(name, { prims, vias });
 		if (this.currentOptions?.livePreview === false) {
-			this.pendingPlanned.set(name, { prims, vias });
 			this.netGeom.set(name, { segments: prims.length, vias: vias.length });
 			this.emitStats();
 			return;
@@ -548,10 +568,8 @@ export class TopologicalRouter {
 	private async applyRipup(names: string[]): Promise<void> {
 		for (const name of names) {
 			this.netGeom.delete(name);
-			if (this.currentOptions?.livePreview === false) {
-				this.pendingPlanned.delete(name);
-				continue;
-			}
+			this.pendingPlanned.delete(name);
+			if (this.currentOptions?.livePreview === false) continue;
 			await this.deleteNet(name);
 		}
 		this.emitStats();

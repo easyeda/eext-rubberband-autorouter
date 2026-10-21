@@ -1,26 +1,20 @@
 /**
- * EdgeRouter - 焊盘到焊盘的「最小距离」走线
+ * EdgeRouter - 焊盘出线几何
  *
- * 旧实现的问题（用户反馈：绕路多、出线不正常）：
- *  - 每个连接都走「焊盘中心 → 逃逸点（≈91mil）→ 寻路 → 逃逸点 → 焊盘中心」，
- *    逃逸点由「净空最大」启发式选出，与目标方向无关 ⇒ 无条件多出 2×91mil，
- *    且出线方向经常背对目标（"不正常的出线"）。
- *  - 直连（焊盘中心到焊盘中心）只在逃逸失败后才尝试，任意角度最短路径几乎用不上。
+ * 布线主模型是「焊盘中心 → 可视图最短路 → 焊盘中心」：本网络焊盘不作为障碍，
+ * 出线方向就是最短路的起始方向，走线天然切线连续、没有人为折角。
  *
- * 新模型：
- *  - 出线方向不再由启发式决定，而是作为「候选集合」交给最短路求解器：
- *    每个候选点位于焊盘铜皮轮廓在某个方向上的边界（+ 极小余量），
- *    候选代价 = 焊盘中心到候选点的引出段长度。
- *  - 多源 Dijkstra 同时以全部源候选为起点、全部目标候选为终点，
- *    取「引出段 + 路径 + 引入段」总长最小者。
- *  - 因此：两点之间直线可连时，总长恰等于两焊盘直线距离（理论下界）；
- *    直线被挡时才绕行，且绕行量由可见图精确求解。
- *  - 焊盘自身的铜皮轮廓作为「本体禁行区」（blockerOnly + forceBlock）：
- *    走线必须从焊盘向外离开，不能压过自己的焊盘；
- *    但引出段在焊盘内部，因此引出段不参与该判定。
+ * 但在密集焊盘排里，邻焊盘的外扩间距圈可能吞没本焊盘中心（间距 < 两焊盘半径+
+ * 外扩之和），中心起点的任何线段都会被判侵入 —— 此时退回到「出线候选」模型：
+ * 从焊盘轮廓边界出线（引出段），引出段与路径之间用切线圆角过渡。
+ *
+ * 因此本文件提供：
+ *  - buildExitCandidates：出线候选点（中心直连失败的同层退避、过孔兜底共用）
+ *  - routePadEdge：出线候选 + 引出段 + 切线圆角的同层退避走线
+ *  - primsLength：图元求长工具
  */
 import {
-	RBObstacle, RBPrimitive, pointSegDist, fanoutFillet,
+	RBObstacle, RBPrimitive, fanoutFillet,
 } from './rubberband-engine';
 import { routeBetweenEndpoints, validatePrimsAgainst } from './visibility-router';
 
@@ -61,8 +55,6 @@ export interface PadEdgeOptions {
 	budgetMs?: number;
 	/** 拐角圆角半径（mil），0 = 直角 */
 	filletRadiusMil?: number;
-	/** 非轴向出线方向的额外代价（mil）：优化阶段用于偏好正交走线 */
-	dirPenaltyMil?: number;
 	/** 候选点相对焊盘边界的外扩余量（mil） */
 	marginMil?: number;
 }
@@ -73,13 +65,11 @@ export interface PadEdgeResult {
 	prims: RBPrimitive[];
 	/** 总长（含引出/引入段） */
 	length: number;
-	src?: ExitCandidate;
-	dst?: ExitCandidate;
 }
 
 /** 均匀出线方向数（45° 步进） */
 const UNIFORM_DIRS = 8;
-/** 候选点外扩余量：让首段切线不被「本体禁行区」判为侵入 */
+/** 候选点外扩余量：给引出段留出一点裕度 */
 const DEFAULT_MARGIN_MIL = 0.05;
 
 /**
@@ -101,10 +91,10 @@ function rayExitDistance(outline: PadOutline[], ux: number, uy: number): number 
 }
 
 /**
- * 生成出线候选点：
+ * 生成出线候选点（同层退避 / 过孔兜底的引出段方向）：
  *  - 8 个均匀方向（45° 步进）——覆盖「先横向让出再转弯」等必要绕行
  *  - 焊盘长轴方向及其反向——长焊盘的常规出线
- *  - 正对目标的方向——保证直线可连时总长恰为两焊盘直线距离
+ *  - 正对目标的方向——保证直线可连时引出段最短
  */
 export function buildExitCandidates(
 	pad: PadTerminal,
@@ -138,7 +128,7 @@ export function buildExitCandidates(
 }
 
 /**
- * 焊盘本体禁行区：走线不得压过自己的焊盘。
+ * 焊盘本体禁行区：走线不得压过自己的焊盘（退避模型下从边界出线）。
  * blockerOnly：只参与碰撞判定，不生成切点/边（否则会沿焊盘边缘绕圈）。
  * forceBlock：即使与当前网络同名也阻挡（同名障碍默认被跳过）。
  */
@@ -158,12 +148,46 @@ export function buildPadKeepout(pad: PadTerminal, layer?: number): RBObstacle[] 
 	}));
 }
 
-/** 引出段是否可行：不侵入其它网络的障碍（本体禁行区按网络跳过） */
-function stubFeasible(pad: PadTerminal, cand: ExitCandidate, obstacles: RBObstacle[], net: string): boolean {
+/**
+ * 引出段是否可行（从焊盘中心到指定点的直线段）：
+ * 不得侵入其它网络的障碍 —— 但完全落在本焊盘铜皮之内的侵入段除外。
+ *
+ * 依据：走线压自家焊盘铜皮不构成任何间距冲突；而密集焊盘排里邻焊盘的
+ * 外扩间距圈会吞没本焊盘中心（相邻间距 < 两焊盘半径+外扩之和），此时
+ * 从中心出发的任何线段开头一段必然「侵入」——这是焊盘排本身的既有状态，
+ * 不是走线造成的，不能因此判死所有出线方向。
+ */
+export function stubFeasible(
+	pad: PadTerminal, x2: number, y2: number, obstacles: RBObstacle[], net: string,
+): boolean {
+	const dx = x2 - pad.x, dy = y2 - pad.y;
+	const len = Math.hypot(dx, dy);
+	if (len < 1e-9) return true;
+	const ux = dx / len, uy = dy / len;
+	// 本焊盘铜皮沿出线方向的出射距离（超出它之后必须真正清障）
+	const exit = rayExitDistance(pad.outline, ux, uy) - 0.5;
 	for (const o of obstacles) {
 		if (o.net === net) continue;
 		if (o.forceBlock) continue;          // 本体禁行区（自己的焊盘）
-		if (pointSegDist(o.x, o.y, pad.x, pad.y, cand.x, cand.y) < o.r - 0.02) return false;
+		const r = o.r - 0.02;
+		const wx = o.x - pad.x, wy = o.y - pad.y;
+		const b = wx * ux + wy * uy;
+		const c = wx * wx + wy * wy - r * r;
+		let t0: number, t1: number;
+		if (c < 0) {
+			t0 = 0; t1 = b + Math.sqrt(b * b - c);   // 焊盘中心已在侵入圈内
+		} else {
+			const disc = b * b - c;
+			if (disc < 0) continue;
+			const sq = Math.sqrt(disc);
+			t0 = b - sq; t1 = b + sq;
+		}
+		if (t1 < 0 || t0 > len) continue;
+		t0 = Math.max(0, t0);
+		t1 = Math.min(len, t1);
+		if (t1 - t0 < 0.01) continue;
+		if (t1 <= exit) continue;            // 侵入段完全在自家铜皮内 → 可接受
+		return false;
 	}
 	return true;
 }
@@ -191,7 +215,7 @@ export function primsLength(prims: RBPrimitive[]): number {
 }
 
 /**
- * 焊盘 → 焊盘的最小距离走线。
+ * 焊盘 → 焊盘的「出线候选」走线（同层退避，仅在中心直连失败时使用）。
  *
  * @param obstacles 当前层上的障碍（不含两个端点焊盘的本体禁行区，本函数内部追加）
  */
@@ -204,27 +228,19 @@ export async function routePadEdge(
 ): Promise<PadEdgeResult> {
 	const expands = opts.expands ?? [150, 500];
 	const margin = opts.marginMil ?? DEFAULT_MARGIN_MIL;
-	const penalty = opts.dirPenaltyMil ?? 0;
 
 	const allSrc = buildExitCandidates(src, dst, margin);
 	const allDst = buildExitCandidates(dst, src, margin);
-	const srcCands = allSrc.filter(c => stubFeasible(src, c, obstacles, net));
-	const dstCands = allDst.filter(c => stubFeasible(dst, c, obstacles, net));
+	const srcCands = allSrc.filter(c => stubFeasible(src, c.x, c.y, obstacles, net));
+	const dstCands = allDst.filter(c => stubFeasible(dst, c.x, c.y, obstacles, net));
 	if (!srcCands.length || !dstCands.length) return { ok: false, prims: [], length: 0 };
-
-	// 出线方向偏好：非轴向（45° 倍数之外）加一点惩罚，仅用于优化阶段
-	const costOf = (c: ExitCandidate): number => {
-		if (penalty <= 0) return c.length;
-		const axis = Math.abs(c.dirX) < 1e-6 || Math.abs(c.dirY) < 1e-6;
-		return c.length + (axis ? 0 : penalty);
-	};
 
 	const keepouts = [...buildPadKeepout(src), ...buildPadKeepout(dst)];
 	const routeObs = [...obstacles, ...keepouts];
 
 	const res = await routeBetweenEndpoints(
-		srcCands.map(c => ({ x: c.x, y: c.y, cost: costOf(c) })),
-		dstCands.map(c => ({ x: c.x, y: c.y, cost: costOf(c) })),
+		srcCands.map(c => ({ x: c.x, y: c.y, cost: c.length })),
+		dstCands.map(c => ({ x: c.x, y: c.y, cost: c.length })),
 		routeObs, net, expands, opts.budgetMs,
 		{ x: src.x, y: src.y }, { x: dst.x, y: dst.y },
 	);
@@ -237,7 +253,7 @@ export async function routePadEdge(
 	const stubOut: RBPrimitive = { kind: 'line', x1: dstCand.x, y1: dstCand.y, x2: dst.x, y2: dst.y };
 	const path = res.prims.slice();
 
-	// 拐角圆角：引出段与路径首/末段之间
+	// 拐角圆角：引出段与路径首/末段之间（切线圆弧过渡，G1 连续）
 	const plain: RBPrimitive[] = [stubIn, ...path, stubOut];
 	const prims: RBPrimitive[] = [];
 	const R = opts.filletRadiusMil ?? 0;
@@ -267,5 +283,5 @@ export async function routePadEdge(
 		if (!legal) finalPrims = plain;
 	}
 
-	return { ok: true, prims: finalPrims, length: primsLength(finalPrims), src: srcCand, dst: dstCand };
+	return { ok: true, prims: finalPrims, length: primsLength(finalPrims) };
 }

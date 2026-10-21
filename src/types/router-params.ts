@@ -8,8 +8,6 @@ export interface RouterUiOptions {
 	traceWidthMil: number;
 	/** 在 DRC 规则基础上额外增加的安全间距（mil） */
 	extraClearanceMil: number;
-	/** 扇出圆角半径（mil），0 = 直角 */
-	filletRadiusMil: number;
 	/** 出线额外余量（mil）：在焊盘边界之外再外扩的量，0 = 严格按最小距离出线 */
 	escapeClearanceMil: number;
 	/** 撕毁重布轮数（0 = 关闭） */
@@ -29,7 +27,6 @@ export interface RouterUiOptions {
 export const DEFAULT_ROUTER_OPTIONS: RouterUiOptions = {
 	traceWidthMil: 10,
 	extraClearanceMil: 0,
-	filletRadiusMil: 40,
 	escapeClearanceMil: 0,
 	ripupRounds: 2,
 	powerNetsFirst: true,
@@ -49,7 +46,6 @@ export function normalizeRouterOptions(input: Partial<RouterUiOptions> | undefin
 	return {
 		traceWidthMil: clamp(o.traceWidthMil, 4, 60, DEFAULT_ROUTER_OPTIONS.traceWidthMil),
 		extraClearanceMil: clamp(o.extraClearanceMil, 0, 40, DEFAULT_ROUTER_OPTIONS.extraClearanceMil),
-		filletRadiusMil: clamp(o.filletRadiusMil, 0, 200, DEFAULT_ROUTER_OPTIONS.filletRadiusMil),
 		escapeClearanceMil: clamp(o.escapeClearanceMil, 0, 40, DEFAULT_ROUTER_OPTIONS.escapeClearanceMil),
 		ripupRounds: Math.round(clamp(o.ripupRounds, 0, 6, DEFAULT_ROUTER_OPTIONS.ripupRounds)),
 		powerNetsFirst: !!o.powerNetsFirst,

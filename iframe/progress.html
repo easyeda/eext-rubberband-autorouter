@@ -394,8 +394,8 @@
 					setStats(data.stats || {});
 					if (data.options) {
 						$('subtitle').textContent =
-							'线宽 ' + data.options.traceWidthMil + ' mil · 圆角 ' + data.options.filletRadiusMil +
-							' mil · ' + (data.options.livePreview ? '实时预览' : '完成后写入');
+							'线宽 ' + data.options.traceWidthMil + ' mil · ' +
+							(data.options.livePreview ? '实时预览' : '完成后写入');
 					}
 					appendLog('info', '布线任务已启动（Web Worker 规划）', Date.now());
 					break;
