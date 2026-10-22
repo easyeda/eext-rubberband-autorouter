@@ -11,7 +11,7 @@
 import {
 	RBObstacle, RBPrimitive, capsuleToCircles,
 	buildPolylineObstacle,
-	pointSegDist, padExitModel, padShapeToCircles,
+	pointSegDist, padExitModel, padShapeToCircles, padShapeDistance,
 } from './rubberband-engine';
 import { routeConnection } from './visibility-router';
 import { buildExitCandidates, routePadEdge, stubFeasible, PadTerminal } from './edge-router';
@@ -53,6 +53,8 @@ export interface EnginePad {
 	radius: number;
 	/** 短轴半径（通用逃逸评分更合适，避免长焊盘逃逸点被推得过远） */
 	bodyRadius?: number;
+	/** 焊盘旋转角（度，EDA 约定逆时针为正） */
+	rotation?: number;
 	index: number;
 }
 
@@ -139,6 +141,9 @@ function bottomCapable(pad: EnginePad): boolean {
 export function mergePrims(prims: RenderedPrim[]): RenderedPrim[] {
 	const out: RenderedPrim[] = [];
 	for (const p of prims) {
+		// 微段（同一障碍圆上相邻两段弧之间 ~1mil 的切点残留）：直接丢弃，
+		// 让两侧的弧有机会按同圆合并
+		if (p.kind === 'line' && Math.hypot((p.x2 ?? 0) - (p.x1 ?? 0), (p.y2 ?? 0) - (p.y1 ?? 0)) < 2) continue;
 		const last = out[out.length - 1];
 		if (p.kind === 'arc' && last && last.kind === 'arc' && last.layer === p.layer &&
 			Math.abs((last.cx ?? 0) - (p.cx ?? 0)) < 0.01 &&
@@ -247,7 +252,7 @@ export class PlanningEngine {
 		// 网络排序（电源优先，其余按 netOrder 指定的策略）
 		const networks = this.sortNetworks(input.networks);
 
-		this.log(`网络顺序（${this.planOptions.netOrder ?? 'longest'}）：${networks.map(n => n.name).join(' → ')}`, 'info');
+		this.log(`网络顺序（${this.planOptions.netOrder ?? 'river'}）：${networks.map(n => n.name).join(' → ')}`, 'info');
 		const pendingNets: Array<{ name: string; pads: EnginePad[] }> = [];
 
 		// 第一轮：逐网络布线
@@ -279,6 +284,7 @@ export class PlanningEngine {
 				const ends = [net.pads[0], net.pads[net.pads.length - 1]];
 				const seals = new Set<string>();
 				for (const o of this.dynamicObstacles) {
+					if (o.soft) continue;
 					if (o.net && o.net !== net.name &&
 						ends.some(e => Math.hypot(o.x - e.x, o.y - e.y) < o.r + 70)) {
 						seals.add(o.net);
@@ -311,6 +317,7 @@ export class PlanningEngine {
 				for (const [ia, ib] of this.computeMST(net.pads)) {
 					const pa = net.pads[ia], pb = net.pads[ib];
 					for (const o of this.dynamicObstacles) {
+						if (o.soft) continue;
 						if (!o.net || o.net === net.name) continue;
 						if (pointSegDist(o.x, o.y, pa.x, pa.y, pb.x, pb.y) < o.r + corridor) {
 							sealsAll.add(o.net);
@@ -378,16 +385,17 @@ export class PlanningEngine {
 	// ── 内部实现 ─────────────────────────────
 
 	/**
-	 * 网络排序：布线顺序直接决定绕路总量。
+	 * 网络排序：布线顺序直接决定绕路总量与拓扑美观度。
 	 *
-	 * 关键结论（离线基准 tmp/quality-test.ts 实测）：
-	 *  一组「扇形」网络中，各条理想路径互不相交（源点在一条边上、目标点在
-	 *  另一条边上，且顺序一致）。若按「从内到外」布线，先布的内层网络会
-	 *  横在外层网络的理想路径上，把外层网络逼到绕远路 —— 这是绕路的主因。
-	 *  因此默认按「连接总长降序」布线：最长的连接约束最多，先给它让出通道。
+	 * 默认 river（河流式）：先按 minX 升序把同源的「扇形束」聚在一起，
+	 * 束内从内层网络到外层网络逐条布设。这样每条网络下潜时前方都是
+	 * 处女地，沿前一条兄弟网络的通道贴边同行，阶梯逐级向外生长；
+	 * 各束之间也互不交错。反之若按总长等全局指标排序，束会交错展开，
+	 * 外层网络先布会封死内层网络的出口（出口一旦被封，内层只能
+	 * 绕远路甚至打孔换层）—— 这是绕路和多余过孔的主因。
 	 */
 	private sortNetworks(nets: Array<{ name: string; pads: EnginePad[] }>): Array<{ name: string; pads: EnginePad[] }> {
-		const mode = this.planOptions.netOrder ?? 'longest';
+		const mode = this.planOptions.netOrder ?? 'river';
 		const span = (n: { name: string; pads: EnginePad[] }) => {
 			const edges = this.computeMST(n.pads);
 			let total = 0;
@@ -485,12 +493,27 @@ export class PlanningEngine {
 			const shape = {
 				pad: cached?.pad ?? ['ELLIPSE', p.radius * 2, p.radius * 2],
 				hole: cached?.hole ?? (p.holeDiameter > 0 ? ['ROUND', p.holeDiameter] : null),
+				rotation: cached?.rotation ?? p.rotation ?? 0,
 			};
 			for (const c of padShapeToCircles(shape)) {
-				out.push({ id: `p${id++}`, kind: 'circle', x: p.x + c.x, y: p.y + c.y, r: c.r + infl, net: p.net, layer, group });
+				out.push({
+					id: `p${id++}`, kind: 'circle', x: p.x + c.x, y: p.y + c.y, r: c.r + infl,
+					net: p.net, layer, group, ...(c.blockerOnly ? { blockerOnly: true } : {}),
+				});
 			}
 		}
 		return out;
+	}
+
+	/** 点到焊盘铜皮的有符号距离（内部为负），用于过孔落点校验 */
+	private padCopperDistance(pad: EnginePad, x: number, y: number): number {
+		const cached = this.padShapes[`${pad.x.toFixed(2)},${pad.y.toFixed(2)}`];
+		const shape = {
+			pad: cached?.pad ?? ['ELLIPSE', pad.radius * 2, pad.radius * 2],
+			hole: cached?.hole ?? null,
+			rotation: cached?.rotation ?? pad.rotation ?? 0,
+		};
+		return padShapeDistance(shape, x - pad.x, y - pad.y);
 	}
 
 	/**
@@ -532,7 +555,13 @@ export class PlanningEngine {
 					r, pr.net, pr.layer, group,
 				));
 			} else {
-				// 弧：两端可绕行 + 沿弧加密阻挡圆（带弦→弧外凸补偿）
+				// 弧：沿弧加密阻挡圆（带弦→弧外凸补偿），另加一个「同心外包络圆」。
+				// 包络圆与弧同心、半径 = 弧半径 + 间距半径，是一条与已布圆弧处处
+				// 等距的曲线：后布网络可以相切地骑在它上面，形成论文图里那种
+				// 同心嵌套的束状圆弧。它只参与建图（soft），不参与碰撞阻挡 ——
+				// 否则会把这个大圆盘内部（圆角内侧的空地）封死。
+				// 不加包络圆时，后布网络只能从前一网络弧的两端切点拉直线，
+				// 要么切进弧内造成真实间距违规，要么被迫绕到障碍另一端出现钩子。
 				const nSeg = Math.max(2, Math.ceil(Math.abs(pr.sweep!) / 0.35));
 				const dTheta = pr.sweep! / nSeg;
 				const bulge = pr.r! * (1 - Math.cos(Math.abs(dTheta) / 2));
@@ -544,14 +573,34 @@ export class PlanningEngine {
 					const a = pr.startAngle! + (pr.sweep! * sIdx) / nSeg;
 					const nx = pr.cx! + pr.r! * Math.cos(a);
 					const ny = pr.cy! + pr.r! * Math.sin(a);
-					for (const c of capsuleToCircles(px, py, nx, ny, rr)) {
-						this.dynamicObstacles.push({ id: `db${this.obstacleIdCounter++}`, kind: 'circle', x: c.x, y: c.y, r: rr, net: pr.net, layer: pr.layer, group, blockerOnly: true });
-					}
+					this.dynamicObstacles.push({
+						id: `db${this.obstacleIdCounter++}`, kind: 'circle',
+						x: nx, y: ny, r: rr, net: pr.net, layer: pr.layer, group,
+						blockerOnly: true, bulge,
+					});
 					px = nx; py = ny;
 				}
 				this.dynamicObstacles.push({ id: `dw${this.obstacleIdCounter++}`, kind: 'circle', x: px, y: py, r, net: pr.net, layer: pr.layer, group });
+				// 同心外包络（只建图、不阻挡）
+				this.dynamicObstacles.push({
+					id: `do${this.obstacleIdCounter++}`, kind: 'circle',
+					x: pr.cx!, y: pr.cy!, r: pr.r! + rr, net: pr.net, layer: pr.layer,
+					group, soft: true,
+				});
 			}
 		}
+		// 相邻图元共享端点，会生成位置完全重合的圆（线段端点 + 弧端点 + 线段的
+		// capsule 端点）。可视图在重合圆上会各自生成切点，路径便沿一串几乎同心的
+		// 小圆「扇贝式」抖动（0.05rad 级碎片弧 + 3mil 短线）。这里按几何去重，
+		// 同一位置保留可用性最高的一个：可绕行 > 仅阻挡 > 只建图。
+		const rank = (o: RBObstacle): number => (o.soft ? 2 : o.blockerOnly ? 1 : 0);
+		const uniq = new Map<string, RBObstacle>();
+		for (const o of this.dynamicObstacles) {
+			const key = `${o.layer ?? ''}|${o.net ?? ''}|${o.x.toFixed(1)}|${o.y.toFixed(1)}|${o.r.toFixed(2)}${o.forceBlock ? '|f' : ''}`;
+			const prev = uniq.get(key);
+			if (!prev || rank(o) < rank(prev)) uniq.set(key, o);
+		}
+		this.dynamicObstacles = [...uniq.values()];
 	}
 
 	/** 布一个网络的全部 MST 连接（纯规划） */
@@ -578,18 +627,39 @@ export class PlanningEngine {
 			// ② 密集焊盘排里邻焊盘的外扩间距圈会吞没本焊盘中心（间距 < 两焊盘
 			//    半径+外扩之和），中心起点的任何线段都判侵入 —— 退回焊盘边界
 			//    出线候选（引出段 + 切线圆角）
-			let rendered = await this.directEdgeRoute(src, dst, net.name, routingLayer) ??
+			const topSolution = await this.directEdgeRoute(src, dst, net.name, routingLayer) ??
 				await this.candidateEdgeRoute(src, dst, net.name, routingLayer);
 
-			// 顶层绕不过去 → 换到底层再试（TH/底层焊盘无需过孔即可落到底层）
-			if (!rendered && routingLayer === 1 && this.hasBottomLayer &&
-				bottomCapable(src) && bottomCapable(dst)) {
-				rendered = await this.directEdgeRoute(src, dst, net.name, 2) ??
-					await this.candidateEdgeRoute(src, dst, net.name, 2);
+			let rendered = topSolution;
+			const edgeVias: PlannedVia[] = [];
+
+			// 「绕不过去」不只看走不走得通：顶层被障碍逼出 1.9 倍以上的大绕
+			// （沿板边兜圈、在铺铜缝隙里穿针），继续贴层既难看又不合理 ——
+			// 此时视为顶层绕不过去，比选换层方案，明显更短才换。
+			const lb = Math.hypot(dst.x - src.x, dst.y - src.y);
+			const topDetoured = rendered !== null && renderedLength(rendered) > lb * 1.55;
+
+			// 顶层走不通（或绕得离谱）→ 换到底层再试：
+			//  双端都能落底层（TH/底层焊盘）则底层直连，无需过孔；
+			//  顶层 SMD 只能过孔换层兜底。
+			if ((!rendered || topDetoured) && routingLayer === 1 && this.hasBottomLayer) {
+				let altPrims: RenderedPrim[] | null = null;
+				let altVias: PlannedVia[] = [];
+				if (bottomCapable(src) && bottomCapable(dst)) {
+					altPrims = await this.directEdgeRoute(src, dst, net.name, 2) ??
+						await this.candidateEdgeRoute(src, dst, net.name, 2);
+				} else {
+					const viaCand = await this.viaEdgeCandidate(src, dst, net.name);
+					if (viaCand) { altPrims = viaCand.prims; altVias = viaCand.vias; }
+				}
+				// 换层方案明显更短才采纳（过孔有工艺代价，省 50mil 不值得打孔）
+				if (altPrims && (!rendered || renderedLength(altPrims) < renderedLength(rendered) - 50)) {
+					rendered = altPrims;
+					edgeVias.push(...altVias);
+				}
 			}
 
 			// 两个单层都走不通 → 才用过孔换层兜底
-			const edgeVias: PlannedVia[] = [];
 			if (!rendered && this.hasBottomLayer) {
 				const viaCand = await this.viaEdgeCandidate(src, dst, net.name);
 				if (viaCand) {
@@ -621,10 +691,14 @@ export class PlanningEngine {
 
 		// 整网成功：提交图元、过孔与动态障碍
 		if (netOk) {
+			// 先合并再接缝：可视图会在同一障碍圆的多个切点之间切出碎片弧/微段，
+			// 直接拿去建障碍会得到一串几乎重合的端点圆与包络圆，后布网络沿着
+			// 它们走就会「扇贝式」抖动。合并后每段弧/线只登记一次。
+			const mergedEdge = mergePrims(attemptRendered);
 			const rds = this.netRendered.get(net.name) ?? [];
-			rds.push(...attemptRendered);
+			rds.push(...mergedEdge);
 			this.netRendered.set(net.name, rds);
-			this.addRenderedToObstacles(attemptRendered);
+			this.addRenderedToObstacles(mergedEdge);
 			this.plannedVias = this.plannedVias.filter(v => v.net !== net.name).concat(attemptVias);
 			// 过孔是贯通各层的孔洞：其它网络（任何层）都要给它让位
 			for (const v of attemptVias) {
@@ -740,6 +814,7 @@ export class PlanningEngine {
 			stubFeasible(this.padTerminal(pad), x2, y2, obs, netName);
 		const viaClear = (x: number, y: number, obs: RBObstacle[]): boolean => {
 			for (const o of obs) {
+				if (o.soft) continue;
 				if (o.net === netName) continue;
 				// 障碍圆半径已含「对方走线半宽 + 间距」，过孔比走线粗，多出的部分要补上；
 				// EDA 的 Track↔Via 规则按焊盘间距执行（大于走线间距）
@@ -770,9 +845,16 @@ export class PlanningEngine {
 			const out: Anchor[] = [];
 			for (const c of cands) {
 				if (!segClear(pad, c.x, c.y, topObs)) continue;
-				// 步进量从 10mil 起：过孔钻孔（r≈6mil）不要落在焊盘铜皮上
-				for (const step of [10, 20, 35, 50, 70]) {
-					const x = c.x + c.dirX * step, y = c.y + c.dirY * step;
+				// 步进首档 ≥ 过孔半径 + 4mil，再沿方向续推直到铜环完全离开
+				// 自家焊盘铜皮：斜向出线时距离增长率 < 1（45° 只有 0.707），
+				// 只按 viaR 步进会让过孔铜环压进焊盘 2~4mil。
+				for (const step of [viaR + 4, viaR + 16, viaR + 32, viaR + 52, viaR + 78]) {
+					let x = c.x + c.dirX * step, y = c.y + c.dirY * step;
+					for (let i = 0; i < 16 && this.padCopperDistance(pad, x, y) < viaR + 4; i++) {
+						x += c.dirX * 4;
+						y += c.dirY * 4;
+					}
+					if (this.padCopperDistance(pad, x, y) < viaR + 4) continue;
 					if (!segClear(pad, x, y, topObs)) continue;
 					if (!viaClear(x, y, topObs) || !viaClear(x, y, bottomObs)) continue;
 					out.push({
@@ -805,7 +887,7 @@ export class PlanningEngine {
 		const bottomFor = async (A: Anchor, B: Anchor): Promise<RenderedPrim[] | null> => {
 			// 底层路径：直连优先，被挡才跑可视图
 			const bottomBlocked = bottomObs.some(o =>
-				o.net !== netName &&
+				!o.soft && o.net !== netName &&
 				pointSegDist(o.x, o.y, A.x, A.y, B.x, B.y) < o.r - 0.05);
 			if (!bottomBlocked) {
 				return [{
@@ -880,6 +962,7 @@ export class PlanningEngine {
 
 		const viaClear = (x: number, y: number, obs: RBObstacle[]): boolean => {
 			for (const o of obs) {
+				if (o.soft) continue;
 				if (o.net === net.name) continue;
 				// EDA 的 Track↔Via 规则按焊盘间距执行（大于走线间距）
 				if (Math.hypot(x - o.x, y - o.y) <
@@ -907,9 +990,15 @@ export class PlanningEngine {
 			const cands = buildExitCandidates(term, other, this.escapeMargin);
 			for (const c of cands) {
 				if (!segClear(pad, c.x, c.y, topObs)) continue;
-				// 步进量从 10mil 起：过孔钻孔（r≈6mil）不要落在焊盘铜皮上
-				for (const step of [10, 20, 35, 50, 70]) {
-					const x = c.x + c.dirX * step, y = c.y + c.dirY * step;
+				// 步进首档 ≥ 过孔半径 + 4mil，再沿方向续推直到铜环完全离开
+				// 自家焊盘铜皮（斜向出线时距离增长率只有 cosθ）。
+				for (const step of [viaR + 4, viaR + 16, viaR + 32, viaR + 52, viaR + 78]) {
+					let x = c.x + c.dirX * step, y = c.y + c.dirY * step;
+					for (let i = 0; i < 16 && this.padCopperDistance(pad, x, y) < viaR + 4; i++) {
+						x += c.dirX * 4;
+						y += c.dirY * 4;
+					}
+					if (this.padCopperDistance(pad, x, y) < viaR + 4) continue;
 					if (!segClear(pad, x, y, topObs)) continue;
 					if (viaClear(x, y, topObs) && viaClear(x, y, bottomObs)) {
 						return {
@@ -932,7 +1021,7 @@ export class PlanningEngine {
 
 		// 底层优先直连（任意角度最短线），被挡时才跑可视图
 		const bottomBlocked = bottomObs.some(o =>
-			o.net !== net.name &&
+			!o.soft && o.net !== net.name &&
 			pointSegDist(o.x, o.y, endA.bottom.x, endA.bottom.y, endB.bottom.x, endB.bottom.y) < o.r - 0.05);
 		let bottomPrims: RenderedPrim[];
 		if (!bottomBlocked) {
@@ -963,11 +1052,12 @@ export class PlanningEngine {
 		if (endA.via) vias.push({ net: net.name, x: endA.via.x, y: endA.via.y, dia: viaDia, hole: viaHole });
 		if (endB.via) vias.push({ net: net.name, x: endB.via.x, y: endB.via.y, dia: viaDia, hole: viaHole });
 
+		const mergedRender = mergePrims(rendered);
 		const rds = this.netRendered.get(net.name) ?? [];
-		rds.push(...rendered);
+		rds.push(...mergedRender);
 		this.netRendered.set(net.name, rds);
 		this.plannedVias.push(...vias);
-		this.addRenderedToObstacles(rendered);
+		this.addRenderedToObstacles(mergedRender);
 		for (const v of vias) {
 			this.dynamicObstacles.push({
 				id: `via${this.obstacleIdCounter++}`,
@@ -1171,6 +1261,7 @@ export class PlanningEngine {
 			let bestOrder: string[] | null = null;
 			let lastOrder: string[] | null = null;
 			let newTotal = Infinity;
+			let bestViaCount = Infinity;
 			for (const ordered of [asc, desc]) {
 				lastOrder = ordered;
 				for (const n of group) this.ripupNetInternal(n, false);
@@ -1184,7 +1275,10 @@ export class PlanningEngine {
 					if (!r) { good = false; break; }
 				}
 				const t = good ? group.reduce((a, n) => a + renderedLength(this.netRendered.get(n) ?? []), 0) : Infinity;
-				if (good && t < newTotal) { newTotal = t; bestOrder = ordered; }
+				const vc = good ? group.reduce((a, n) => a + this.plannedVias.filter(v => v.net === n).length, 0) : Infinity;
+				if (good && (t < newTotal || (t === newTotal && vc < bestViaCount))) {
+					newTotal = t; bestViaCount = vc; bestOrder = ordered;
+				}
 			}
 			this.planOptions = prevOptions;
 
@@ -1201,7 +1295,13 @@ export class PlanningEngine {
 			};
 
 			const newLens = new Map(group.map(n => [n, renderedLength(this.netRendered.get(n) ?? [])]));
-			if (bestOrder && newTotal < savedTotal - 0.5 &&
+			// 接受条件从严：
+			//  - 总长须显著缩短（≥2% 且 ≥8mil）：几 mil 的微优化不值得翻转整束拓扑，
+			//    重排的混乱会把漂亮的阶梯束搅成上下翻飞；
+			//  - 换层次数不得增加：重排尝试里开了过孔兜底，若不拦，原本单层
+			//    走通的网络会在重排失败后悄悄被打上过孔。
+			const savedViaCount = group.reduce((a, n) => a + (saved.get(n)?.vias.length ?? 0), 0);
+			if (bestOrder && newTotal < savedTotal - Math.max(8, savedTotal * 0.02) && bestViaCount <= savedViaCount &&
 				(bestOrder === lastOrder || await rerunOrder(bestOrder)) &&
 				group.every(n => (this.netRendered.get(n) ?? []).length > 0)) {
 				this.log(`冲突消除：${worst.name} 组（${group.join(', ')}）总长 ${savedTotal.toFixed(0)} → ${newTotal.toFixed(0)} mil`, 'success');
@@ -1213,7 +1313,7 @@ export class PlanningEngine {
 					const sv = saved.get(n)!;
 					if (sv.prims.length) {
 						this.netRendered.set(n, [...sv.prims]);
-						this.addRenderedToObstacles(sv.prims);
+						this.addRenderedToObstacles(mergePrims(sv.prims));
 					}
 					this.plannedVias = this.plannedVias.filter(v => v.net !== n).concat(sv.vias);
 				}
@@ -1265,13 +1365,17 @@ export class PlanningEngine {
 			this.planOptions = prevOptions;
 
 			const newLen = ok ? renderedLength(this.netRendered.get(name) ?? []) : Infinity;
-			if (!ok || newLen > savedLen + 0.5) {
+			const newViaCount = ok ? this.plannedVias.filter(v => v.net === name).length : Infinity;
+			// 采纳条件从严：显著更短（≥2% 且 ≥8mil）才换，且不得新增换层。
+			// 几 mil 的微优化不值得翻转束内拓扑（近等长的备选往往上下翻飞），
+			// 更不允许重布把原本单层走通的网络逼出过孔。
+			if (!ok || newLen > savedLen - Math.max(8, savedLen * 0.02) || newViaCount > savedVias.length) {
 				// 撤掉重布尝试注册的动态障碍（尝试失败时本就没注册，过滤是无害空操作），
 				// 否则被否决的走线会以"幽灵障碍"的身份挤占后续网络的布线空间。
 				this.dynamicObstacles = this.dynamicObstacles.filter(o => o.net !== name);
 				this.netRendered.set(name, savedPrims);
 				this.plannedVias = this.plannedVias.filter(v => v.net !== name).concat(savedVias);
-				this.addRenderedToObstacles(savedPrims);
+				this.addRenderedToObstacles(mergePrims(savedPrims));
 				// 撕网时该网过孔的动态障碍一并被移除，回滚需重新注册
 				for (const v of savedVias) {
 					this.dynamicObstacles.push({

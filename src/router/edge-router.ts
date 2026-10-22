@@ -167,6 +167,7 @@ export function stubFeasible(
 	// 本焊盘铜皮沿出线方向的出射距离（超出它之后必须真正清障）
 	const exit = rayExitDistance(pad.outline, ux, uy) - 0.5;
 	for (const o of obstacles) {
+		if (o.soft) continue;                // 辅助建图圆（弧外包络）不阻挡
 		if (o.net === net) continue;
 		if (o.forceBlock) continue;          // 本体禁行区（自己的焊盘）
 		const r = o.r - 0.02;

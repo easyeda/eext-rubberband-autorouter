@@ -68,6 +68,25 @@ interface VGEdge {
 
 const EPS_TOUCH = 0.02;   // 相切容差（浮点误差）
 const GRID_CELL = 100;    // 阻挡查询网格（≥ 最大障碍半径即可）
+/**
+ * 链相切容差（mil）：同一物理铜链（已布走线拆成的重叠圆链）在拐弯处，
+ * 相邻圆的外公切线/贴边弧会切入相邻圆的膨胀盘 0.1~1.2mil —— 这是「弦 vs 弧」
+ * 的矢高误差，不是真实间距违规（障碍半径本就含 w/2+间距+w/2+0.1 的余量）。
+ * 若不容忍，可视图里「贴着已布走线绕弯」的切线全部判侵入，路径被迫绕大圈，
+ * 并在绕行圆上产生 180° 折返尖刺（V 形折角）。
+ * 仅当阻挡圆与被切圆同网、同层且圆盘相交（= 同一条铜链的相邻圆）时放行；
+ * 焊盘/静态障碍不在此列（它们不与走线圆构成铜链）。
+ */
+const CHAIN_TOL = 0.05;
+
+/** 阻挡圆 k 对被切圆 t 的链容差：同一铜链（同网同层且圆盘相交）时放行 CHAIN_TOL */
+function chainTolFor(k: RBObstacle, t: RBObstacle | undefined): number {
+	if (!t || !k.net || k.net !== t.net) return 0;
+	if ((k.layer ?? -1) !== (t.layer ?? -1)) return 0;
+	// 圆盘不相交 → 不是同一条铜链上的相邻圆，不给容差
+	if (Math.hypot(k.x - t.x, k.y - t.y) >= k.r + t.r) return 0;
+	return CHAIN_TOL;
+}
 
 /**
  * 均匀网格：按圆心插入；查询与线段/点可能相交的圆下标。
@@ -125,13 +144,22 @@ class CircleGrid {
  * 线段是否不侵入任何圆（快速网格查询；touchedA/B 为允许相切的圆下标）
  */
 function makeSegmentChecker(circles: RBObstacle[], grid: CircleGrid, net = '') {
+	// 弦→弧外凸补偿：带 bulge 的阻挡圆按基准半径（r - bulge）判相切，
+	// 让切线能贴着已布走线的圆链走（否则外扩量会封死所有贴边切线）
+	const effR = (c: RBObstacle) => c.r - (c.bulge ?? 0);
 	return (x1: number, y1: number, x2: number, y2: number, touchedA: number, touchedB: number): boolean => {
 		let blocked = false;
+		// 链容差：阻挡圆与被切圆（切线两端所在圆）属于同一铜链时，允许
+		// 弦vs弧矢高量级（≤CHAIN_TOL）的切入——那是建模误差而非真违规
+		const tA = touchedA >= 0 ? circles[touchedA] : undefined;
+		const tB = touchedB >= 0 ? circles[touchedB] : undefined;
 		grid.nearSegment(x1, y1, x2, y2, (k) => {
 			if (blocked || k === touchedA || k === touchedB) return;
 			const c = circles[k];
+			if (c.soft) return;
 			if (net && c.net === net && !c.forceBlock) return;
-			if (pointSegDist(c.x, c.y, x1, y1, x2, y2) < c.r - EPS_TOUCH) blocked = true;
+			const tol = Math.max(chainTolFor(c, tA), chainTolFor(c, tB));
+			if (pointSegDist(c.x, c.y, x1, y1, x2, y2) < effR(c) - EPS_TOUCH - tol) blocked = true;
 		});
 		return !blocked;
 	};
@@ -144,14 +172,18 @@ function makeArcChecker(circles: RBObstacle[], grid: CircleGrid, net = '') {
 	return (cx: number, cy: number, r: number, a1: number, sweep: number, selfIdx: number): boolean => {
 		const steps = Math.max(4, Math.ceil(Math.abs(sweep) * r / (GRID_CELL * 0.5)));
 		let blocked = false;
+		// 链容差：贴边绕行弧与弧自身所在圆同链的圆，允许矢高量级切入
+		const self = selfIdx >= 0 ? circles[selfIdx] : undefined;
 		for (let s = 0; s <= steps && !blocked; s++) {
 			const a = a1 + (sweep * s) / steps;
 			const px = cx + r * Math.cos(a), py = cy + r * Math.sin(a);
 			grid.nearPoint(px, py, (k) => {
 				if (blocked || k === selfIdx) return;
 				const o = circles[k];
+				if (o.soft) return;
 				if (net && o.net === net && !o.forceBlock) return;
-				if (Math.hypot(px - o.x, py - o.y) < o.r - EPS_TOUCH) blocked = true;
+				const tol = chainTolFor(o, self);
+				if (Math.hypot(px - o.x, py - o.y) < o.r - (o.bulge ?? 0) - EPS_TOUCH - tol) blocked = true;
 			});
 		}
 		return !blocked;
@@ -286,6 +318,15 @@ export async function routeBetweenEndpoints(
 	return { ok: false, prims: [] };
 }
 
+/** 找到表面经过点 p 的圆下标（|dist - r| ≤ eps），供链容差判定用；找不到返回 -1 */
+function findSurfaceCircle(all: RBObstacle[], px: number, py: number, eps = 0.05): number {
+	for (let i = 0; i < all.length; i++) {
+		const c = all[i];
+		if (Math.abs(Math.hypot(px - c.x, py - c.y) - c.r) <= eps) return i;
+	}
+	return -1;
+}
+
 /** 用全量障碍复验路径图元（防止走廊剪枝造成的假合法路径） */
 export async function validatePrimsAgainst(prims: RBPrimitive[], all: RBObstacle[], net = ''): Promise<boolean> {
 	const grid = new CircleGrid(all);
@@ -299,7 +340,11 @@ export async function validatePrimsAgainst(prims: RBPrimitive[], all: RBObstacle
 		}
 		const pr = prims[i];
 		if (pr.kind === 'line') {
-			if (!segOK(pr.x1, pr.y1, pr.x2, pr.y2, -1, -1)) {
+			// 端点所在的圆视为「被切圆」：切线合法地与它们相切，
+			// 且链容差（同一铜链相邻圆的矢高切入）需要据此放行
+			const tA = findSurfaceCircle(all, pr.x1, pr.y1);
+			const tB = findSurfaceCircle(all, pr.x2, pr.y2);
+			if (!segOK(pr.x1, pr.y1, pr.x2, pr.y2, tA, tB)) {
 				if ((globalThis as any).__RB_VERBOSE__) {
 					let worst: RBObstacle | null = null;
 					let wd = Infinity;
@@ -312,7 +357,9 @@ export async function validatePrimsAgainst(prims: RBPrimitive[], all: RBObstacle
 				return false;
 			}
 		} else {
-			if (!arcOK(pr.cx, pr.cy, pr.r, pr.startAngle, pr.sweep, -1)) {
+			const startPt = { x: pr.cx! + pr.r! * Math.cos(pr.startAngle!), y: pr.cy! + pr.r! * Math.sin(pr.startAngle!) };
+			const selfIdx = findSurfaceCircle(all, startPt.x, startPt.y);
+			if (!arcOK(pr.cx, pr.cy, pr.r, pr.startAngle, pr.sweep, selfIdx)) {
 				if ((globalThis as any).__RB_VERBOSE__) console.log(`[VR] 弧被拒 #${i}: c=(${pr.cx.toFixed(0)},${pr.cy.toFixed(0)}) r=${pr.r.toFixed(1)}`);
 				return false;
 			}

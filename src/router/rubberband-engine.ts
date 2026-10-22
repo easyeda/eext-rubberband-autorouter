@@ -38,6 +38,11 @@ export interface RBObstacle {
 	noPrune?: boolean;
 	/** 仅阻挡不建图（填充内部网格圆）：路径不能绕它们转，只需被挡住 */
 	blockerOnly?: boolean;
+	/** 只建图、不阻挡：可相切/骑行的辅助圆（弧的同心外包络），不参与碰撞判定 */
+	soft?: boolean;
+	/** 弦→弧外凸补偿量：阻挡圆 r = 基准半径 + bulge。可视图相切判定按 r-bulge
+	 * （基准半径）执行，否则这点外扩会让「贴着已布走线」的切线全部判侵入 */
+	bulge?: number;
 	/** 即使与当前网络同名也要阻挡（焊盘自身的外扩轮廓：走线不得压过本网络焊盘） */
 	forceBlock?: boolean;
 }
@@ -308,12 +313,34 @@ export function capsuleToCircles(
 	return out;
 }
 
-/** 焊盘物理轮廓 → 圆群（未膨胀），unit: mil */
-export function padShapeToCircles(pad: { pad: any[]; hole?: any[] | null }): Array<{ x: number; y: number; r: number }> {
+/**
+ * 焊盘物理轮廓 → 圆群（未膨胀），unit: mil。
+ *
+ * 长焊盘（OVAL/RECT 胶囊）用「两端帽圆 + 密集侧向填充圆」表示：
+ * 稀疏三圆在斜 45° 方向上会把焊盘边界低估约 (长轴/2 − 短轴/2)·sin45°
+ * （23.4×77.5 焊盘低估 19mil），导致出线候选点、过孔落点跑进焊盘铜皮里。
+ * 端帽圆是凸包极点（参与切点生成），中间填充圆只做碰撞判定。
+ * 所有圆都按 rotation 旋转（EDA 角度约定：逆时针为正）。
+ */
+export function padShapeToCircles(
+	pad: { pad: any[]; hole?: any[] | null; rotation?: number },
+): Array<{ x: number; y: number; r: number; blockerOnly?: boolean }> {
 	const shape = Array.isArray(pad.pad) ? pad.pad : [];
 	const w = shape[1] ?? 0;
 	const h = shape[2] ?? 0;
 	const shapeName = String(shape[0] ?? 'ELLIPSE').toUpperCase();
+	const rot = ((pad.rotation ?? 0) * Math.PI) / 180;
+	const cosR = Math.cos(rot), sinR = Math.sin(rot);
+	const rotAll = (arr: Array<{ x: number; y: number; r: number; blockerOnly?: boolean }>) =>
+		arr.map(c => {
+			const o: { x: number; y: number; r: number; blockerOnly?: boolean } = {
+				x: c.x * cosR - c.y * sinR,
+				y: c.x * sinR + c.y * cosR,
+				r: c.r,
+			};
+			if (c.blockerOnly) o.blockerOnly = true;
+			return o;
+		});
 
 	// 通孔焊盘的铜皮外形仍按 pad 形状建模：孔只影响钻孔，不应缩小铜皮障碍。
 	// （旧逻辑把带孔焊盘一律当圆，RECT 角部会漏出 ~1mil，造成贴边 DRC）
@@ -341,30 +368,71 @@ export function padShapeToCircles(pad: { pad: any[]; hole?: any[] | null }): Arr
 				out.push({ x: cxp, y: cyp, r: rc });
 			}
 		}
-		return out;
+		return rotAll(out);
 	}
-	if (h >= w * 1.05) {
-		// 竖长焊盘（OVAL/RECT）：短边一半为半径，沿长轴三个圆（两端 + 中间）
-		const r = w / 2;
-		const off = h / 2 - r;
-		return [
-			{ x: 0, y: off, r },
-			{ x: 0, y: 0, r },
-			{ x: 0, y: -off, r },
-		];
+	return rotAll(capsuleOutline(w, h));
+}
+
+/**
+ * 点到焊盘铜皮的有符号距离（内部为负），unit: mil。
+ * 用于过孔落点校验：过孔铜环（半径 viaR）必须完全落在自家焊盘铜皮之外，
+ * 只按「沿出线方向步进 viaR」是不够的——斜向出线时距离增长率只有 cosθ，
+ * 45° 方向会少走出去 ~30%，过孔铜环仍会压进焊盘。
+ */
+export function padShapeDistance(
+	pad: { pad: any[]; hole?: any[] | null; rotation?: number },
+	dx: number, dy: number,
+): number {
+	const shape = Array.isArray(pad.pad) ? pad.pad : [];
+	const w = shape[1] ?? 0, h = shape[2] ?? 0;
+	const shapeName = String(shape[0] ?? 'ELLIPSE').toUpperCase();
+	if (w <= 0 || h <= 0) return Math.hypot(dx, dy);
+	const rot = ((pad.rotation ?? 0) * Math.PI) / 180;
+	const cosR = Math.cos(rot), sinR = Math.sin(rot);
+	const lx = dx * cosR + dy * sinR;
+	const ly = -dx * sinR + dy * cosR;
+	const a = w / 2, b = h / 2;
+	const rectDist = (x: number, y: number, ra: number, rb: number) => {
+		const qx = Math.abs(x) - ra, qy = Math.abs(y) - rb;
+		if (qx <= 0 && qy <= 0) return Math.max(qx, qy);
+		return Math.hypot(Math.max(qx, 0), Math.max(qy, 0));
+	};
+	if (shapeName === 'RECT') return rectDist(lx, ly, a, b);
+	if (shapeName === 'OVAL' || shapeName === 'ROUNDRECT') {
+		const r = Math.min(a, b);
+		const half = Math.max(a, b) - r;
+		const along = b >= a ? ly : lx;
+		const perp = b >= a ? lx : ly;
+		return Math.hypot(perp, Math.max(Math.abs(along) - half, 0)) - r;
 	}
-	if (w > h * 1.05) {
-		// 横长焊盘：沿 x 轴三个圆
-		const r = h / 2;
-		const off = w / 2 - r;
-		return [
-			{ x: off, y: 0, r },
-			{ x: 0, y: 0, r },
-			{ x: -off, y: 0, r },
-		];
-	}
-	// 近方形：单圆（半径 = 半宽，不遮挡侧向间隙）
-	return [{ x: 0, y: 0, r: Math.max(w, h) / 2 }];
+	// ELLIPSE（含近圆）：按椭圆径向缩放估算，偏保守（低估 → 过孔只会走得更远）
+	if (Math.abs(a - b) < 0.01) return Math.hypot(lx, ly) - a;
+	const k = Math.hypot(lx / a, ly / b);
+	return (k - 1) * Math.min(a, b);
+}
+
+/**
+ * 胶囊（OVAL / 长 RECT）轮廓圆群：端帽圆 + 侧向密集填充圆。
+ * 填充圆间距 ≤ 0.4·r，半径外扩半个弦高，保证圆群并集覆盖胶囊且不超过 +0.25mil。
+ */
+function capsuleOutline(w: number, h: number): Array<{ x: number; y: number; r: number; blockerOnly?: boolean }> {
+	const r = Math.min(w, h) / 2;
+	const half = Math.max(w, h) / 2 - r; // 端帽圆心到中心距离
+	const vertical = h >= w;
+	const P = (t: number, rr: number, blockerOnly?: boolean) => ({
+		x: vertical ? 0 : t,
+		y: vertical ? t : 0,
+		r: rr,
+		...(blockerOnly ? { blockerOnly: true } : {}),
+	});
+	if (half <= 1e-6) return [P(0, r)];
+	const out = [P(half, r), P(-half, r)];
+	const spacing = Math.max(0.5, r * 0.4);
+	const n = Math.max(2, Math.ceil((2 * half) / spacing));
+	const d = (2 * half) / n;
+	const sag = r - Math.sqrt(Math.max(0, r * r - (d / 2) * (d / 2)));
+	for (let i = 1; i < n; i++) out.push(P(-half + d * i, r + sag, true));
+	return out;
 }
 
 // ─────────────────────────────────────────────
