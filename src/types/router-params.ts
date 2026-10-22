@@ -25,6 +25,8 @@ export interface RouterUiOptions {
 	finalOptimize: boolean;
 	/** 失败网络允许过孔换层（底层兜底） */
 	viaFallback: boolean;
+	/** 允许过孔落在焊盘上（默认关闭：过孔铜环必须避开所有焊盘铜皮） */
+	allowViaInPad: boolean;
 	/** 允许布线的铜层 ID（1 = 顶层，2 = 底层；顶层始终可用） */
 	routeLayers: number[];
 	/** 不参与布线的网络名：保持画布现状，不做任何删改 */
@@ -39,10 +41,11 @@ export const DEFAULT_ROUTER_OPTIONS: RouterUiOptions = {
 	escapeClearanceMil: 0,
 	ripupRounds: 3,
 	powerNetsFirst: false,
-	budgetMs: 300000,
+	budgetMs: 900000,
 	livePreview: true,
 	finalOptimize: true,
 	viaFallback: true,
+	allowViaInPad: false,
 	routeLayers: [1, 2],
 	excludeNets: [],
 	netOrder: 'auto',
@@ -76,6 +79,7 @@ export function normalizeRouterOptions(input: Partial<RouterUiOptions> | undefin
 		livePreview: o.livePreview !== false,
 		finalOptimize: o.finalOptimize !== false,
 		viaFallback: o.viaFallback !== false,
+		allowViaInPad: o.allowViaInPad === true,
 		routeLayers: [...layers].sort((a, b) => a - b),
 		excludeNets: excluded,
 		netOrder: NET_ORDERS.includes(o.netOrder) ? o.netOrder : 'auto',

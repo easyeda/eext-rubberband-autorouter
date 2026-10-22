@@ -63,7 +63,7 @@ export class AutoRouterFacade {
 				PARAMS_ID,
 				'/iframe/params.html',
 				880,
-				650,
+				680,
 				'橡皮筋自动布线 · 参数',
 				{
 					onReady: (send) => {

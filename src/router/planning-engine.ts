@@ -39,6 +39,8 @@ export interface PlanOptions {
 	netOrder?: 'auto' | 'river' | 'reverse' | 'max-x' | 'longest' | 'shortest';
 	/** 失败网络允许过孔换层（底层布线）兜底 */
 	allowViaFallback?: boolean;
+	/** 允许过孔落在焊盘铜皮上（默认 false：过孔铜环必须避开所有焊盘） */
+	allowViaInPad?: boolean;
 }
 
 export interface EnginePad {
@@ -116,6 +118,8 @@ export interface PlanningResult {
 	nets: PlannedNetResult[];
 	vias: PlannedVia[];
 	failed: string[];
+	/** 部分连通：有有效走线但仍有 MST 连接失败的网（保留在画布上） */
+	partial: string[];
 	/** 已布网络名（按布线顺序） */
 	routedNets: string[];
 	/** 规划日志（Worker 模式下由主线程读取） */
@@ -226,6 +230,8 @@ export class PlanningEngine {
 	private obstacleIdCounter = 0;
 	/** 每网络的规划图元 */
 	private netRendered = new Map<string, RenderedPrim[]>();
+	/** 每个网络已完成的 MST 连接（键 = 两个焊盘 id），用于部分连通后继续重试 */
+	private routedEdges = new Map<string, Set<string>>();
 	/** 已布网络顺序 */
 	private routedOrder: string[] = [];
 	/** 规划的过孔 */
@@ -250,6 +256,11 @@ export class PlanningEngine {
 		return this.copperLayers >= 2;
 	}
 
+	/** 是否允许过孔落在焊盘铜皮上（默认关闭） */
+	private get allowViaInPad(): boolean {
+		return this.planOptions.allowViaInPad === true;
+	}
+
 	/** 执行完整规划：排序 → 逐网 → 撕毁重布 → 成组重布 */
 	async plan(input: PlanningInput, callbacks: PlanningCallbacks = {}): Promise<PlanningResult> {
 		this.drc = input.drc;
@@ -262,6 +273,7 @@ export class PlanningEngine {
 		this.dynamicObstacles = [];
 		this.obstacleIdCounter = 0;
 		this.netRendered.clear();
+		this.routedEdges.clear();
 		this.routedOrder = [];
 		this.plannedVias = [];
 		this.logs = [];
@@ -381,7 +393,11 @@ export class PlanningEngine {
 
 		// 过孔换层兜底：单层容量不足时，失败网络走底层，两端用逃逸段+过孔连接
 		if (this.planOptions.allowViaFallback !== false && !this.checkCancelled() && Date.now() <= deadline) {
-			const stillFailed = networks.filter(n => !this.routedOrder.includes(n.name));
+			const stillFailed = networks.filter(n =>
+				!this.routedOrder.includes(n.name) &&
+				// 已部分布通的网络已保留有效走线，逐边重试时已包含过孔候选；
+				// 再跑「首尾焊盘」兜底会在已有铜皮上重复叠线。
+				(this.netRendered.get(n.name) ?? []).length === 0);
 			for (const net of stillFailed) {
 				if (this.checkCancelled()) break;
 				await this.tryViaFallback(net);
@@ -389,13 +405,19 @@ export class PlanningEngine {
 		}
 
 		const failed = networks.filter(n => !this.routedOrder.includes(n.name)).map(n => n.name);
+		const partial = networks
+			.filter(n => !this.routedOrder.includes(n.name) && (this.netRendered.get(n.name) ?? []).length > 0)
+			.map(n => n.name);
 		return {
-			nets: this.routedOrder.map(name => ({
-				name,
-				prims: mergePrims(this.netRendered.get(name) ?? []),
-			})),
+			nets: networks
+				.filter(n => (this.netRendered.get(n.name) ?? []).length > 0)
+				.map(n => ({
+					name: n.name,
+					prims: mergePrims(this.netRendered.get(n.name) ?? []),
+				})),
 			vias: [...this.plannedVias],
 			failed,
+			partial,
 			routedNets: [...this.routedOrder],
 			logs: [...this.logs],
 		};
@@ -469,6 +491,15 @@ export class PlanningEngine {
 			}
 		});
 
+		// 并排焊盘封装（连接器、IC 引脚排）：先走中间的焊盘。
+		// 原因：同一排外侧焊盘先出线时，走线容易绕到排外形成包围，把中间
+		// 焊盘唯一的垂直出口封死；中间焊盘先垂直出线后，外侧焊盘仍可从
+		// 排两端出线。只调整同一层级内这些网络的相对顺序，不影响电源/地
+		// 的层级约束。
+		const rowCount = mode === 'auto' || mode === 'river'
+			? this.prioritizeRowInteriorPads(keyed)
+			: 0;
+
 		if (mode === 'auto') {
 			const count = (t: number) => keyed.filter(k => k.tier === t).length;
 			this.log(
@@ -476,8 +507,125 @@ export class PlanningEngine {
 				(count(3) ? '（地网络最后布，避免先布封路）' : ''),
 				'info',
 			);
+			if (rowCount) this.log(`并排焊盘：${rowCount} 个网络改为中间焊盘优先出线`, 'info');
 		}
 		return keyed.map(k => k.net);
+	}
+
+	/**
+	 * 检测共线焊盘排，并把排内网络按「中间 → 两端」重排。
+	 *
+	 * 返回被重排的网络数量（0 表示没有检测到并排焊盘）。
+	 * 同层级的网络才会互相换位，避免把地/电源提前。
+	 */
+	private prioritizeRowInteriorPads<T extends {
+		net: { name: string; pads: EnginePad[] };
+		tier: number;
+	}>(keyed: T[]): number {
+		const pads = keyed.flatMap(k => k.net.pads);
+		if (pads.length < 3) return 0;
+
+		const rowScore = new Map<string, number>();
+		// 并查集：同一排（以及同一封装的两排，如连接器上下两排共用网络）的网络
+		// 属于同一组，组与组之间保持原来的相对位置，避免把两个独立连接器的
+		// 网络块交错成一片、破坏成束走线。
+		const parent = new Map<string, string>();
+		const find = (x: string): string => {
+			let r = x;
+			while (parent.get(r) !== undefined && parent.get(r) !== r) r = parent.get(r)!;
+			while (parent.get(x) !== undefined && parent.get(x) !== x) {
+				const nx = parent.get(x)!;
+				parent.set(x, r);
+				x = nx;
+			}
+			return r;
+		};
+		const union = (a: string, b: string): void => {
+			if (!parent.has(a)) parent.set(a, a);
+			if (!parent.has(b)) parent.set(b, b);
+			const ra = find(a), rb = find(b);
+			if (ra !== rb) parent.set(ra, rb);
+		};
+		const markRow = (run: EnginePad[]): void => {
+			if (run.length < 3) return;
+			if (new Set(run.map(p => p.net)).size < 2) return;
+			const mid = (run.length - 1) / 2;
+			run.forEach((p, i) => {
+				// 1 = 排中心，0 = 排两端
+				const t = 1 - Math.abs(i - mid) / Math.max(mid, 1);
+				rowScore.set(p.net, Math.max(rowScore.get(p.net) ?? 0, t));
+				if (!parent.has(p.net)) parent.set(p.net, p.net);
+				if (i > 0) union(run[0].net, p.net);
+			});
+		};
+
+		// axis = 排的走向坐标（x 相同 → 竖排；y 相同 → 横排）
+		const scanRows = (axis: 'x' | 'y'): void => {
+			const cross = axis === 'x' ? 'y' : 'x';
+			const sorted = [...pads].sort((a, b) => a[axis] - b[axis]);
+			const aligned: EnginePad[] = [];
+			let clusterCoord = Number.NaN;
+			const flushCluster = (): void => {
+				if (aligned.length < 3) return;
+				const runPads = [...aligned].sort((a, b) => a[cross] - b[cross]);
+				const radii = runPads.map(p => p.radius).sort((a, b) => a - b);
+				const medianR = radii[Math.floor(radii.length / 2)] || 0;
+				// 相邻焊盘间距超过约 6 倍焊盘半径就不算同一排
+				const maxGap = Math.max(60, medianR * 6);
+				let run: EnginePad[] = [];
+				for (const p of runPads) {
+					const prev = run[run.length - 1];
+					if (prev && p[cross] - prev[cross] > maxGap) {
+						markRow(run);
+						run = [];
+					}
+					run.push(p);
+				}
+				markRow(run);
+			};
+			for (const p of sorted) {
+				if (Number.isNaN(clusterCoord)) {
+					clusterCoord = p[axis];
+				} else if (p[axis] - clusterCoord > 4) {
+					flushCluster();
+					aligned.length = 0;
+					clusterCoord = p[axis];
+				}
+				aligned.push(p);
+			}
+			flushCluster();
+		};
+		scanRows('x');
+		scanRows('y');
+
+		if (rowScore.size < 2) return 0;
+
+		// 每个「焊盘排组」内部按层级重排：只在这些网络原来占用的位置上按
+		// 「中间 → 两端」换位，其它网络的位置不动；不同层级之间绝不互换。
+		let moved = 0;
+		const components = new Map<string, Set<string>>();
+		for (const name of rowScore.keys()) {
+			const root = find(name);
+			let set = components.get(root);
+			if (!set) { set = new Set(); components.set(root, set); }
+			set.add(name);
+		}
+		for (const members of components.values()) {
+			const tiers = new Set(keyed.filter(k => members.has(k.net.name)).map(k => k.tier));
+			for (const tier of tiers) {
+				const slots: number[] = [];
+				keyed.forEach((k, i) => {
+					if (k.tier === tier && members.has(k.net.name)) slots.push(i);
+				});
+				if (slots.length < 2) continue;
+				const ordered = slots
+					.map(i => keyed[i])
+					.sort((a, b) => (rowScore.get(b.net.name) ?? 0) - (rowScore.get(a.net.name) ?? 0));
+				slots.forEach((slot, i) => { keyed[slot] = ordered[i]; });
+				moved += slots.length;
+			}
+		}
+		return moved;
 	}
 
 	private checkCancelled(): boolean {
@@ -568,6 +716,32 @@ export class PlanningEngine {
 	}
 
 	/**
+	 * 过孔落点 → 全部焊盘的精确间距校验（直通孔在顶层/底层都有铜皮）。
+	 *
+	 *  - 异网焊盘：过孔铜环到焊盘铜皮 ≥ Track↔Pad DRC 间距，避免贴边违规；
+	 *  - 同网焊盘：默认同样要求过孔铜环完全离开焊盘铜皮（不允许焊盘打孔）；
+	 *    只有显式开启 allowViaInPad 后才放开同网焊盘。
+	 *
+	 * 这里按焊盘真实形状（矩形/椭圆/旋转）计算，而不是障碍圆近似，
+	 * 避免矩形焊盘角部被圆群低估后过孔压进隔壁焊盘。
+	 */
+	private viaPadClear(x: number, y: number, viaR: number, netName: string): boolean {
+		const drc = this.drc;
+		for (const p of this.allPads) {
+			// 过孔是贯穿孔：只关心顶层/底层/通孔焊盘
+			if (p.layer !== 1 && p.layer !== 2 && p.layer !== 12 && p.padType !== 'th') continue;
+			const sameNet = p.net === netName;
+			if (sameNet && this.allowViaInPad) continue;
+			const d = this.padCopperDistance(p, x, y);
+			const need = sameNet
+				? viaR + 4
+				: viaR + drc.trackToPadMil + 0.2;
+			if (d < need) return false;
+		}
+		return true;
+	}
+
+	/**
 	 * 焊盘终端：出线候选点的几何依据。
 	 *  - 铜皮轮廓（圆群）由焊盘形状推出，用于确定各方向的出线边界
 	 *  - 长焊盘的长轴方向作为常规出线方向（额外候选）
@@ -654,94 +828,120 @@ export class PlanningEngine {
 		this.dynamicObstacles = [...uniq.values()];
 	}
 
-	/** 布一个网络的全部 MST 连接（纯规划） */
+	/** 布一个网络的全部 MST 连接（纯规划；单条失败不再丢弃整网已布部分） */
 	private async routeNetEdges(net: { name: string; pads: EnginePad[] }): Promise<boolean> {
 		const drc = this.drc;
 		const edges = this.computeMST(net.pads);
-		const netOk = true;
-		// 本次尝试的图元/过孔先暂存：整网成功才提交为动态障碍并通知主线程，
-		// 失败尝试不得留下"幽灵障碍"影响后续网络。
+		const edgeKey = (si: number, di: number) => `${net.pads[si].id}->${net.pads[di].id}`;
+		// 部分连通的网络在撕毁/重试之间保留已完成的连接，只补未完成的边；
+		// 否则重试会重复布线并叠加过孔。
+		const done = this.routedEdges.get(net.name) ?? new Set<string>();
+		// 本次尝试的图元/过孔先暂存：成功一条提交一条，失败连接不再拖累整网。
 		const attemptRendered: RenderedPrim[] = [];
 		const attemptVias: PlannedVia[] = [];
-		if (!this.routedOrder.includes(net.name)) {
-			this.plannedVias = this.plannedVias.filter(v => v.net !== net.name);
-		}
 
 		for (const [si, di] of edges) {
 			if (this.checkCancelled()) return false;
+			const key = edgeKey(si, di);
+			if (done.has(key)) continue;
 			const src = net.pads[si], dst = net.pads[di];
 			const routingLayer = getRoutingLayer(src, dst);
+			const srcLayer = src.layer === 12 ? routingLayer : src.layer;
+			const dstLayer = dst.layer === 12 ? routingLayer : dst.layer;
+			// 顶层 SMD ↔ 底层 SMD：常规做法是在目标焊盘中心打孔（焊盘内过孔）。
+			// 默认禁止焊盘打孔时必须改走「焊盘外过孔」路径；只有显式开启
+			// allowViaInPad 才保留目标焊盘中心的过孔。
+			const crossLayerSmd = src.padType === 'smd' && dst.padType === 'smd' &&
+				(src.layer === 1 || src.layer === 2) && (dst.layer === 1 || dst.layer === 2) &&
+				src.layer !== dst.layer;
 
-			// 单层优先，两级退避：
-			// ① 焊盘中心 → 可视图最短路 → 焊盘中心（首选，出线方向即最短路起始
-			//    方向，除绕障必需的圆弧外整条走线没有人为折角 —— 橡皮筋拉紧效果）
-			// ② 密集焊盘排里邻焊盘的外扩间距圈会吞没本焊盘中心（间距 < 两焊盘
-			//    半径+外扩之和），中心起点的任何线段都判侵入 —— 退回焊盘边界
-			//    出线候选（引出段 + 切线圆角）
-			const topSolution = await this.directEdgeRoute(src, dst, net.name, routingLayer) ??
-				await this.candidateEdgeRoute(src, dst, net.name, routingLayer);
-
-			let rendered = topSolution;
+			let rendered: RenderedPrim[] | null = null;
 			const edgeVias: PlannedVia[] = [];
 
-			// 「绕不过去」不只看走不走得通：顶层被障碍逼出 1.9 倍以上的大绕
-			// （沿板边兜圈、在铺铜缝隙里穿针），继续贴层既难看又不合理 ——
-			// 此时视为顶层绕不过去，比选换层方案，明显更短才换。
-			const lb = Math.hypot(dst.x - src.x, dst.y - src.y);
-			const topDetoured = rendered !== null && renderedLength(rendered) > lb * 1.55;
-
-			// 顶层走不通（或绕得离谱）→ 换到底层再试：
-			//  双端都能落底层（TH/底层焊盘）则底层直连，无需过孔；
-			//  顶层 SMD 只能过孔换层兜底。
-			if ((!rendered || topDetoured) && routingLayer === 1 && this.hasBottomLayer) {
-				let altPrims: RenderedPrim[] | null = null;
-				let altVias: PlannedVia[] = [];
-				if (bottomCapable(src) && bottomCapable(dst)) {
-					altPrims = await this.directEdgeRoute(src, dst, net.name, 2) ??
-						await this.candidateEdgeRoute(src, dst, net.name, 2);
-				} else {
-					const viaCand = await this.viaEdgeCandidate(src, dst, net.name);
-					if (viaCand) { altPrims = viaCand.prims; altVias = viaCand.vias; }
-				}
-				// 换层方案明显更短才采纳（过孔有工艺代价，省 50mil 不值得打孔）
-				if (altPrims && (!rendered || renderedLength(altPrims) < renderedLength(rendered) - 50)) {
-					rendered = altPrims;
-					edgeVias.push(...altVias);
-				}
-			}
-
-			// 两个单层都走不通 → 才用过孔换层兜底
-			if (!rendered && this.hasBottomLayer) {
+			if (crossLayerSmd && !this.allowViaInPad) {
+				// 顶层 SMD 引出段 + 焊盘外过孔 + 底层路径；不会在任一焊盘上打孔
 				const viaCand = await this.viaEdgeCandidate(src, dst, net.name);
 				if (viaCand) {
 					rendered = viaCand.prims;
 					edgeVias.push(...viaCand.vias);
 				}
+			} else {
+				// 单层优先，两级退避：
+				// ① 焊盘中心 → 可视图最短路 → 焊盘中心（首选，出线方向即最短路起始
+				//    方向，除绕障必需的圆弧外整条走线没有人为折角 —— 橡皮筋拉紧效果）
+				// ② 密集焊盘排里邻焊盘的外扩间距圈会吞没本焊盘中心（间距 < 两焊盘
+				//    半径+外扩之和），中心起点的任何线段都判侵入 —— 退回焊盘边界
+				//    出线候选（引出段 + 切线圆角）
+				const topSolution = await this.directEdgeRoute(src, dst, net.name, routingLayer) ??
+					await this.candidateEdgeRoute(src, dst, net.name, routingLayer);
+
+				rendered = topSolution;
+
+				// 「绕不过去」不只看走不走得通：顶层被障碍逼出 1.9 倍以上的大绕
+				// （沿板边兜圈、在铺铜缝隙里穿针），继续贴层既难看又不合理 ——
+				// 此时视为顶层绕不过去，比选换层方案，明显更短才换。
+				const lb = Math.hypot(dst.x - src.x, dst.y - src.y);
+				const topDetoured = rendered !== null && renderedLength(rendered) > lb * 1.55;
+
+				// 顶层走不通（或绕得离谱）→ 换到底层再试：
+				//  双端都能落底层（TH/底层焊盘）则底层直连，无需过孔；
+				//  顶层 SMD 只能过孔换层兜底。
+				if ((!rendered || topDetoured) && routingLayer === 1 && this.hasBottomLayer) {
+					let altPrims: RenderedPrim[] | null = null;
+					let altVias: PlannedVia[] = [];
+					if (bottomCapable(src) && bottomCapable(dst)) {
+						altPrims = await this.directEdgeRoute(src, dst, net.name, 2) ??
+							await this.candidateEdgeRoute(src, dst, net.name, 2);
+					} else {
+						const viaCand = await this.viaEdgeCandidate(src, dst, net.name);
+						if (viaCand) { altPrims = viaCand.prims; altVias = viaCand.vias; }
+					}
+					// 换层方案明显更短才采纳（过孔有工艺代价，省 50mil 不值得打孔）
+					if (altPrims && (!rendered || renderedLength(altPrims) < renderedLength(rendered) - 50)) {
+						rendered = altPrims;
+						edgeVias.push(...altVias);
+					}
+				}
+
+				// 两个单层都走不通 → 才用过孔换层兜底
+				if (!rendered && this.hasBottomLayer) {
+					const viaCand = await this.viaEdgeCandidate(src, dst, net.name);
+					if (viaCand) {
+						rendered = viaCand.prims;
+						edgeVias.push(...viaCand.vias);
+					}
+				}
+
+				// 跨层 SMD 对（顶层 ↔ 底层）：路径落在其中一层的焊盘中心，
+				// 另一层焊盘靠过孔连接。该过孔位于焊盘内，仅在允许焊盘打孔时使用
+				// （默认路径已在上面的 crossLayerSmd 分支改为焊盘外过孔）。
+				if (rendered && srcLayer !== dstLayer) {
+					const dia = Math.max(20, drc.traceWidthMil * 2);
+					const hole = Math.max(10, drc.traceWidthMil);
+					// 焊盘内过孔同样要避开隔壁异网焊盘；避不开就放弃这条连接
+					if (!this.viaPadClear(dst.x, dst.y, dia / 2, net.name)) {
+						rendered = null;
+						edgeVias.length = 0;
+					} else {
+						edgeVias.push({ net: net.name, x: dst.x, y: dst.y, dia, hole });
+					}
+				}
 			}
 
 			if (!rendered) {
 				this.log(`网络 ${net.name}: ${src.id}(${src.x.toFixed(0)},${src.y.toFixed(0)}) → ${dst.id}(${dst.x.toFixed(0)},${dst.y.toFixed(0)}) 未找到路径`, 'warn');
-				return false;
-			}
-
-			// 跨层 SMD 对（顶层 ↔ 底层）：路径落在其中一层的焊盘中心，
-			// 另一层焊盘靠焊盘内过孔连接
-			const srcLayer = src.layer === 12 ? routingLayer : src.layer;
-			const dstLayer = dst.layer === 12 ? routingLayer : dst.layer;
-			if (srcLayer !== dstLayer) {
-				edgeVias.push({
-					net: net.name, x: dst.x, y: dst.y,
-					dia: Math.max(20, drc.traceWidthMil * 2),
-					hole: Math.max(10, drc.traceWidthMil),
-				});
+				continue;   // 其余连接继续布，已布部分不回滚
 			}
 
 			attemptRendered.push(...rendered);
 			attemptVias.push(...edgeVias);
+			done.add(key);
 		}
+		this.routedEdges.set(net.name, done);
+		const complete = edges.every(([si, di]) => done.has(edgeKey(si, di)));
 
-		// 整网成功：提交图元、过孔与动态障碍
-		if (netOk) {
+		// 成功连接立即提交图元、过孔与动态障碍（部分连通也保留在画布上）
+		if (attemptRendered.length || attemptVias.length) {
 			// 先合并再接缝：可视图会在同一障碍圆的多个切点之间切出碎片弧/微段，
 			// 直接拿去建障碍会得到一串几乎重合的端点圆与包络圆，后布网络沿着
 			// 它们走就会「扇贝式」抖动。合并后每段弧/线只登记一次。
@@ -750,7 +950,7 @@ export class PlanningEngine {
 			rds.push(...mergedEdge);
 			this.netRendered.set(net.name, rds);
 			this.addRenderedToObstacles(mergedEdge);
-			this.plannedVias = this.plannedVias.filter(v => v.net !== net.name).concat(attemptVias);
+			this.plannedVias.push(...attemptVias);
 			// 过孔是贯通各层的孔洞：其它网络（任何层）都要给它让位
 			for (const v of attemptVias) {
 				this.dynamicObstacles.push({
@@ -759,19 +959,30 @@ export class PlanningEngine {
 					net: net.name, layer: undefined, group: `via:${net.name}:${v.x},${v.y}`, noPrune: true,
 				});
 			}
-			if (!this.routedOrder.includes(net.name)) this.routedOrder.push(net.name);
 		}
+		if (complete && !this.routedOrder.includes(net.name)) this.routedOrder.push(net.name);
 
-		// 实时结果：主线程收到后立即写入/替换该网络的画布图元
+		// 实时结果：主线程收到后立即写入/替换该网络的画布图元。
+		// 只要网内有成功图元就按「可写」下发，否则失败网络会被整网删除 ——
+		// 这正是「一条连接失败导致整网飞线都不布」的原因。
 		const prims = mergePrims(this.netRendered.get(net.name) ?? []);
-		this.callbacks.onNetUpdate?.(net.name, prims, this.plannedVias.filter(v => v.net === net.name), netOk);
+		this.callbacks.onNetUpdate?.(net.name, prims, this.plannedVias.filter(v => v.net === net.name), prims.length > 0);
 		this.log(
-			netOk
+			complete
 				? `网络 ${net.name} 布线完成（${edges.length} 条连接，${prims.length} 段图形）`
-				: `网络 ${net.name} 部分连接失败（${edges.length} 条连接）`,
-			netOk ? 'success' : 'warn',
+				: `网络 ${net.name} 部分连接失败（已布 ${done.size}/${edges.length} 条，保留有效走线）`,
+			complete ? 'success' : 'warn',
 		);
-		return netOk;
+		return complete;
+	}
+
+	/** 把一个网络的全部 MST 连接登记为已完成（回滚「原本已完整布通」的走线时用） */
+	private markAllEdgesDone(net: { name: string; pads: EnginePad[] }): void {
+		const done = new Set<string>();
+		for (const [si, di] of this.computeMST(net.pads)) {
+			done.add(`${net.pads[si].id}->${net.pads[di].id}`);
+		}
+		this.routedEdges.set(net.name, done);
 	}
 
 	/** 当前层障碍全集（静态 + 其它网络焊盘 [+ 动态]） */
@@ -894,6 +1105,15 @@ export class PlanningEngine {
 			const term = this.padTerminal(pad);
 			const cands = buildExitCandidates(term, other, this.escapeMargin);
 			const out: Anchor[] = [];
+			// 允许焊盘打孔时，焊盘中心是最短的换层点（过孔直接落在 SMD 焊盘上）
+			if (this.allowViaInPad &&
+				this.viaPadClear(pad.x, pad.y, viaR, netName) &&
+				viaClear(pad.x, pad.y, topObs) && viaClear(pad.x, pad.y, bottomObs)) {
+				out.push({
+					x: pad.x, y: pad.y, stub: null,
+					via: { x: pad.x, y: pad.y }, stubLen: 0,
+				});
+			}
 			for (const c of cands) {
 				if (!segClear(pad, c.x, c.y, topObs)) continue;
 				// 步进首档 ≥ 过孔半径 + 4mil，再沿方向续推直到铜环完全离开
@@ -906,6 +1126,8 @@ export class PlanningEngine {
 						y += c.dirY * 4;
 					}
 					if (this.padCopperDistance(pad, x, y) < viaR + 4) continue;
+					// 精确校验所有焊盘：同网默认也不许落孔，异网按 Track↔Pad 间距避让
+					if (!this.viaPadClear(x, y, viaR, netName)) continue;
 					if (!segClear(pad, x, y, topObs)) continue;
 					if (!viaClear(x, y, topObs) || !viaClear(x, y, bottomObs)) continue;
 					out.push({
@@ -1037,6 +1259,15 @@ export class PlanningEngine {
 				return { via: null, stub: null, bottom: { x: pad.x, y: pad.y } };
 			}
 			if (pad.layer !== topLayer) return null;
+			// 允许焊盘打孔时优先在焊盘中心换层
+			if (this.allowViaInPad &&
+				this.viaPadClear(pad.x, pad.y, viaR, net.name) &&
+				viaClear(pad.x, pad.y, topObs) && viaClear(pad.x, pad.y, bottomObs)) {
+				return {
+					via: { x: pad.x, y: pad.y }, stub: null,
+					bottom: { x: pad.x, y: pad.y },
+				};
+			}
 			const term = this.padTerminal(pad);
 			const cands = buildExitCandidates(term, other, this.escapeMargin);
 			for (const c of cands) {
@@ -1050,6 +1281,7 @@ export class PlanningEngine {
 						y += c.dirY * 4;
 					}
 					if (this.padCopperDistance(pad, x, y) < viaR + 4) continue;
+					if (!this.viaPadClear(x, y, viaR, net.name)) continue;
 					if (!segClear(pad, x, y, topObs)) continue;
 					if (viaClear(x, y, topObs) && viaClear(x, y, bottomObs)) {
 						return {
@@ -1131,6 +1363,7 @@ export class PlanningEngine {
 	private ripupNetInternal(netName: string, notify: boolean): void {
 		if (notify) this.callbacks.onRipup?.([netName]);
 		this.netRendered.delete(netName);
+		this.routedEdges.delete(netName);
 		this.plannedVias = this.plannedVias.filter(v => v.net !== netName);
 		this.dynamicObstacles = this.dynamicObstacles.filter(o => o.net !== netName);
 		const ro = this.routedOrder.indexOf(netName);
@@ -1367,6 +1600,10 @@ export class PlanningEngine {
 						this.addRenderedToObstacles(mergePrims(sv.prims));
 					}
 					this.plannedVias = this.plannedVias.filter(v => v.net !== n).concat(sv.vias);
+					// 原走线是完整布通的：同步恢复「已完成连接」记录，避免后续撕毁
+					// 重布时把已有边当成未布线又叠一遍。
+					const nn = networks.find(x => x.name === n);
+					if (nn) this.markAllEdgesDone(nn);
 				}
 				for (const v of this.plannedVias) {
 					if (!group.includes(v.net)) continue;   // 只补组内网络：组外过孔的障碍从未被撕掉
@@ -1427,6 +1664,7 @@ export class PlanningEngine {
 				this.netRendered.set(name, savedPrims);
 				this.plannedVias = this.plannedVias.filter(v => v.net !== name).concat(savedVias);
 				this.addRenderedToObstacles(mergePrims(savedPrims));
+				this.markAllEdgesDone(net);
 				// 撕网时该网过孔的动态障碍一并被移除，回滚需重新注册
 				for (const v of savedVias) {
 					this.dynamicObstacles.push({

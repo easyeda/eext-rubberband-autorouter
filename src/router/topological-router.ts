@@ -433,6 +433,7 @@ export class TopologicalRouter {
 					connectivityFirst: true,
 					optimize: options.finalOptimize !== false,
 					allowViaFallback: options.viaFallback !== false,
+					allowViaInPad: options.allowViaInPad === true,
 					escapeClearanceMil: options.escapeClearanceMil,
 					ripupRounds: options.ripupRounds,
 					powerNetsFirst: options.powerNetsFirst,
@@ -459,8 +460,11 @@ export class TopologicalRouter {
 			// 等待所有实时写入完成
 			await this.applyQueue;
 
-			// 最终对账：失败网络不得在画布上残留任何图元（含被拆后重布失败的旧走线）
+			// 最终对账：完全失败的网不得残留图元；部分连通的网要保留已布走线
+			// （否则一条连接失败会把整网其它已布好的线段一并删掉）。
+			const partial = new Set(result.partial ?? []);
 			for (const name of result.failed) {
+				if (partial.has(name)) continue;
 				this.netGeom.delete(name);
 				if (options.livePreview === false) {
 					this.pendingPlanned.delete(name);
@@ -541,6 +545,7 @@ export class TopologicalRouter {
 				nets: [],
 				vias: [],
 				failed: [...this.failedNames],
+				partial: [],
 				routedNets: [...this.routedNames],
 				logs: [],
 			}));

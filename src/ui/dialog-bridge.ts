@@ -18,6 +18,47 @@ const HOST_SOURCE = 'rb-host';
 const UI_SOURCE = 'rb-ui';
 const DIALOG_ID_PREFIX = 'rb-dialog-';
 
+/**
+ * 右侧贴边定位：x/y 为弹窗左上角在 EDA 界面内的 CSS 像素坐标。
+ *
+ * 注意必须直接调用 `eda.sys_Window.getViewportSize()`：EDA 扩展沙箱里的
+ * `eda` 是注入的局部变量，不一定挂在 `globalThis` 上（`globalThis.eda`
+ * 在沙箱里可能为 undefined，回退到 window.innerWidth 会拿到错误尺寸，
+ * 表现为 x/y 失效或弹窗仍出现在中间）。
+ *
+ * 取不到视口尺寸时返回空对象，让 EDA 使用默认居中位置。
+ */
+export function rightEdgePosition(width: number, height: number): { x?: number; y?: number } {
+	let viewportWidth = 0;
+	let viewportHeight = 0;
+	try {
+		const size = eda?.sys_Window?.getViewportSize?.();
+		viewportWidth = Number(size?.width) || 0;
+		viewportHeight = Number(size?.height) || 0;
+	} catch { /* 旧版 EDA 没有该接口时回退 window */ }
+
+	if (viewportWidth <= 0 || viewportHeight <= 0) {
+		// 回退：扩展页面自身的窗口尺寸（仅当 EDA 视口接口不可用时）
+		const host = globalThis as any;
+		const doc = host.document;
+		if (viewportWidth <= 0) viewportWidth = Number(host.innerWidth) || Number(doc?.documentElement?.clientWidth) || 0;
+		if (viewportHeight <= 0) viewportHeight = Number(host.innerHeight) || Number(doc?.documentElement?.clientHeight) || 0;
+	}
+	if (viewportWidth <= 0) return {};
+
+	const margin = 16;
+	// 弹窗实际外框比 iframe 内容多出标题栏/边框，右侧留出的边距里扣除这部分余量，
+	// 避免窗口右边被视口裁掉。高度按外框估算后纵向居中。
+	const chromeWidth = 8;
+	const chromeHeight = 36;
+	return {
+		x: Math.max(margin, Math.round(viewportWidth - width - chromeWidth - margin)),
+		y: viewportHeight > 0
+			? Math.max(margin, Math.round((viewportHeight - height - chromeHeight) / 2))
+			: undefined,
+	};
+}
+
 export class DialogBridge {
 	private installed = false;
 	private handlers = new Map<DialogName, DialogHandler>();
@@ -77,6 +118,8 @@ export class DialogBridge {
 			minimizeButton: true,
 			maximizeButton: false,
 			grayscaleMask: false,
+			// 参数窗与进度窗统一贴 EDA 界面右侧，纵向居中
+			...rightEdgePosition(width, height),
 			onBeforeCloseCallFn: () => {
 				this.handlers.get(name)?.onBeforeClose?.();
 				return true;

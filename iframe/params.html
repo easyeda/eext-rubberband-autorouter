@@ -437,9 +437,10 @@
 					</div>
 					<div class="control">
 						<select id="budgetSec">
-							<option value="300" selected>5 分钟</option>
+							<option value="300">5 分钟</option>
 							<option value="600">10 分钟</option>
-							<option value="900">15 分钟</option>
+							<option value="900" selected>15 分钟</option>
+							<option value="1800">30 分钟</option>
 							<option value="0">不限时</option>
 						</select>
 					</div>
@@ -476,6 +477,16 @@
 					</div>
 					<div class="control">
 						<label class="switch"><input type="checkbox" id="viaFallback" checked><span></span></label>
+					</div>
+				</div>
+
+				<div class="row">
+					<div class="label">
+						<span>允许焊盘打孔</span>
+						<small>过孔可落在焊盘铜皮上；关闭时过孔只打在焊盘外，并避开相邻焊盘的 DRC 间距</small>
+					</div>
+					<div class="control">
+						<label class="switch"><input type="checkbox" id="allowViaInPad"><span></span></label>
 					</div>
 				</div>
 			</section>
@@ -543,10 +554,11 @@
 			escapeClearanceMil: 0,
 			ripupRounds: 3,
 			powerNetsFirst: false,
-			budgetMs: 300000,
+			budgetMs: 900000,
 			livePreview: true,
 			finalOptimize: true,
 			viaFallback: true,
+			allowViaInPad: false,
 			routeLayers: [1, 2],
 			excludeNets: [],
 			netOrder: 'auto'
@@ -700,15 +712,16 @@
 			setNumberPair('escapeClearanceMil', 'escapeClearanceMilNum', o.escapeClearanceMil);
 			$('ripupRounds').value = String(o.ripupRounds);
 			var budgetSec = Math.round((Number(o.budgetMs) || 0) / 1000);
-			if (budgetSec !== 0 && budgetSec !== 300 && budgetSec !== 600 && budgetSec !== 900) {
+			if (budgetSec !== 0 && budgetSec !== 300 && budgetSec !== 600 && budgetSec !== 900 && budgetSec !== 1800) {
 				// 旧版本可能保存过 60/120 秒等值：归入最近的档位
-				budgetSec = budgetSec >= 750 ? 900 : budgetSec >= 450 ? 600 : 300;
+				budgetSec = budgetSec >= 1350 ? 1800 : budgetSec >= 750 ? 900 : budgetSec >= 450 ? 600 : 300;
 			}
 			$('budgetSec').value = String(budgetSec);
 			$('netOrder').value = o.netOrder || 'auto';
 			$('livePreview').checked = o.livePreview !== false;
 			$('finalOptimize').checked = o.finalOptimize !== false;
 			$('viaFallback').checked = o.viaFallback !== false;
+			$('allowViaInPad').checked = o.allowViaInPad === true;
 
 			if (netRows.length) {
 				applyNetSelection(o.excludeNets || []);
@@ -733,6 +746,7 @@
 				livePreview: $('livePreview').checked,
 				finalOptimize: $('finalOptimize').checked,
 				viaFallback: $('viaFallback').checked,
+				allowViaInPad: $('allowViaInPad').checked,
 				routeLayers: layers,
 				// 没有网络清单时不要误排除任何网络
 				excludeNets: netRows.length
@@ -745,6 +759,7 @@
 		function updateLayerState() {
 			var single = $('layerBottom').disabled || !$('layerBottom').checked;
 			$('viaFallback').disabled = single;
+			$('allowViaInPad').disabled = single;
 			if (single) {
 				$('viaFallback').checked = false;
 			}

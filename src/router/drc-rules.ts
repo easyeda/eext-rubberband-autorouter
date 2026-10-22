@@ -38,6 +38,21 @@ export const FALLBACK_DRC_RULES: DRCRules = {
 
 export type DRCLog = (message: string, level: string) => void;
 
+/**
+ * DRC 配置里的数值带各自规则条目的 `unit` 字段（"mil"/"mm"/"inch"/"cm"）。
+ * 不同 PCB 的规则配置单位并不一致（同一工程里既有 mm 也有 mil 的板子），
+ * 不能按固定单位换算，必须逐条读取。
+ */
+function ruleValueToMil(value: number, unit: unknown): number {
+	switch (String(unit ?? 'mm').toLowerCase()) {
+		case 'mil': return value;
+		case 'inch': case 'in': return value * 1000;
+		case 'cm': return value * MM_TO_MIL * 10;
+		case 'mm':
+		default: return value * MM_TO_MIL;
+	}
+}
+
 /** 从当前 PCB 的 DRC 配置读取走线宽度与各类间距 */
 export async function fetchDRCRules(onLog?: DRCLog): Promise<DRCRules> {
 	try {
@@ -50,6 +65,7 @@ export async function fetchDRCRules(onLog?: DRCLog): Promise<DRCRules> {
 		let trackToLineMm = 0.1524;
 		let trackToBoardMm = 0.3;
 		let trackToFillMm = 0.254;
+		let spacingUnit: unknown = 'mm';
 
 		if (spacing) {
 			const tableKey = Object.keys(spacing).find(k => spacing[k].isSetDefault) ?? Object.keys(spacing)[0];
@@ -58,6 +74,7 @@ export async function fetchDRCRules(onLog?: DRCLog): Promise<DRCRules> {
 			const cols: string[] = tbl?.column ?? [];
 			const rows: string[] = tbl?.row ?? [];
 			const trackColIdx = cols.indexOf('Track');
+			spacingUnit = tbl?.unit;
 
 			const readSpacing = (rowName: string): number | null => {
 				const rowIdx = rows.indexOf(rowName);
@@ -81,22 +98,27 @@ export async function fetchDRCRules(onLog?: DRCLog): Promise<DRCRules> {
 		// 读取默认走线宽度
 		const trackRules = cfg?.Physics?.Track;
 		let traceWidthMm = 0.254;
+		let trackUnit: unknown = 'mm';
 		if (trackRules) {
 			const defaultKey =
 				Object.keys(trackRules).find(k => trackRules[k].isSetDefault) ??
 				Object.keys(trackRules)[0];
 			const tw = trackRules[defaultKey]?.form?.data?.['1']?.defaultValue;
 			if (typeof tw === 'number' && tw > 0) traceWidthMm = tw;
+			trackUnit = trackRules[defaultKey]?.unit;
 		}
 
 		const rules: DRCRules = {
-			traceWidthMil: traceWidthMm * MM_TO_MIL,
-			clearanceMil: Math.max(trackToTrackMm, trackToPadMm) * MM_TO_MIL,
-			trackToTrackMil: trackToTrackMm * MM_TO_MIL,
-			trackToLineMil: trackToLineMm * MM_TO_MIL,
-			trackToBoardMil: trackToBoardMm * MM_TO_MIL,
-			trackToPadMil: trackToPadMm * MM_TO_MIL,
-			trackToFillMil: trackToFillMm * MM_TO_MIL,
+			traceWidthMil: ruleValueToMil(traceWidthMm, trackUnit),
+			clearanceMil: Math.max(
+				ruleValueToMil(trackToTrackMm, spacingUnit),
+				ruleValueToMil(trackToPadMm, spacingUnit),
+			),
+			trackToTrackMil: ruleValueToMil(trackToTrackMm, spacingUnit),
+			trackToLineMil: ruleValueToMil(trackToLineMm, spacingUnit),
+			trackToBoardMil: ruleValueToMil(trackToBoardMm, spacingUnit),
+			trackToPadMil: ruleValueToMil(trackToPadMm, spacingUnit),
+			trackToFillMil: ruleValueToMil(trackToFillMm, spacingUnit),
 		};
 
 		onLog?.(
