@@ -73,6 +73,9 @@ export class TopologicalRouter {
 	/** 已布成功的网络（仅用于实时统计） */
 	private routedNames = new Set<string>();
 	private failedNames = new Set<string>();
+	/** 每网络焊盘级飞线进度（total = 参与布线焊盘数，routed = 已消除全部飞线） */
+	private netPadStats = new Map<string, { total: number; routed: number }>();
+	private totalPads = 0;
 
 	private applyQueue: Promise<void> = Promise.resolve();
 	private worker: Worker | null = null;
@@ -366,6 +369,8 @@ export class TopologicalRouter {
 			this.pendingPlanned.clear();
 			this.routedNames.clear();
 			this.failedNames.clear();
+			this.netPadStats.clear();
+			this.totalPads = 0;
 			this.padShapeCache.clear();
 			this.applyQueue = Promise.resolve();
 			this.totalNets = 0;
@@ -408,6 +413,10 @@ export class TopologicalRouter {
 			}
 			if (networks.length === 0) throw new Error('所有网络都被排除，没有可布线的网络');
 			this.totalNets = networks.length;
+			// 飞线布通率的分母：参与布线的焊盘总数（排除网络不计）
+			this.totalPads = networks.reduce((sum, n) => sum + n.pads.length, 0);
+			this.netPadStats.clear();
+			for (const n of networks) this.netPadStats.set(n.name, { total: n.pads.length, routed: 0 });
 
 			const padShapes: Record<string, PadShape> = {};
 			for (const [key, value] of this.padShapeCache) padShapes[key] = value;
@@ -572,12 +581,20 @@ export class TopologicalRouter {
 							this.routedNames.delete(msg.name);
 							this.failedNames.add(msg.name);
 						}
+						if (msg.pads) {
+							this.netPadStats.set(msg.name, {
+								total: Number(msg.pads.total) || 0,
+								routed: Number(msg.pads.routed) || 0,
+							});
+						}
 						this.enqueue(() => this.applyNet(msg.name, msg.prims ?? [], msg.vias ?? [], msg.ok !== false));
 						break;
 					case 'ripup':
 						for (const name of msg.names ?? []) {
 							this.routedNames.delete(name);
 							this.failedNames.add(name);
+							const padStat = this.netPadStats.get(name);
+							if (padStat) padStat.routed = 0;
 						}
 						this.enqueue(() => this.applyRipup(msg.names ?? []));
 						break;
@@ -608,19 +625,22 @@ export class TopologicalRouter {
 		return engine.plan(input, {
 			onLog: (message, level) => this.onLog?.(message, level),
 			onProgress: (percentage, message) => this.onProgress?.({ stage: '规划中', percentage, message }),
-			onNetUpdate: (name, prims, vias, ok) => {
+			onNetUpdate: (name, prims, vias, ok, pads) => {
 				if (ok) {
 					this.routedNames.add(name);
 					this.failedNames.delete(name);
 				} else {
 					this.failedNames.add(name);
 				}
+				if (pads) this.netPadStats.set(name, { total: pads.total, routed: pads.routed });
 				this.enqueue(() => this.applyNet(name, prims, vias, ok));
 			},
 			onRipup: (names) => {
 				for (const name of names) {
 					this.routedNames.delete(name);
 					this.failedNames.add(name);
+					const padStat = this.netPadStats.get(name);
+					if (padStat) padStat.routed = 0;
 				}
 				this.enqueue(() => this.applyRipup(names));
 			},
@@ -844,10 +864,19 @@ export class TopologicalRouter {
 			segments += g.segments;
 			vias += g.vias;
 		}
+		let routedPads = 0;
+		let totalPads = 0;
+		for (const p of this.netPadStats.values()) {
+			routedPads += Math.min(p.routed, p.total);
+			totalPads += p.total;
+		}
 		return {
 			totalNets: this.totalNets,
 			routedNets: this.routedNames.size,
 			failedNets: this.failedNames.size,
+			// 以参与布线网络的实际焊盘数为准；初始化前回退到预算值
+			totalPads: totalPads || this.totalPads,
+			routedPads,
 			segments,
 			vias,
 			elapsedMs: Date.now() - this.startedAt,

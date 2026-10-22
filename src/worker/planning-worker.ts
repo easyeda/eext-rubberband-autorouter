@@ -49,7 +49,7 @@ ctx.onmessage = async (event: MessageEvent<IncomingMessage>) => {
 		const result: PlanningResult = await engine.plan(msg.input, {
 			onLog: (message, level) => ctx.postMessage({ type: 'log', message, level }),
 			onProgress: (percentage, message) => ctx.postMessage({ type: 'progress', percentage, message }),
-			onNetUpdate: (name, prims, vias, ok) => ctx.postMessage({ type: 'net', name, prims, vias, ok }),
+			onNetUpdate: (name, prims, vias, ok, pads) => ctx.postMessage({ type: 'net', name, prims, vias, ok, pads }),
 			onRipup: (names) => ctx.postMessage({ type: 'ripup', names }),
 			isCancelled: () => cancelled,
 		});

@@ -110,6 +110,10 @@ export interface RouteStats {
 	totalNets: number;
 	routedNets: number;
 	failedNets: number;
+	/** 参与布线的焊盘总数（排除网络不计） */
+	totalPads: number;
+	/** 已消除全部飞线的焊盘数：该焊盘在 MST 中的所有连接都已布通 */
+	routedPads: number;
 	segments: number;
 	vias: number;
 	elapsedMs: number;

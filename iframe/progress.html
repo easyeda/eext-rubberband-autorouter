@@ -128,7 +128,7 @@
 	@keyframes shimmer { to { transform: translateX(100%); } }
 
 	/* ── 统计 ── */
-	.stats { display: grid; grid-template-columns: 1.25fr repeat(4, 1fr); gap: 8px; }
+	.stats { display: grid; grid-template-columns: 1.18fr 1.18fr repeat(4, 1fr); gap: 7px; }
 	.stat {
 		background: var(--card); border: 1px solid var(--card-border);
 		border-radius: 11px; box-shadow: var(--shadow);
@@ -144,6 +144,12 @@
 		border-color: rgba(16, 185, 129, 0.28);
 	}
 	.stat.rate b { color: var(--success); font-size: 19px; }
+	.stat.rate.fly {
+		background: linear-gradient(160deg, rgba(79, 124, 255, 0.15), var(--card) 70%);
+		border-color: rgba(79, 124, 255, 0.30);
+	}
+	.stat.rate.fly b { color: var(--accent); }
+	.stat.rate.fly .rate-bar i { background: linear-gradient(90deg, var(--accent), var(--accent2)); }
 	.rate-bar {
 		height: 4px; border-radius: 999px; background: var(--track);
 		overflow: hidden; margin: 5px 3px 0;
@@ -244,10 +250,15 @@
 	</div>
 
 	<div class="stats">
-		<div class="stat rate">
+		<div class="stat rate" title="已完整布通的网络 / 参与布线的网络总数">
 			<b id="rate">0%</b>
 			<span id="rateSub">布通 0/0</span>
 			<div class="rate-bar"><i id="rateFill"></i></div>
+		</div>
+		<div class="stat rate fly" title="已消除全部飞线的焊盘 / 参与布线的焊盘总数">
+			<b id="flyRate">0%</b>
+			<span id="flyRateSub">已消飞线 0/0</span>
+			<div class="rate-bar"><i id="flyRateFill"></i></div>
 		</div>
 		<div class="stat"><b id="routed">0</b><span>已布网络</span></div>
 		<div class="stat"><b id="failed">0</b><span>失败网络</span></div>
@@ -348,6 +359,13 @@
 			$('rate').textContent = rate + '%';
 			$('rateSub').textContent = '布通 ' + routed + '/' + total;
 			$('rateFill').style.width = rate + '%';
+			// 飞线布通率：按焊盘统计，已消除全部飞线的焊盘 / 参与布线焊盘
+			var padsTotal = Number(stats.totalPads) || 0;
+			var padsRouted = Number(stats.routedPads) || 0;
+			var flyRate = padsTotal > 0 ? Math.round((padsRouted / padsTotal) * 100) : 0;
+			$('flyRate').textContent = flyRate + '%';
+			$('flyRateSub').textContent = '已消飞线 ' + padsRouted + '/' + padsTotal;
+			$('flyRateFill').style.width = flyRate + '%';
 			$('routed').textContent = String(routed);
 			$('failed').textContent = String(stats.failedNets || 0);
 			$('segments').textContent = String(stats.segments || 0);
@@ -400,7 +418,8 @@
 					summary.cancelled ? '已保留当前已写入的走线' : '全部网络处理结束',
 					summary.cancelled ? '已停止' : '完成');
 				appendLog(ok ? 'success' : 'warn',
-					'结果：' + summary.routedNets + '/' + summary.totalNets + ' 个网络，走线 ' +
+					'结果：' + summary.routedNets + '/' + summary.totalNets + ' 个网络，飞线焊盘 ' +
+					(summary.routedPads || 0) + '/' + (summary.totalPads || 0) + '，走线 ' +
 					summary.segments + ' 段，过孔 ' + summary.vias + ' 个，用时 ' +
 					Math.round((summary.elapsedMs || 0) / 1000) + ' 秒' +
 					(summary.failed && summary.failed.length ? '，失败：' + summary.failed.join(', ') : ''),

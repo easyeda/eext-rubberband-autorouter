@@ -237,6 +237,8 @@ export class AutoRouterFacade {
 			totalNets: 0,
 			routedNets: 0,
 			failedNets: 0,
+			totalPads: 0,
+			routedPads: 0,
 			segments: 0,
 			vias: 0,
 			elapsedMs: 0,

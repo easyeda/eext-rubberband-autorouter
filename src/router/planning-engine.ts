@@ -99,11 +99,17 @@ export interface PlanningInput {
 	options?: PlanOptions;
 }
 
+/** 网络焊盘级飞线进度：total = 该网络参与布线的焊盘数，routed = 已消除全部飞线的焊盘数 */
+export interface NetPadProgress {
+	total: number;
+	routed: number;
+}
+
 export interface PlanningCallbacks {
 	onLog?: (message: string, level: string) => void;
 	onProgress?: (percentage: number, message: string) => void;
 	/** 某个网络完成（或重新完成）规划：主线程据此实时写入画布 */
-	onNetUpdate?: (name: string, prims: RenderedPrim[], vias: PlannedVia[], ok: boolean) => void;
+	onNetUpdate?: (name: string, prims: RenderedPrim[], vias: PlannedVia[], ok: boolean, pads?: NetPadProgress) => void;
 	/** 撕毁网络：主线程需删除该网络已写入的图元 */
 	onRipup?: (names: string[]) => void;
 	isCancelled?: () => boolean;
@@ -494,8 +500,8 @@ export class PlanningEngine {
 		// 并排焊盘封装（连接器、IC 引脚排）：先走中间的焊盘。
 		// 原因：同一排外侧焊盘先出线时，走线容易绕到排外形成包围，把中间
 		// 焊盘唯一的垂直出口封死；中间焊盘先垂直出线后，外侧焊盘仍可从
-		// 排两端出线。只调整同一层级内这些网络的相对顺序，不影响电源/地
-		// 的层级约束。
+		// 排两端出线。信号网络（层级 0/1）跨层级合并重排，电源/地的层级
+		// 约束不受影响（地仍最后）。
 		const rowCount = mode === 'auto' || mode === 'river'
 			? this.prioritizeRowInteriorPads(keyed)
 			: 0;
@@ -600,8 +606,12 @@ export class PlanningEngine {
 
 		if (rowScore.size < 2) return 0;
 
-		// 每个「焊盘排组」内部按层级重排：只在这些网络原来占用的位置上按
-		// 「中间 → 两端」换位，其它网络的位置不动；不同层级之间绝不互换。
+		// 每个「焊盘排组」内部按「中间 → 两端」重排：只在这些网络原来占用的
+		// 位置上换位，其它网络的位置不动。
+		// 层级 0/1（短连接 + 一般信号）合并为一个池跨层级重排：排内短连接
+		// 网络若按层级先行，会抢在中间焊盘之前出线（如 FPC 排两端焊盘的
+		// 2-pad 网络），从排侧包住整排，封死中间焊盘的唯一出口。电源（层级 2）
+		// 仍只在电源内部重排，地（层级 3）保持最后不动。
 		let moved = 0;
 		const components = new Map<string, Set<string>>();
 		for (const name of rowScore.keys()) {
@@ -610,17 +620,19 @@ export class PlanningEngine {
 			if (!set) { set = new Set(); components.set(root, set); }
 			set.add(name);
 		}
+		const byInteriority = (a: T, b: T) =>
+			(rowScore.get(b.net.name) ?? 0) - (rowScore.get(a.net.name) ?? 0);
 		for (const members of components.values()) {
-			const tiers = new Set(keyed.filter(k => members.has(k.net.name)).map(k => k.tier));
-			for (const tier of tiers) {
-				const slots: number[] = [];
-				keyed.forEach((k, i) => {
-					if (k.tier === tier && members.has(k.net.name)) slots.push(i);
-				});
+			const signalSlots: number[] = [];
+			const powerSlots: number[] = [];
+			keyed.forEach((k, i) => {
+				if (!members.has(k.net.name)) return;
+				if (k.tier <= 1) signalSlots.push(i);
+				else if (k.tier === 2) powerSlots.push(i);
+			});
+			for (const slots of [signalSlots, powerSlots]) {
 				if (slots.length < 2) continue;
-				const ordered = slots
-					.map(i => keyed[i])
-					.sort((a, b) => (rowScore.get(b.net.name) ?? 0) - (rowScore.get(a.net.name) ?? 0));
+				const ordered = slots.map(i => keyed[i]).sort(byInteriority);
 				slots.forEach((slot, i) => { keyed[slot] = ordered[i]; });
 				moved += slots.length;
 			}
@@ -828,6 +840,31 @@ export class PlanningEngine {
 		this.dynamicObstacles = [...uniq.values()];
 	}
 
+	/**
+	 * 焊盘级飞线进度。
+	 *
+	 * 「已布线焊盘」= 该焊盘在 MST 上的每条飞线都已布通（不再有飞线残留）；
+	 * 多焊盘网络上只连了一部分的焊盘不计入，避免出现「100% 但仍有飞线」。
+	 */
+	private padProgress(
+		net: { name: string; pads: EnginePad[] },
+		edges: Array<[number, number]> = this.computeMST(net.pads),
+	): NetPadProgress {
+		const done = this.routedEdges.get(net.name) ?? new Set<string>();
+		const degree = new Array<number>(net.pads.length).fill(0);
+		const doneDegree = new Array<number>(net.pads.length).fill(0);
+		for (const [si, di] of edges) {
+			degree[si]++; degree[di]++;
+			const key = `${net.pads[si].id}->${net.pads[di].id}`;
+			if (done.has(key)) { doneDegree[si]++; doneDegree[di]++; }
+		}
+		let routed = 0;
+		for (let i = 0; i < net.pads.length; i++) {
+			if (doneDegree[i] >= degree[i]) routed++;
+		}
+		return { total: net.pads.length, routed };
+	}
+
 	/** 布一个网络的全部 MST 连接（纯规划；单条失败不再丢弃整网已布部分） */
 	private async routeNetEdges(net: { name: string; pads: EnginePad[] }): Promise<boolean> {
 		const drc = this.drc;
@@ -966,7 +1003,10 @@ export class PlanningEngine {
 		// 只要网内有成功图元就按「可写」下发，否则失败网络会被整网删除 ——
 		// 这正是「一条连接失败导致整网飞线都不布」的原因。
 		const prims = mergePrims(this.netRendered.get(net.name) ?? []);
-		this.callbacks.onNetUpdate?.(net.name, prims, this.plannedVias.filter(v => v.net === net.name), prims.length > 0);
+		this.callbacks.onNetUpdate?.(
+			net.name, prims, this.plannedVias.filter(v => v.net === net.name),
+			prims.length > 0, this.padProgress(net, edges),
+		);
 		this.log(
 			complete
 				? `网络 ${net.name} 布线完成（${edges.length} 条连接，${prims.length} 段图形）`
@@ -1350,7 +1390,11 @@ export class PlanningEngine {
 			});
 		}
 		if (!this.routedOrder.includes(net.name)) this.routedOrder.push(net.name);
-		this.callbacks.onNetUpdate?.(net.name, mergePrims(rds), this.plannedVias.filter(v => v.net === net.name), true);
+		// 兜底路径按整网布通处理（与 routedOrder / 布通率口径一致）
+		this.callbacks.onNetUpdate?.(
+			net.name, mergePrims(rds), this.plannedVias.filter(v => v.net === net.name),
+			true, { total: net.pads.length, routed: net.pads.length },
+		);
 		this.log(`网络 ${net.name} ${vias.length ? '通过过孔换层' : '走底层'}布通`, 'success');
 		return true;
 	}
@@ -1620,7 +1664,11 @@ export class PlanningEngine {
 				// 失败的尝试留下了残缺画面），回滚后把原走线写回去保持一致
 				for (const n of group) {
 					const sv = saved.get(n)!;
-					this.callbacks.onNetUpdate?.(n, mergePrims(sv.prims), sv.vias, sv.prims.length > 0);
+					const nn = networks.find(x => x.name === n);
+					this.callbacks.onNetUpdate?.(
+						n, mergePrims(sv.prims), sv.vias, sv.prims.length > 0,
+						nn ? this.padProgress(nn) : undefined,
+					);
 				}
 				soloCache.clear();
 			}
@@ -1677,7 +1725,7 @@ export class PlanningEngine {
 				this.log(`网络 ${name} 优化未采纳（${ok ? newLen.toFixed(0) : '失败'} vs ${savedLen.toFixed(0)} mil），保留原走线`, 'info');
 				// 画布还停留在刚被否决的重布结果上（routeNetEdges 已实时写入）：
 				// 把原走线写回去，画布与引擎状态保持一致
-				this.callbacks.onNetUpdate?.(name, mergePrims(savedPrims), savedVias, true);
+				this.callbacks.onNetUpdate?.(name, mergePrims(savedPrims), savedVias, true, this.padProgress(net));
 			}
 		}
 		this.progress(98, '优化完成');
