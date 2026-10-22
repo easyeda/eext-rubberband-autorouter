@@ -25,7 +25,7 @@
 
 ### 方法 1：从 .eext 文件安装
 
-1. 下载 `rubberband-autorouter_v0.0.51.eext` 文件
+1. 下载 `rubberband-autorouter_v0.0.52.eext` 文件
 2. 打开嘉立创 EDA 专业版
 3. 进入 **扩展管理** (Extensions)
 4. 点击 **从本地安装** (Install from local)
