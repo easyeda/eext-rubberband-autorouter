@@ -17,6 +17,7 @@ import {
 	normalizeRouterOptions,
 	RouterUiOptions,
 	RouteStats,
+	BoardInspection,
 } from './types/router-params';
 
 const PARAMS_ID = 'params' as const;
@@ -28,6 +29,8 @@ export class AutoRouterFacade {
 	private logger = new Logger('[AutoRouter]');
 	private busy = false;
 	private progressVisible = false;
+	/** 最近一次使用的参数：重新布线 / 再次打开设置时复用 */
+	private lastOptions: RouterUiOptions | null = null;
 
 	isBusy(): boolean {
 		return this.busy;
@@ -42,8 +45,13 @@ export class AutoRouterFacade {
 
 		let drcDefaults: RouterUiOptions;
 		let drc: DRCRules;
+		let inspection: BoardInspection | null = null;
 		try {
-			drc = await fetchDRCRules((message, level) => this.logLine(message, level));
+			// DRC 与板级信息（层/网络清单）并行读取：参数窗打开即可展示可选项
+			[drc, inspection] = await Promise.all([
+				fetchDRCRules((message, level) => this.logLine(message, level)),
+				this.ensureRouter().inspectBoard().catch(() => null),
+			]);
 			drcDefaults = deriveDefaultOptions(drc);
 		} catch {
 			drc = await fetchDRCRules();
@@ -54,20 +62,22 @@ export class AutoRouterFacade {
 			void this.bridge.open(
 				PARAMS_ID,
 				'/iframe/params.html',
-				560,
-				830,
+				880,
+				650,
 				'橡皮筋自动布线 · 参数',
 				{
 					onReady: (send) => {
 						send({
 							type: 'defaults',
-							options: drcDefaults,
+							options: this.lastOptions ?? drcDefaults,
 							drc: {
 								traceWidthMil: drc.traceWidthMil,
 								trackToTrackMil: drc.trackToTrackMil,
 								trackToPadMil: drc.trackToPadMil,
 								trackToBoardMil: drc.trackToBoardMil,
 							},
+							layers: inspection?.layers ?? null,
+							nets: inspection?.nets ?? null,
 						});
 					},
 					onMessage: (msg) => {
@@ -107,34 +117,18 @@ export class AutoRouterFacade {
 	private async startRouting(options: RouterUiOptions): Promise<void> {
 		if (this.busy) return;
 		this.busy = true;
+		this.lastOptions = options;
 		showInfo('橡皮筋自动布线：开始布线');
 
-		await this.openProgress(options);
+		// 进度窗口已存在时直接复用（避免关闭重开导致运行中被 onBeforeClose 取消）
+		if (this.progressVisible && this.bridge.isOpen(PROGRESS_ID)) {
+			this.bridge.send(PROGRESS_ID, this.beginMessage(options));
+			await this.bridge.focus(PROGRESS_ID);
+		} else {
+			await this.openProgress(options);
+		}
 
-		const router = new TopologicalRouter(
-			(progress) => {
-				this.bridge.send(PROGRESS_ID, {
-					type: 'progress',
-					percentage: progress.percentage,
-					message: progress.message,
-					stage: progress.stage,
-				});
-			},
-			(message, level) => {
-				this.logLine(message, level);
-				this.bridge.send(PROGRESS_ID, {
-					type: 'log',
-					level,
-					message,
-					time: Date.now(),
-				});
-			},
-			(stats) => {
-				this.bridge.send(PROGRESS_ID, { type: 'stats', stats });
-			},
-		);
-		this.router = router;
-
+		const router = this.ensureRouter();
 		try {
 			const summary = await router.route(options);
 			this.bridge.send(PROGRESS_ID, { type: 'done', summary });
@@ -152,8 +146,49 @@ export class AutoRouterFacade {
 			this.bridge.send(PROGRESS_ID, { type: 'error', message: msg });
 		} finally {
 			this.busy = false;
-			this.router = null;
 		}
+	}
+
+	/**
+	 * 路由器在门面生命周期内复用：它保存上一轮写入画布的图元 ID，
+	 * 重新布线时先精确清理这些图元，避免把旧走线当成静态障碍。
+	 */
+	private ensureRouter(): TopologicalRouter {
+		if (!this.router) {
+			this.router = new TopologicalRouter(
+				(progress) => {
+					this.bridge.send(PROGRESS_ID, {
+						type: 'progress',
+						percentage: progress.percentage,
+						message: progress.message,
+						stage: progress.stage,
+					});
+				},
+				(message, level) => {
+					this.logLine(message, level);
+					this.bridge.send(PROGRESS_ID, {
+						type: 'log',
+						level,
+						message,
+						time: Date.now(),
+					});
+				},
+				(stats) => {
+					this.bridge.send(PROGRESS_ID, { type: 'stats', stats });
+				},
+			);
+		}
+		return this.router;
+	}
+
+	private beginMessage(options: RouterUiOptions): Record<string, unknown> {
+		return {
+			type: 'begin',
+			version: extensionConfig.version,
+			options,
+			startedAt: Date.now(),
+			stats: this.emptyStats(),
+		};
 	}
 
 	private async openProgress(options: RouterUiOptions): Promise<void> {
@@ -163,17 +198,11 @@ export class AutoRouterFacade {
 				PROGRESS_ID,
 				'/iframe/progress.html',
 				620,
-				620,
+				560,
 				'橡皮筋自动布线 · 进度',
 				{
 					onReady: (send) => {
-						send({
-							type: 'begin',
-							version: extensionConfig.version,
-							options,
-							startedAt: Date.now(),
-							stats: this.emptyStats(),
-						});
+						send(this.beginMessage(options));
 					},
 					onMessage: (msg) => {
 						if (msg.type === 'cancel') {
@@ -181,6 +210,12 @@ export class AutoRouterFacade {
 						} else if (msg.type === 'close') {
 							this.progressVisible = false;
 							void this.bridge.close(PROGRESS_ID);
+						} else if (msg.type === 'rerun') {
+							if (!this.busy && this.lastOptions) {
+								void this.startRouting(this.lastOptions);
+							}
+						} else if (msg.type === 'openSettings') {
+							if (!this.busy) void this.openSettings();
 						}
 					},
 					onBeforeClose: () => {

@@ -7,7 +7,7 @@
 <style>
 	:root {
 		--bg: #f4f6fb;
-		--card: rgba(255, 255, 255, 0.86);
+		--card: rgba(255, 255, 255, 0.88);
 		--card-border: rgba(15, 23, 42, 0.08);
 		--text: #0f172a;
 		--muted: #64748b;
@@ -16,13 +16,15 @@
 		--accent2: #8b5cf6;
 		--accent-soft: rgba(79, 124, 255, 0.12);
 		--track: rgba(15, 23, 42, 0.09);
-		--shadow: 0 18px 50px rgba(15, 23, 42, 0.10);
-		--radius: 16px;
+		--shadow: 0 12px 32px rgba(15, 23, 42, 0.08);
+		--success: #10b981;
+		--warn: #f59e0b;
+		--radius: 13px;
 	}
 	@media (prefers-color-scheme: dark) {
 		:root {
 			--bg: #0b1020;
-			--card: rgba(23, 30, 51, 0.82);
+			--card: rgba(23, 30, 51, 0.84);
 			--card-border: rgba(148, 163, 184, 0.14);
 			--text: #eef2ff;
 			--muted: #a5b0c6;
@@ -31,7 +33,7 @@
 			--accent2: #a78bfa;
 			--accent-soft: rgba(109, 141, 255, 0.18);
 			--track: rgba(148, 163, 184, 0.18);
-			--shadow: 0 22px 60px rgba(0, 0, 0, 0.45);
+			--shadow: 0 16px 40px rgba(0, 0, 0, 0.38);
 		}
 	}
 	* { box-sizing: border-box; }
@@ -41,49 +43,60 @@
 		font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "Microsoft YaHei", "PingFang SC", sans-serif;
 		color: var(--text);
 		background:
-			radial-gradient(680px 320px at -10% -10%, rgba(79, 124, 255, 0.18), transparent 60%),
-			radial-gradient(520px 280px at 110% 0%, rgba(139, 92, 246, 0.16), transparent 55%),
+			radial-gradient(680px 300px at -10% -10%, rgba(79, 124, 255, 0.16), transparent 60%),
+			radial-gradient(520px 260px at 110% 0%, rgba(139, 92, 246, 0.14), transparent 55%),
 			var(--bg);
 		overflow: hidden;
 	}
-	.app { height: 100%; display: grid; grid-template-rows: auto 1fr auto; }
+	.app { height: 100%; display: grid; grid-template-rows: auto auto 1fr auto; }
 
 	/* ── 顶部 ── */
 	.hero {
 		display: flex; align-items: center; justify-content: space-between;
-		padding: 14px 22px 8px;
+		padding: 10px 18px 6px;
 	}
-	.brand { display: flex; align-items: center; gap: 12px; }
+	.brand { display: flex; align-items: center; gap: 10px; }
 	.logo {
-		width: 42px; height: 42px; border-radius: 13px;
+		width: 34px; height: 34px; border-radius: 11px;
 		display: grid; place-items: center;
 		background: linear-gradient(135deg, var(--accent), var(--accent2));
-		box-shadow: 0 10px 24px rgba(79, 124, 255, 0.35);
+		box-shadow: 0 8px 18px rgba(79, 124, 255, 0.3);
 		color: #fff;
 	}
-	h1 { margin: 0; font-size: 17px; font-weight: 700; letter-spacing: 0.2px; }
-	.hero p { margin: 3px 0 0; font-size: 12px; color: var(--muted); }
+	h1 { margin: 0; font-size: 15px; font-weight: 700; letter-spacing: 0.2px; }
+	.hero p { margin: 2px 0 0; font-size: 11px; color: var(--muted); }
 	.hero-meta { display: flex; align-items: center; gap: 8px; }
 	.version-chip {
-		font-size: 11px; font-weight: 700; color: var(--muted);
+		font-size: 10.5px; font-weight: 700; color: var(--muted);
 		background: var(--card);
 		border: 1px solid var(--card-border);
-		padding: 6px 10px; border-radius: 999px;
+		padding: 5px 9px; border-radius: 999px;
 		white-space: nowrap;
 		font-variant-numeric: tabular-nums;
 	}
 	.badge {
-		font-size: 11px; font-weight: 600; color: var(--accent);
+		font-size: 10.5px; font-weight: 600; color: var(--accent);
 		background: var(--accent-soft);
 		border: 1px solid rgba(79, 124, 255, 0.25);
-		padding: 6px 10px; border-radius: 999px;
+		padding: 5px 9px; border-radius: 999px;
 		white-space: nowrap;
 	}
 
-	/* ── 内容 ── */
-	main { overflow-y: auto; padding: 2px 18px 6px; }
-	main::-webkit-scrollbar { width: 8px; }
-	main::-webkit-scrollbar-thumb { background: var(--track); border-radius: 999px; }
+	/* ── 主体：左右两栏 ── */
+	main {
+		display: grid;
+		grid-template-columns: 1.02fr 0.98fr;
+		gap: 10px;
+		padding: 2px 16px 4px;
+		min-height: 0;
+		overflow: hidden;
+	}
+	.col { display: flex; flex-direction: column; gap: 9px; min-height: 0; min-width: 0; }
+	.col-left { overflow: hidden; padding-right: 2px; }
+	.col-left::-webkit-scrollbar, .net-list::-webkit-scrollbar { width: 7px; }
+	.col-left::-webkit-scrollbar-thumb, .net-list::-webkit-scrollbar-thumb {
+		background: var(--track); border-radius: 999px;
+	}
 
 	.card {
 		background: var(--card);
@@ -91,80 +104,86 @@
 		border-radius: var(--radius);
 		box-shadow: var(--shadow);
 		backdrop-filter: blur(14px);
-		padding: 12px 16px;
-		margin-bottom: 8px;
+		padding: 8px 12px 9px;
+		min-width: 0;
 	}
 	.section-title {
-		display: flex; align-items: center; gap: 8px;
-		font-size: 12px; font-weight: 700; letter-spacing: 0.4px;
+		display: flex; align-items: center; gap: 7px;
+		font-size: 11px; font-weight: 700; letter-spacing: 0.4px;
 		color: var(--muted); text-transform: uppercase;
-		margin-bottom: 6px;
+		margin-bottom: 2px;
 	}
 	.section-title .dot {
-		width: 7px; height: 7px; border-radius: 50%;
+		width: 6px; height: 6px; border-radius: 50%;
 		background: linear-gradient(135deg, var(--accent), var(--accent2));
-		box-shadow: 0 0 0 4px var(--accent-soft);
+		box-shadow: 0 0 0 3px var(--accent-soft);
+	}
+	.section-title .spacer { flex: 1; }
+	.section-title .count {
+		font-size: 10px; font-weight: 600; color: var(--faint);
+		text-transform: none; letter-spacing: 0;
+		font-variant-numeric: tabular-nums;
 	}
 
 	.row {
-		display: grid; grid-template-columns: 1fr auto; gap: 14px;
+		display: grid; grid-template-columns: 1fr auto; gap: 10px;
 		align-items: center;
-		padding: 8px 0;
+		padding: 4px 0;
 		border-top: 1px dashed var(--card-border);
 	}
 	.row:first-of-type { border-top: 0; }
 	.row .label { min-width: 0; }
-	.row .label > span { display: block; font-size: 13px; font-weight: 600; }
-	.row .label > small { display: block; margin-top: 3px; font-size: 11px; color: var(--faint); line-height: 1.45; }
-	.control { display: flex; align-items: center; gap: 10px; }
+	.row .label > span { display: block; font-size: 12.5px; font-weight: 600; }
+	.row .label > small { display: block; margin-top: 1px; font-size: 10px; color: var(--faint); line-height: 1.35; }
+	.control { display: flex; align-items: center; gap: 8px; }
 
 	/* 滑杆 */
 	input[type="range"] {
 		-webkit-appearance: none; appearance: none;
-		width: 150px; height: 26px; background: transparent; cursor: pointer;
+		width: 118px; height: 22px; background: transparent; cursor: pointer;
 	}
 	input[type="range"]::-webkit-slider-runnable-track {
-		height: 6px; border-radius: 999px; background: var(--track);
+		height: 5px; border-radius: 999px; background: var(--track);
 	}
 	input[type="range"]::-webkit-slider-thumb {
 		-webkit-appearance: none; appearance: none;
-		width: 18px; height: 18px; margin-top: -6px;
+		width: 16px; height: 16px; margin-top: -5.5px;
 		border-radius: 50%; background: #fff;
 		border: 3px solid var(--accent);
-		box-shadow: 0 4px 12px rgba(79, 124, 255, 0.35);
+		box-shadow: 0 3px 10px rgba(79, 124, 255, 0.32);
 		transition: transform 0.15s ease;
 	}
 	input[type="range"]::-webkit-slider-thumb:hover { transform: scale(1.12); }
 
 	.num {
-		display: flex; align-items: center; gap: 5px;
+		display: flex; align-items: center; gap: 4px;
 		background: var(--accent-soft);
 		border: 1px solid rgba(79, 124, 255, 0.22);
-		border-radius: 10px; padding: 5px 9px;
+		border-radius: 8px; padding: 4px 7px;
 	}
 	.num input {
-		width: 46px; border: 0; outline: 0; background: transparent;
-		color: var(--text); font-size: 13px; font-weight: 700;
+		width: 42px; border: 0; outline: 0; background: transparent;
+		color: var(--text); font-size: 12px; font-weight: 700;
 		text-align: right; font-variant-numeric: tabular-nums;
 	}
-	.num span { font-size: 11px; color: var(--muted); }
+	.num span { font-size: 10px; color: var(--muted); }
 
 	select {
 		appearance: none;
 		border: 1px solid rgba(79, 124, 255, 0.22);
 		background: var(--accent-soft);
 		color: var(--text);
-		font-size: 12px; font-weight: 650;
-		padding: 8px 30px 8px 12px; border-radius: 10px;
+		font-size: 11.5px; font-weight: 650;
+		padding: 6px 26px 6px 10px; border-radius: 8px;
 		cursor: pointer; outline: none;
 		background-image: linear-gradient(45deg, transparent 50%, var(--accent) 50%), linear-gradient(135deg, var(--accent) 50%, transparent 50%);
-		background-position: calc(100% - 16px) 50%, calc(100% - 11px) 50%;
-		background-size: 5px 5px, 5px 5px;
+		background-position: calc(100% - 14px) 50%, calc(100% - 9px) 50%;
+		background-size: 4px 4px, 4px 4px;
 		background-repeat: no-repeat;
 	}
 
 	/* 开关 */
-	.switch { position: relative; width: 44px; height: 26px; flex: none; }
+	.switch { position: relative; width: 38px; height: 22px; flex: none; }
 	.switch input { opacity: 0; width: 0; height: 0; }
 	.switch span {
 		position: absolute; inset: 0; border-radius: 999px;
@@ -173,35 +192,98 @@
 	}
 	.switch span::after {
 		content: ""; position: absolute; top: 3px; left: 3px;
-		width: 20px; height: 20px; border-radius: 50%;
-		background: #fff; box-shadow: 0 2px 6px rgba(15, 23, 42, 0.25);
+		width: 16px; height: 16px; border-radius: 50%;
+		background: #fff; box-shadow: 0 2px 5px rgba(15, 23, 42, 0.25);
 		transition: transform 0.2s cubic-bezier(0.2, 0.9, 0.3, 1.2);
 	}
 	.switch input:checked + span {
 		background: linear-gradient(135deg, var(--accent), var(--accent2));
 	}
-	.switch input:checked + span::after { transform: translateX(18px); }
+	.switch input:checked + span::after { transform: translateX(16px); }
+	.switch input:disabled + span { opacity: 0.5; cursor: default; }
 
-	/* 摘要 */
-	.summary { display: none; }
-	.chip {
-		font-size: 11px; color: var(--muted);
-		background: var(--card);
-		border: 1px solid var(--card-border);
-		border-radius: 999px; padding: 6px 10px;
+	/* ── 布线层 ── */
+	.layer-row {
+		display: flex; align-items: center; gap: 8px;
+		padding: 4px 0;
+		border-top: 1px dashed var(--card-border);
 	}
-	.chip b { color: var(--text); font-weight: 700; }
+	.layer-row:first-of-type { border-top: 0; }
+	.check {
+		width: 15px; height: 15px; accent-color: var(--accent);
+		cursor: pointer; flex: none;
+	}
+	.check:disabled { cursor: default; opacity: 0.55; }
+	.layer-name { font-size: 12px; font-weight: 600; }
+	.layer-chip {
+		font-size: 10px; font-weight: 600; color: var(--muted);
+		background: var(--track); border-radius: 6px; padding: 2px 6px;
+		font-family: "Cascadia Code", Consolas, monospace;
+	}
+	.layer-main { font-size: 9.5px; font-weight: 700; color: var(--accent); margin-left: auto; }
+	.hint {
+		margin-top: 4px; font-size: 10px; line-height: 1.45; color: var(--faint);
+	}
+
+	/* ── 网络列表 ── */
+	.card.nets { flex: 1; display: flex; flex-direction: column; min-height: 0; }
+	.tools { display: flex; align-items: center; gap: 6px; margin: 5px 0 6px; }
+	.search {
+		flex: 1; min-width: 0;
+		border: 1px solid var(--card-border);
+		background: var(--card);
+		color: var(--text);
+		font-family: inherit; font-size: 11px;
+		padding: 5px 9px; border-radius: 8px; outline: none;
+	}
+	.search:focus { border-color: rgba(79, 124, 255, 0.45); }
+	button.mini {
+		font-family: inherit; font-size: 10px; font-weight: 650;
+		padding: 5px 7px; border-radius: 7px;
+		border: 1px solid var(--card-border);
+		background: transparent; color: var(--muted);
+		cursor: pointer; white-space: nowrap;
+	}
+	button.mini:hover { color: var(--text); background: var(--accent-soft); }
+	.net-list {
+		flex: 1; min-height: 0; overflow-y: auto;
+		border-top: 1px solid var(--card-border);
+		padding-top: 2px;
+	}
+	.net-item {
+		display: grid; grid-template-columns: auto 1fr auto auto;
+		align-items: center; gap: 7px;
+		padding: 4px 3px; border-radius: 6px; cursor: pointer;
+	}
+	.net-item:hover { background: var(--accent-soft); }
+	.net-item.hide { display: none; }
+	.net-name {
+		font-size: 11.5px; font-weight: 560;
+		white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+	}
+	.tag {
+		font-size: 9px; font-weight: 700; padding: 1px 5px; border-radius: 999px;
+		white-space: nowrap;
+	}
+	.tag.gnd { color: #b45309; background: rgba(245, 158, 11, 0.16); }
+	.tag.pwr { color: #b91c1c; background: rgba(239, 68, 68, 0.13); }
+	.tag.sig { color: var(--faint); background: var(--track); }
+	.net-pads {
+		font-size: 9.5px; color: var(--faint); font-variant-numeric: tabular-nums;
+		min-width: 26px; text-align: right;
+	}
+	.empty { padding: 14px 4px; font-size: 11px; color: var(--faint); line-height: 1.6; }
 
 	/* ── 底部 ── */
 	footer {
-		display: flex; align-items: center; gap: 10px;
-		padding: 10px 18px 12px;
+		display: flex; align-items: center; gap: 9px;
+		padding: 8px 16px 10px;
 		background: linear-gradient(to top, var(--bg) 55%, transparent);
 	}
 	.spacer { flex: 1; }
 	button {
-		font-family: inherit; font-size: 13px; font-weight: 650;
-		border-radius: 11px; padding: 10px 16px;
+		font-family: inherit; font-size: 12.5px; font-weight: 650;
+		border-radius: 10px; padding: 8px 14px;
 		cursor: pointer; border: 1px solid transparent;
 		transition: transform 0.12s ease, box-shadow 0.2s ease, opacity 0.2s ease;
 	}
@@ -215,13 +297,13 @@
 		display: inline-flex; align-items: center; gap: 8px;
 		color: #fff; border: 0;
 		background: linear-gradient(135deg, var(--accent), var(--accent2));
-		box-shadow: 0 12px 26px rgba(79, 124, 255, 0.35);
-		padding: 11px 20px;
+		box-shadow: 0 10px 22px rgba(79, 124, 255, 0.32);
+		padding: 9px 18px;
 	}
-	button.primary:hover { box-shadow: 0 16px 32px rgba(79, 124, 255, 0.45); }
+	button.primary:hover { box-shadow: 0 14px 28px rgba(79, 124, 255, 0.42); }
 	button.primary:disabled { opacity: 0.65; cursor: default; box-shadow: none; }
 	.spinner {
-		width: 14px; height: 14px; border-radius: 50%;
+		width: 13px; height: 13px; border-radius: 50%;
 		border: 2px solid rgba(255, 255, 255, 0.4);
 		border-top-color: #fff;
 		display: none;
@@ -232,14 +314,19 @@
 
 	.error-bar {
 		display: none;
-		margin: 0 18px 8px;
+		margin: 0 16px 4px;
 		background: rgba(239, 68, 68, 0.12);
 		border: 1px solid rgba(239, 68, 68, 0.35);
 		color: #ef4444;
-		font-size: 12px; font-weight: 600;
-		padding: 9px 12px; border-radius: 10px;
+		font-size: 11.5px; font-weight: 600;
+		padding: 7px 10px; border-radius: 8px;
 	}
 	.error-bar.show { display: block; }
+	@media (max-width: 740px) {
+		main { grid-template-columns: 1fr; overflow-y: auto; }
+		.col-left { overflow: visible; }
+		.card.nets { min-height: 220px; }
+	}
 </style>
 </head>
 <body>
@@ -247,7 +334,7 @@
 	<header class="hero">
 		<div class="brand">
 			<div class="logo">
-				<svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+				<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
 					<path d="M4 17c4 0 4-10 8-10s4 10 8 10"/>
 					<circle cx="4" cy="17" r="1.6" fill="currentColor"/>
 					<circle cx="20" cy="17" r="1.6" fill="currentColor"/>
@@ -267,132 +354,179 @@
 	<div class="error-bar" id="errorBar"></div>
 
 	<main>
-		<section class="card">
-			<div class="section-title"><span class="dot"></span>走线</div>
+		<!-- 左栏：参数 -->
+		<div class="col col-left">
+			<section class="card">
+				<div class="section-title"><span class="dot"></span>走线</div>
 
-			<div class="row">
-				<div class="label">
-					<span>走线宽度</span>
-					<small>同时影响障碍外扩半径，越宽越难穿插</small>
+				<div class="row">
+					<div class="label">
+						<span>走线宽度</span>
+						<small>同时影响障碍外扩半径，越宽越难穿插</small>
+					</div>
+					<div class="control">
+						<input type="range" id="traceWidthMil" min="4" max="40" step="0.5">
+						<div class="num"><input type="number" id="traceWidthMilNum" min="4" max="40" step="0.5"><span>mil</span></div>
+					</div>
 				</div>
-				<div class="control">
-					<input type="range" id="traceWidthMil" min="4" max="40" step="0.5">
-					<div class="num"><input type="number" id="traceWidthMilNum" min="4" max="40" step="0.5"><span>mil</span></div>
-				</div>
-			</div>
 
-			<div class="row">
-				<div class="label">
-					<span>额外安全间距</span>
-					<small>在 DRC 规则之上再加的余量，0 = 严格按 DRC</small>
+				<div class="row">
+					<div class="label">
+						<span>额外安全间距</span>
+						<small>在 DRC 之上再加的余量，0 = 严格按 DRC</small>
+					</div>
+					<div class="control">
+						<input type="range" id="extraClearanceMil" min="0" max="20" step="0.5">
+						<div class="num"><input type="number" id="extraClearanceMilNum" min="0" max="20" step="0.5"><span>mil</span></div>
+					</div>
 				</div>
-				<div class="control">
-					<input type="range" id="extraClearanceMil" min="0" max="20" step="0.5">
-					<div class="num"><input type="number" id="extraClearanceMilNum" min="0" max="20" step="0.5"><span>mil</span></div>
-				</div>
-			</div>
-		</section>
 
-		<section class="card">
-			<div class="section-title"><span class="dot"></span>焊盘扇出</div>
+				<div class="row">
+					<div class="label">
+						<span>出线额外余量</span>
+						<small>焊盘外再外扩的距离，0 = 贴着焊盘出线</small>
+					</div>
+					<div class="control">
+						<input type="range" id="escapeClearanceMil" min="0" max="40" step="1">
+						<div class="num"><input type="number" id="escapeClearanceMilNum" min="0" max="40" step="1"><span>mil</span></div>
+					</div>
+				</div>
+			</section>
 
-			<div class="row">
-				<div class="label">
-					<span>出线额外余量</span>
-					<small>焊盘边界之外再外扩的距离，0 = 严格按最小距离出线</small>
-				</div>
-				<div class="control">
-					<input type="range" id="escapeClearanceMil" min="0" max="40" step="1">
-					<div class="num"><input type="number" id="escapeClearanceMilNum" min="0" max="40" step="1"><span>mil</span></div>
-				</div>
-			</div>
-		</section>
+			<section class="card">
+				<div class="section-title"><span class="dot"></span>布线策略</div>
 
-		<section class="card">
-			<div class="section-title"><span class="dot"></span>布线策略</div>
+				<div class="row">
+					<div class="label">
+						<span>网络排序</span>
+						<small>自动 = 短连接 → 信号 → 电源 → 地（地最后）</small>
+					</div>
+					<div class="control">
+						<select id="netOrder">
+							<option value="auto" selected>自动规划（推荐）</option>
+							<option value="river">区域束状</option>
+							<option value="shortest">短线优先</option>
+							<option value="longest">长线优先</option>
+							<option value="max-x">从右向左</option>
+							<option value="reverse">反向扫描</option>
+						</select>
+					</div>
+				</div>
 
-			<div class="row">
-				<div class="label">
-					<span>撕毁重布轮数</span>
-					<small>失败网络拆除封路网络后重试的轮数，越大越慢但更容易布通</small>
+				<div class="row">
+					<div class="label">
+						<span>撕毁重布轮数</span>
+						<small>布不通时拆除挡路网络重试的轮数，越大越慢</small>
+					</div>
+					<div class="control">
+						<select id="ripupRounds">
+							<option value="0">关闭</option>
+							<option value="1">1 轮</option>
+							<option value="2">2 轮</option>
+							<option value="3" selected>3 轮</option>
+							<option value="4">4 轮</option>
+							<option value="5">5 轮</option>
+						</select>
+					</div>
 				</div>
-				<div class="control">
-					<select id="ripupRounds">
-						<option value="0">关闭</option>
-						<option value="1">1 轮</option>
-						<option value="2" selected>2 轮</option>
-						<option value="3">3 轮</option>
-						<option value="4">4 轮</option>
-						<option value="5">5 轮</option>
-					</select>
-				</div>
-			</div>
 
-			<div class="row">
-				<div class="label">
-					<span>时间预算</span>
-					<small>超过预算后停止重试；不限时由你随时手动停止</small>
+				<div class="row">
+					<div class="label">
+						<span>时间预算</span>
+						<small>全部网络与优化阶段共用的总时长（不含 PCB 读写）；到期后停止剩余网络，已布走线保留</small>
+					</div>
+					<div class="control">
+						<select id="budgetSec">
+							<option value="300" selected>5 分钟</option>
+							<option value="600">10 分钟</option>
+							<option value="900">15 分钟</option>
+							<option value="0">不限时</option>
+						</select>
+					</div>
 				</div>
-				<div class="control">
-					<select id="budgetSec">
-						<option value="60">60 秒</option>
-						<option value="120">120 秒</option>
-						<option value="300" selected>300 秒</option>
-						<option value="600">600 秒</option>
-						<option value="0">不限时</option>
-					</select>
-				</div>
-			</div>
+			</section>
 
-			<div class="row">
-				<div class="label">
-					<span>电源网络优先</span>
-					<small>GND / VCC / VDD 等网络先布，减少后期封路</small>
-				</div>
-				<div class="control">
-					<label class="switch"><input type="checkbox" id="powerNetsFirst" checked><span></span></label>
-				</div>
-			</div>
+			<section class="card">
+				<div class="section-title"><span class="dot"></span>执行选项</div>
 
-			<div class="row">
-				<div class="label">
-					<span>实时预览</span>
-					<small>每布完一个网络立即刷新到 PCB 画布</small>
+				<div class="row">
+					<div class="label">
+						<span>实时预览</span>
+						<small>每布完一个网络立即刷新画布</small>
+					</div>
+					<div class="control">
+						<label class="switch"><input type="checkbox" id="livePreview" checked><span></span></label>
+					</div>
 				</div>
-				<div class="control">
-					<label class="switch"><input type="checkbox" id="livePreview" checked><span></span></label>
-				</div>
-			</div>
 
-			<div class="row">
-				<div class="label">
-					<span>最后凸包优化</span>
-					<small>先用最短路径保证连通，全部布通后再做端帽/圆角/拉紧优化</small>
+				<div class="row">
+					<div class="label">
+						<span>最后凸包优化</span>
+						<small>全部布通后做端帽/圆角/拉紧</small>
+					</div>
+					<div class="control">
+						<label class="switch"><input type="checkbox" id="finalOptimize" checked><span></span></label>
+					</div>
 				</div>
-				<div class="control">
-					<label class="switch"><input type="checkbox" id="finalOptimize" checked><span></span></label>
-				</div>
-			</div>
 
-			<div class="row">
-				<div class="label">
-					<span>过孔换层兜底</span>
-					<small>顶层布不通的网络，尝试绕到底层并用过孔连接</small>
+				<div class="row">
+					<div class="label">
+						<span>过孔换层兜底</span>
+						<small>同层不通时打孔换层（关闭底层后失效）</small>
+					</div>
+					<div class="control">
+						<label class="switch"><input type="checkbox" id="viaFallback" checked><span></span></label>
+					</div>
 				</div>
-				<div class="control">
-					<label class="switch"><input type="checkbox" id="viaFallback" checked><span></span></label>
-				</div>
-			</div>
-		</section>
+			</section>
+		</div>
 
-		<div class="summary" id="summary"></div>
+		<!-- 右栏：板级设置 -->
+		<div class="col">
+			<section class="card">
+				<div class="section-title"><span class="dot"></span>布线层</div>
+
+				<label class="layer-row">
+					<input type="checkbox" class="check" id="layerTop" checked disabled>
+					<span class="layer-name">顶层</span>
+					<span class="layer-chip" id="layerTopName">F.Cu</span>
+					<span class="layer-main">主布线层</span>
+				</label>
+
+				<label class="layer-row">
+					<input type="checkbox" class="check" id="layerBottom" checked>
+					<span class="layer-name">底层</span>
+					<span class="layer-chip" id="layerBottomName">B.Cu</span>
+				</label>
+				<div class="hint" id="layerHint">双面板可同时使用顶层与底层；关闭底层即单层布线。</div>
+			</section>
+
+			<section class="card nets">
+				<div class="section-title">
+					<span class="dot"></span>布线网络
+					<span class="spacer"></span>
+					<span class="count" id="netCount">读取中…</span>
+				</div>
+
+				<div class="tools">
+					<input class="search" id="netSearch" type="search" placeholder="搜索网络名…" autocomplete="off">
+					<button class="mini" id="selectAll" type="button">全选</button>
+					<button class="mini" id="selectSignal" type="button">仅信号</button>
+					<button class="mini" id="selectNone" type="button">清空</button>
+				</div>
+
+				<div class="net-list" id="netList">
+					<div class="empty">正在读取 PCB 网络…</div>
+				</div>
+			</section>
+		</div>
 	</main>
 
 	<footer>
-		<button class="ghost" id="resetBtn">恢复默认</button>
+		<button class="ghost" id="resetBtn" type="button">恢复默认</button>
 		<div class="spacer"></div>
-		<button class="ghost" id="cancelBtn">取消</button>
-		<button class="primary" id="runBtn">
+		<button class="ghost" id="cancelBtn" type="button">取消</button>
+		<button class="primary" id="runBtn" type="button">
 			<span class="spinner"></span>
 			<span class="txt">开始布线</span>
 		</button>
@@ -407,16 +541,23 @@
 			traceWidthMil: 10,
 			extraClearanceMil: 0,
 			escapeClearanceMil: 0,
-			ripupRounds: 2,
-			powerNetsFirst: true,
+			ripupRounds: 3,
+			powerNetsFirst: false,
 			budgetMs: 300000,
 			livePreview: true,
 			finalOptimize: true,
-			viaFallback: true
+			viaFallback: true,
+			routeLayers: [1, 2],
+			excludeNets: [],
+			netOrder: 'auto'
 		};
 		var defaults = Object.assign({}, DEFAULTS);
 		var responded = false;
 		var hostReady = false;
+		var netRows = [];
+		var netInfo = null;
+		var pendingExcluded = null;
+		var pendingRouteLayers = null;
 
 		var bindings = [
 			['traceWidthMil', 'traceWidthMilNum', function (v) { return v; }],
@@ -438,44 +579,178 @@
 			num.value = String(value);
 		}
 
+		// ── 板级信息（布线层 / 网络清单） ──────────────
+
+		function applyBoardInfo(layers, nets) {
+			if (Array.isArray(layers) && layers.length) {
+				var top = null, bottom = null;
+				for (var i = 0; i < layers.length; i++) {
+					if (layers[i].id === 1) top = layers[i];
+					if (layers[i].id === 2) bottom = layers[i];
+				}
+				if (top) $('layerTopName').textContent = String(top.name).replace(/^顶层\s*/, '') || 'F.Cu';
+				if (bottom) $('layerBottomName').textContent = String(bottom.name).replace(/^底层\s*/, '') || 'B.Cu';
+
+				var bottomUsable = !!bottom && bottom.available !== false;
+				$('layerBottom').disabled = !bottomUsable;
+				$('layerBottom').checked = bottomUsable;
+				$('layerHint').textContent = bottomUsable
+					? '双面板可同时使用顶层与底层；关闭底层即单层布线。'
+					: '单面板：仅顶层可布线，底层不可用。';
+				if (!bottomUsable) $('layerBottom').checked = false;
+			}
+
+			netInfo = Array.isArray(nets) ? nets : null;
+			renderNets(netInfo);
+
+			if (pendingRouteLayers) {
+				applyLayerSelection(pendingRouteLayers);
+				pendingRouteLayers = null;
+			}
+			if (pendingExcluded) {
+				applyNetSelection(pendingExcluded);
+				pendingExcluded = null;
+			}
+			updateNetCount();
+		}
+
+		function renderNets(nets) {
+			var list = $('netList');
+			list.innerHTML = '';
+			netRows = [];
+
+			if (!nets || !nets.length) {
+				var box = document.createElement('div');
+				box.className = 'empty';
+				box.textContent = '未读取到可布线网络（每个网络至少需要 2 个焊盘）。将按全部网络布线。';
+				list.appendChild(box);
+				return;
+			}
+
+			var frag = document.createDocumentFragment();
+			nets.forEach(function (n) {
+				var row = document.createElement('label');
+				row.className = 'net-item';
+				row.title = n.name + ' · ' + n.padCount + ' 个焊盘';
+
+				var input = document.createElement('input');
+				input.type = 'checkbox';
+				input.className = 'check';
+				input.checked = true;
+				input.setAttribute('data-net', n.name);
+
+				var name = document.createElement('span');
+				name.className = 'net-name';
+				name.textContent = n.name;
+
+				var tag = document.createElement('span');
+				if (n.kind === 'ground') { tag.className = 'tag gnd'; tag.textContent = '地'; }
+				else if (n.kind === 'power') { tag.className = 'tag pwr'; tag.textContent = '电源'; }
+				else { tag.className = 'tag sig'; tag.textContent = '信号'; }
+
+				var pads = document.createElement('span');
+				pads.className = 'net-pads';
+				pads.textContent = String(n.padCount);
+
+				row.appendChild(input);
+				row.appendChild(name);
+				row.appendChild(tag);
+				row.appendChild(pads);
+				frag.appendChild(row);
+
+				netRows.push({ name: n.name, kind: n.kind, el: row, input: input });
+			});
+			list.appendChild(frag);
+		}
+
+		function applyLayerSelection(routeLayers) {
+			var useBottom = Array.isArray(routeLayers) ? routeLayers.indexOf(2) >= 0 : true;
+			var box = $('layerBottom');
+			if (!box.disabled) box.checked = useBottom;
+		}
+
+		function applyNetSelection(excluded) {
+			var set = Object.create(null);
+			(excluded || []).forEach(function (name) { set[name] = true; });
+			netRows.forEach(function (r) {
+				r.input.checked = !set[r.name];
+			});
+			updateNetCount();
+		}
+
+		function selectedNets() {
+			return netRows.filter(function (r) { return r.input.checked; });
+		}
+
+		function updateNetCount() {
+			if (!netRows.length) {
+				$('netCount').textContent = netInfo ? '0 个网络' : '全部网络';
+				return;
+			}
+			var on = selectedNets().length;
+			$('netCount').textContent = '已选 ' + on + '/' + netRows.length +
+				(on < netRows.length ? ' · 排除 ' + (netRows.length - on) : '');
+		}
+
+		// ── 参数读写 ──────────────────────────────
+
 		function applyOptions(o) {
 			setNumberPair('traceWidthMil', 'traceWidthMilNum', o.traceWidthMil);
 			setNumberPair('extraClearanceMil', 'extraClearanceMilNum', o.extraClearanceMil);
 			setNumberPair('escapeClearanceMil', 'escapeClearanceMilNum', o.escapeClearanceMil);
 			$('ripupRounds').value = String(o.ripupRounds);
-			$('budgetSec').value = String(Math.round(o.budgetMs / 1000));
-			$('powerNetsFirst').checked = !!o.powerNetsFirst;
+			var budgetSec = Math.round((Number(o.budgetMs) || 0) / 1000);
+			if (budgetSec !== 0 && budgetSec !== 300 && budgetSec !== 600 && budgetSec !== 900) {
+				// 旧版本可能保存过 60/120 秒等值：归入最近的档位
+				budgetSec = budgetSec >= 750 ? 900 : budgetSec >= 450 ? 600 : 300;
+			}
+			$('budgetSec').value = String(budgetSec);
+			$('netOrder').value = o.netOrder || 'auto';
 			$('livePreview').checked = o.livePreview !== false;
 			$('finalOptimize').checked = o.finalOptimize !== false;
 			$('viaFallback').checked = o.viaFallback !== false;
-			updateSummary();
+
+			if (netRows.length) {
+				applyNetSelection(o.excludeNets || []);
+				applyLayerSelection(o.routeLayers || [1, 2]);
+			} else {
+				pendingExcluded = o.excludeNets || [];
+				pendingRouteLayers = o.routeLayers || [1, 2];
+			}
+			updateLayerState();
 		}
 
 		function collect() {
+			var layers = [1];
+			if ($('layerBottom').checked && !$('layerBottom').disabled) layers.push(2);
 			return {
 				traceWidthMil: clamp($('traceWidthMilNum').value, 4, 40),
 				extraClearanceMil: clamp($('extraClearanceMilNum').value, 0, 20),
 				escapeClearanceMil: clamp($('escapeClearanceMilNum').value, 0, 40),
 				ripupRounds: parseInt($('ripupRounds').value, 10) || 0,
-				powerNetsFirst: $('powerNetsFirst').checked,
+				powerNetsFirst: false,
 				budgetMs: (parseInt($('budgetSec').value, 10) || 0) * 1000,
 				livePreview: $('livePreview').checked,
 				finalOptimize: $('finalOptimize').checked,
-				viaFallback: $('viaFallback').checked
+				viaFallback: $('viaFallback').checked,
+				routeLayers: layers,
+				// 没有网络清单时不要误排除任何网络
+				excludeNets: netRows.length
+					? netRows.filter(function (r) { return !r.input.checked; }).map(function (r) { return r.name; })
+					: [],
+				netOrder: $('netOrder').value
 			};
 		}
 
-		function updateSummary() {
-			var o = collect();
-			var chips = [
-				'<span class="chip">线宽 <b>' + o.traceWidthMil + '</b> mil</span>',
-				'<span class="chip">撕毁重布 <b>' + (o.ripupRounds > 0 ? o.ripupRounds + ' 轮' : '关闭') + '</b></span>',
-				'<span class="chip">' + (o.livePreview ? '实时预览' : '完成后写入') + '</span>',
-				'<span class="chip">' + (o.finalOptimize ? '最后凸包优化' : '仅连通') + '</span>',
-				'<span class="chip">' + (o.viaFallback ? '允许过孔换层' : '仅单层') + '</span>'
-			];
-			$('summary').innerHTML = chips.join('');
+		function updateLayerState() {
+			var single = $('layerBottom').disabled || !$('layerBottom').checked;
+			$('viaFallback').disabled = single;
+			if (single) {
+				$('viaFallback').checked = false;
+			}
 		}
+
+		// ── 通信 ──────────────────────────────────
 
 		function ready() {
 			try {
@@ -489,38 +764,51 @@
 			try { if (window.top && window.top !== parent) window.top.postMessage(payload, '*'); } catch (e) { /* ignore */ }
 		}
 
-		// 滑杆与数字输入双向同步
+		// ── 事件绑定 ──────────────────────────────
+
 		bindings.forEach(function (b) {
 			var range = $(b[0]);
 			var num = $(b[1]);
 			range.addEventListener('input', function () {
 				num.value = range.value;
-				updateSummary();
 			});
 			num.addEventListener('input', function () {
 				if (num.value === '' || num.value === '-') return;
 				var lo = Number(range.min), hi = Number(range.max);
 				range.value = String(clamp(num.value, lo, hi));
-				updateSummary();
 			});
 			num.addEventListener('blur', function () {
 				var lo = Number(range.min), hi = Number(range.max);
 				var v = clamp(num.value, lo, hi);
 				num.value = String(v);
 				range.value = String(v);
-				updateSummary();
 			});
 		});
 
-		$('ripupRounds').addEventListener('change', updateSummary);
-		$('budgetSec').addEventListener('change', updateSummary);
-		$('powerNetsFirst').addEventListener('change', updateSummary);
-		$('livePreview').addEventListener('change', updateSummary);
-		$('finalOptimize').addEventListener('change', updateSummary);
-		$('viaFallback').addEventListener('change', updateSummary);
+		$('layerBottom').addEventListener('change', updateLayerState);
+		$('netSearch').addEventListener('input', function () {
+			var q = this.value.trim().toLowerCase();
+			netRows.forEach(function (r) {
+				r.el.classList.toggle('hide', !!q && r.name.toLowerCase().indexOf(q) < 0);
+			});
+		});
+
+		$('selectAll').addEventListener('click', function () {
+			netRows.forEach(function (r) { r.input.checked = true; });
+			updateNetCount();
+		});
+		$('selectSignal').addEventListener('click', function () {
+			netRows.forEach(function (r) { r.input.checked = r.kind === 'signal'; });
+			updateNetCount();
+		});
+		$('selectNone').addEventListener('click', function () {
+			netRows.forEach(function (r) { r.input.checked = false; });
+			updateNetCount();
+		});
 
 		$('resetBtn').addEventListener('click', function () {
 			applyOptions(defaults);
+			updateLayerState();
 		});
 
 		$('cancelBtn').addEventListener('click', function () {
@@ -544,6 +832,7 @@
 					$('versionBadge').textContent = 'v' + data.version;
 				}
 				defaults = Object.assign({}, DEFAULTS, data.options || {});
+				applyBoardInfo(data.layers, data.nets);
 				applyOptions(defaults);
 				$('errorBar').classList.remove('show');
 			} else if (data.type === 'error') {
@@ -568,6 +857,7 @@
 		var placeholder = '__RB_' + 'VERSION__';
 		if (badge.textContent.indexOf(placeholder) >= 0) badge.textContent = 'v-dev';
 		applyOptions(defaults);
+		updateLayerState();
 	})();
 </script>
 </body>

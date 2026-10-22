@@ -35,8 +35,8 @@ export interface PlanOptions {
 	optimize?: boolean;
 	/** 兼容旧参数：新算法始终使用「焊盘中心 → 最短路 → 焊盘中心」 */
 	directConnect?: boolean;
-	/** 网络排序：river/ reverse / max-x / longest / shortest */
-	netOrder?: 'river' | 'reverse' | 'max-x' | 'longest' | 'shortest';
+	/** 网络排序：auto（专业自动规划）/ river / reverse / max-x / longest / shortest */
+	netOrder?: 'auto' | 'river' | 'reverse' | 'max-x' | 'longest' | 'shortest';
 	/** 失败网络允许过孔换层（底层布线）兜底 */
 	allowViaFallback?: boolean;
 }
@@ -123,6 +123,27 @@ export interface PlanningResult {
 }
 
 const CLR_EPS = 0.05;
+
+/**
+ * 地网络识别：GND / VSS 及其常见前缀变体（AGND、DGND、PGND、SGND、
+ * GND_1、SIGNAL_GND、CHASSIS_GND ...），以及 0V / 地 / EARTH。
+ * 地网络要最后布，识别错一个都可能把后布网络封死。
+ */
+export function isGroundNetName(name: string): boolean {
+	const upper = name.trim().toUpperCase();
+	if (!upper) return false;
+	if (upper === '0V' || upper === '地' || upper === 'EARTH') return true;
+	return /(^|[_\-. /])(A|D|P|S|CHASSIS)?(GND|VSS)([_\-. 0-9]|$)/.test(upper);
+}
+
+/** 电源网络（不含地）：VCC/VDD/VBAT/VBUS/VIN/VOUT/VREF/PWR、+3V3、3V3、-5V 等 */
+export function isPowerNetName(name: string): boolean {
+	if (isGroundNetName(name)) return false;
+	const upper = name.trim().toUpperCase();
+	if (!upper) return false;
+	return /^(VCC|VDD|VBAT|VBUS|VIN|VOUT|VREF|PWR|VSYS)([_\-. 0-9]|$)/.test(upper) ||
+		/^[+-]\d/.test(upper) || /^\d+V\d*$/.test(upper);
+}
 
 function getRoutingLayer(pad1: EnginePad, pad2: EnginePad): number {
 	const l1 = pad1.layer, l2 = pad2.layer;
@@ -249,10 +270,10 @@ export class PlanningEngine {
 		const budgetMs = input.budgetMs ?? 0;
 		const deadline = budgetMs > 0 ? Date.now() + budgetMs : Number.POSITIVE_INFINITY;
 
-		// 网络排序（电源优先，其余按 netOrder 指定的策略）
+		// 网络排序（auto = 专业自动规划；地网络永远最后）
 		const networks = this.sortNetworks(input.networks);
 
-		this.log(`网络顺序（${this.planOptions.netOrder ?? 'river'}）：${networks.map(n => n.name).join(' → ')}`, 'info');
+		this.log(`网络顺序（${this.planOptions.netOrder ?? 'auto'}）：${networks.map(n => n.name).join(' → ')}`, 'info');
 		const pendingNets: Array<{ name: string; pads: EnginePad[] }> = [];
 
 		// 第一轮：逐网络布线
@@ -271,7 +292,7 @@ export class PlanningEngine {
 		}
 
 		// 多轮撕毁重布
-		const ripupRounds = Math.max(0, Math.round(this.planOptions.ripupRounds ?? 2));
+		const ripupRounds = Math.max(0, Math.round(this.planOptions.ripupRounds ?? 3));
 		for (let pass = 0; pass < ripupRounds && pendingNets.length; pass++) {
 			if (this.checkCancelled()) break;
 			if (Date.now() > deadline) {
@@ -387,45 +408,75 @@ export class PlanningEngine {
 	/**
 	 * 网络排序：布线顺序直接决定绕路总量与拓扑美观度。
 	 *
-	 * 默认 river（河流式）：先按 minX 升序把同源的「扇形束」聚在一起，
-	 * 束内从内层网络到外层网络逐条布设。这样每条网络下潜时前方都是
-	 * 处女地，沿前一条兄弟网络的通道贴边同行，阶梯逐级向外生长；
-	 * 各束之间也互不交错。反之若按总长等全局指标排序，束会交错展开，
-	 * 外层网络先布会封死内层网络的出口（出口一旦被封，内层只能
-	 * 绕远路甚至打孔换层）—— 这是绕路和多余过孔的主因。
+	 * auto（默认，按 PCB 布局专业规则自动规划）分四层：
+	 *  0. 短小两焊盘连接 —— 可动空间最小，先布最稳（如串阻、去耦短线）；
+	 *  1. 一般信号 —— 区域内按 river 束状排序，同源扇出逐级向外嵌套；
+	 *  2. 电源（非地）—— 走线通常较宽、跨距大，放在信号之后；
+	 *  3. 地（GND / VSS / AGND / DGND ...）—— **永远最后布**。地网络焊盘多、
+	 *     覆盖全板，先布会像围墙一样把后来的信号全部封死；最后布时其余网络
+	 *     已经定型，地网络再沿剩余通道或底层收尾。
+	 *
+	 * 无论用户选哪种显式顺序，地网络都保持在最后 —— 这是硬约束。
+	 * 显式几何顺序仍可指定 river / shortest / longest / max-x / reverse，
+	 * 层内比较规则与 river 相同（按 minX 聚束），只是全局扫描方向不同。
 	 */
 	private sortNetworks(nets: Array<{ name: string; pads: EnginePad[] }>): Array<{ name: string; pads: EnginePad[] }> {
-		const mode = this.planOptions.netOrder ?? 'river';
+		const mode = this.planOptions.netOrder ?? 'auto';
 		const span = (n: { name: string; pads: EnginePad[] }) => {
 			const edges = this.computeMST(n.pads);
 			let total = 0;
 			for (const [i, j] of edges) total += Math.hypot(n.pads[i].x - n.pads[j].x, n.pads[i].y - n.pads[j].y);
 			return total;
 		};
+		const allX = nets.flatMap(n => n.pads.map(p => p.x));
+		const allY = nets.flatMap(n => n.pads.map(p => p.y));
+		const boardDiag = allX.length
+			? Math.hypot(Math.max(...allX) - Math.min(...allX), Math.max(...allY) - Math.min(...allY))
+			: 0;
+		const shortLimit = boardDiag * 0.22;
+
 		const keyed = nets.map(n => {
 			const xs = n.pads.map(p => p.x);
+			const len = span(n);
+			const ground = this.isGroundNet(n.name);
+			const power = !ground && this.isPowerNet(n.name);
+			let tier: number;
+			if (mode === 'auto') {
+				tier = ground ? 3 : power ? 2 : (n.pads.length === 2 && len <= shortLimit ? 0 : 1);
+			} else {
+				// 显式顺序：地网络硬性最后；powerNetsFirst 仅作为旧参数兼容
+				tier = ground ? 3 : (this.planOptions.powerNetsFirst !== false && power ? 0 : 1);
+			}
 			return {
 				net: n,
 				minX: Math.min(...xs),
 				maxX: Math.max(...xs),
-				len: span(n),
+				len,
+				tier,
+				ground,
 			};
 		});
 		keyed.sort((a, b) => {
-			if (this.planOptions.powerNetsFirst !== false) {
-				const isPowerA = this.isPowerNet(a.net.name), isPowerB = this.isPowerNet(b.net.name);
-				if (isPowerA && !isPowerB) return -1;
-				if (!isPowerA && isPowerB) return 1;
-			}
+			if (a.tier !== b.tier) return a.tier - b.tier;
 			switch (mode) {
 				case 'longest': return b.len - a.len;
 				case 'shortest': return a.len - b.len;
 				case 'max-x': return b.maxX - a.maxX;
 				case 'reverse': return b.maxX - a.maxX || b.minX - a.minX;
 				case 'river':
+				case 'auto':
 				default: return a.minX - b.minX || a.maxX - b.maxX;
 			}
 		});
+
+		if (mode === 'auto') {
+			const count = (t: number) => keyed.filter(k => k.tier === t).length;
+			this.log(
+				`自动规划：短连接 ${count(0)} → 一般信号 ${count(1)} → 电源 ${count(2)} → 地 ${count(3)}` +
+				(count(3) ? '（地网络最后布，避免先布封路）' : ''),
+				'info',
+			);
+		}
 		return keyed.map(k => k.net);
 	}
 
@@ -446,12 +497,12 @@ export class PlanningEngine {
 		this.callbacks.onProgress?.(percentage, message);
 	}
 
+	private isGroundNet(name: string): boolean {
+		return isGroundNetName(name);
+	}
+
 	private isPowerNet(name: string): boolean {
-		const upper = name.toUpperCase();
-		return upper === 'GND' || upper === 'VCC' || upper === 'VDD' ||
-			upper.startsWith('GND') || upper.startsWith('VCC') ||
-			upper.startsWith('VDD') || upper.startsWith('PWR') ||
-			upper.startsWith('+') || upper.startsWith('-');
+		return isPowerNetName(name);
 	}
 
 	/** Prim MST：网络内连接顺序 */
@@ -1191,7 +1242,7 @@ export class PlanningEngine {
 	 *  5. 组内总长变短才接受，否则整组回滚
 	 */
 	private async resolveContention(networks: Array<{ name: string; pads: EnginePad[] }>): Promise<void> {
-		const maxIter = Math.max(0, Math.round(this.planOptions.ripupRounds ?? 2)) + 2;
+		const maxIter = Math.max(0, Math.round(this.planOptions.ripupRounds ?? 3)) + 2;
 		const soloCache = new Map<string, { prims: RBPrimitive[]; length: number } | null>();
 		const soloOf = async (name: string) => {
 			if (soloCache.has(name)) return soloCache.get(name)!;

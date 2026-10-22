@@ -17,10 +17,12 @@ import { DRCRules, fetchDRCRules, applyRouterOptionsToDRC } from './drc-rules';
 import {
 	PlanningEngine, PlanningInput, PlanningResult,
 	RenderedPrim, PlannedVia, PadShape, EnginePad,
-	mergePrims,
+	mergePrims, isGroundNetName, isPowerNetName,
 } from './planning-engine';
 import { createPlanningWorker } from './worker-source';
-import { RouterUiOptions, RouteStats, RouteSummary } from '../types/router-params';
+import {
+	RouterUiOptions, RouteStats, RouteSummary, BoardInspection,
+} from '../types/router-params';
 import { RoutingProgress } from '../types';
 
 export type ProgressCallback = (progress: RoutingProgress) => void;
@@ -193,6 +195,63 @@ export class TopologicalRouter {
 		return 2;
 	}
 
+	/**
+	 * 参数弹窗打开时读取板级信息：可用铜层与可布线网络清单。
+	 *
+	 * 只做只读枚举，不修改画布；取不到时退回「顶层 + 底层」的保守清单。
+	 */
+	async inspectBoard(): Promise<BoardInspection> {
+		let layers: BoardInspection['layers'] = [
+			{ id: 1, name: '顶层 F.Cu', available: true },
+			{ id: 2, name: '底层 B.Cu', available: true },
+		];
+		try {
+			const all = await eda.pcb_Layer.getAllLayers();
+			const copper = (all || []).filter((l: any) => l?.type === 'SIGNAL' && l.layerStatus === 1);
+			if (copper.length >= 1) {
+				const top = copper.find((l: any) => l.id === 1);
+				const bottom = copper.find((l: any) => l.id === 2);
+				layers = [{
+					id: 1,
+					name: top?.name ? `顶层 ${top.name}` : '顶层 F.Cu',
+					available: true,
+				}];
+				if (bottom) {
+					layers.push({ id: 2, name: `底层 ${bottom.name}`, available: true });
+				}
+			}
+		} catch { /* 保持保守清单 */ }
+
+		const nets: BoardInspection['nets'] = [];
+		try {
+			const names = await eda.pcb_Net.getAllNetsName();
+			for (const name of names || []) {
+				try {
+					const primitives = await eda.pcb_Net.getAllPrimitivesByNet(name);
+					let padCount = 0;
+					for (const prim of primitives || []) {
+						const p = prim as any;
+						if (p.type !== undefined && p.type !== 1) continue;
+						const x = p.center?.x ?? p.x ?? p.startX ?? 0;
+						const y = p.center?.y ?? p.y ?? p.startY ?? 0;
+						if (x === 0 && y === 0 && !p.center) continue;
+						padCount++;
+					}
+					if (padCount >= 2) {
+						nets.push({
+							name,
+							padCount,
+							kind: isGroundNetName(name) ? 'ground' : (isPowerNetName(name) ? 'power' : 'signal'),
+						});
+					}
+				} catch { /* 单个网络读取失败不影响其它 */ }
+			}
+		} catch { /* 无网络时返回空清单 */ }
+		nets.sort((a, b) => a.name.localeCompare(b.name, 'zh-CN', { numeric: true }));
+
+		return { layers, nets };
+	}
+
 	/** 收集静态铜层障碍（折线/线条/填充/板框），不含焊盘 */
 	private async collectStaticObstacles(drc: DRCRules): Promise<RBObstacle[]> {
 		const obstacles: RBObstacle[] = [];
@@ -290,17 +349,27 @@ export class TopologicalRouter {
 		this.worker = null;
 		this.engine = null;
 		this.forceFinish = null;
-		this.netPrimIds.clear();
-		this.touchedNets.clear();
-		this.netGeom.clear();
-		this.pendingPlanned.clear();
-		this.routedNames.clear();
-		this.failedNames.clear();
-		this.padShapeCache.clear();
-		this.applyQueue = Promise.resolve();
-		this.totalNets = 0;
 
 		try {
+			// 重新布线：先清理上一轮由本扩展写入画布的图元。否则旧走线会在本轮
+			// 被 collectStaticObstacles 当成静态障碍，迫使新走线绕行甚至叠画。
+			if (this.netPrimIds.size || this.touchedNets.size) {
+				const previous = new Set([...this.netPrimIds.keys(), ...this.touchedNets]);
+				this.onProgress?.({ stage: '清理画布', percentage: 2, message: '正在清理上一轮走线...' });
+				for (const name of previous) await this.deleteNet(name);
+				this.onLog?.(`重新布线：已清理上一轮 ${previous.size} 个网络的走线`, 'info');
+			}
+
+			this.netPrimIds.clear();
+			this.touchedNets.clear();
+			this.netGeom.clear();
+			this.pendingPlanned.clear();
+			this.routedNames.clear();
+			this.failedNames.clear();
+			this.padShapeCache.clear();
+			this.applyQueue = Promise.resolve();
+			this.totalNets = 0;
+
 			this.onProgress?.({ stage: '读取规则', percentage: 3, message: '正在读取 DRC 间距规则...' });
 			const drcBase = await fetchDRCRules(this.onLog);
 			const drc = applyRouterOptionsToDRC(drcBase, options);
@@ -328,11 +397,28 @@ export class TopologicalRouter {
 			this.onProgress?.({ stage: '构建障碍', percentage: 15, message: '正在构建障碍物...' });
 			const staticObstacles = await this.collectStaticObstacles(drc);
 
-			const networks = Array.from(padMap.entries()).map(([name, pads]) => ({ name, pads }));
+			// 用户排除的网络不参与规划：焊盘仍保留在 allPads 里作为障碍，
+			// 已有走线也仍由 collectStaticObstacles 当作静态铜处理，不做任何删改。
+			const excluded = new Set(options.excludeNets ?? []);
+			const networks = Array.from(padMap.entries())
+				.filter(([name]) => !excluded.has(name))
+				.map(([name, pads]) => ({ name, pads }));
+			if (excluded.size) {
+				this.onLog?.(`按设置排除 ${Array.from(excluded).filter(n => padMap.has(n)).length} 个网络`, 'info');
+			}
+			if (networks.length === 0) throw new Error('所有网络都被排除，没有可布线的网络');
 			this.totalNets = networks.length;
 
 			const padShapes: Record<string, PadShape> = {};
 			for (const [key, value] of this.padShapeCache) padShapes[key] = value;
+
+			// 布线层设置：当前引擎只有顶层（1）与底层（2）。关闭底层即单层布线，
+			// 同时禁用一切过孔换层路径；底层不存在时以实际板层为准。
+			const detectedLayers = await this.detectCopperLayers();
+			const bottomEnabled = (options.routeLayers ?? [1, 2]).includes(2) && detectedLayers >= 2;
+			if (!bottomEnabled && detectedLayers >= 2) {
+				this.onLog?.('按设置仅使用顶层布线（底层已关闭）', 'info');
+			}
 
 			const input: PlanningInput = {
 				drc,
@@ -341,7 +427,7 @@ export class TopologicalRouter {
 				staticObstacles,
 				padShapes,
 				budgetMs: options.budgetMs,
-				copperLayers: await this.detectCopperLayers(),
+				copperLayers: bottomEnabled ? detectedLayers : 1,
 				options: {
 					// 首轮只求连通；连通完成后再做中心到中心最短路拉紧优化
 					connectivityFirst: true,
@@ -350,6 +436,7 @@ export class TopologicalRouter {
 					escapeClearanceMil: options.escapeClearanceMil,
 					ripupRounds: options.ripupRounds,
 					powerNetsFirst: options.powerNetsFirst,
+					netOrder: options.netOrder,
 				},
 			};
 

@@ -51,11 +51,11 @@
 			var(--bg);
 		overflow: hidden;
 	}
-	.app { height: 100%; display: grid; grid-template-rows: auto auto auto auto 1fr auto; gap: 12px; padding: 18px 20px 16px; }
+	.app { height: 100%; display: grid; grid-template-rows: auto auto auto auto 1fr auto; gap: 9px; padding: 12px 14px 12px; }
 
 	/* ── 顶部状态 ── */
-	.top { display: flex; align-items: center; justify-content: space-between; gap: 14px; }
-	.status { display: flex; align-items: center; gap: 12px; min-width: 0; }
+	.top { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+	.status { display: flex; align-items: center; gap: 10px; min-width: 0; }
 	.pulse {
 		position: relative; width: 12px; height: 12px; border-radius: 50%;
 		background: var(--accent); flex: none;
@@ -70,45 +70,45 @@
 		100% { box-shadow: 0 0 0 0 rgba(79, 124, 255, 0); }
 	}
 	.title-wrap { min-width: 0; }
-	h1 { margin: 0; font-size: 17px; font-weight: 700; letter-spacing: 0.2px; }
+	h1 { margin: 0; font-size: 15.5px; font-weight: 700; letter-spacing: 0.2px; }
 	.subtitle {
-		margin: 3px 0 0; font-size: 12px; color: var(--muted);
+		margin: 2px 0 0; font-size: 11.5px; color: var(--muted);
 		white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
 		max-width: 430px;
 	}
-	.top-right { display: flex; align-items: center; gap: 8px; }
+	.top-right { display: flex; align-items: center; gap: 7px; }
 	.version {
-		font-size: 11px; font-weight: 650; color: var(--faint);
+		font-size: 10.5px; font-weight: 650; color: var(--faint);
 		background: var(--card); border: 1px solid var(--card-border);
-		padding: 7px 9px; border-radius: 9px;
+		padding: 5px 8px; border-radius: 8px;
 	}
 	.timer {
-		font-size: 13px; font-weight: 700; color: var(--muted);
+		font-size: 12px; font-weight: 700; color: var(--muted);
 		font-variant-numeric: tabular-nums;
 		background: var(--card); border: 1px solid var(--card-border);
-		padding: 8px 12px; border-radius: 10px;
+		padding: 6px 10px; border-radius: 9px;
 		box-shadow: var(--shadow);
 	}
 
 	/* ── 进度条 ── */
 	.progress-card {
 		background: var(--card); border: 1px solid var(--card-border);
-		border-radius: 16px; box-shadow: var(--shadow);
-		padding: 14px 16px 16px;
+		border-radius: 13px; box-shadow: var(--shadow);
+		padding: 10px 12px 11px;
 	}
 	.progress-head {
 		display: flex; align-items: baseline; justify-content: space-between;
-		margin-bottom: 9px;
+		margin-bottom: 7px;
 	}
 	.percent {
-		font-size: 26px; font-weight: 800; letter-spacing: -0.5px;
+		font-size: 22px; font-weight: 800; letter-spacing: -0.5px;
 		background: linear-gradient(135deg, var(--accent), var(--accent2));
 		-webkit-background-clip: text; background-clip: text; color: transparent;
 		font-variant-numeric: tabular-nums;
 	}
-	.stage { font-size: 12px; font-weight: 600; color: var(--muted); }
+	.stage { font-size: 11.5px; font-weight: 600; color: var(--muted); }
 	.bar {
-		height: 9px; border-radius: 999px; background: var(--track);
+		height: 7px; border-radius: 999px; background: var(--track);
 		overflow: hidden; position: relative;
 	}
 	.fill {
@@ -128,37 +128,51 @@
 	@keyframes shimmer { to { transform: translateX(100%); } }
 
 	/* ── 统计 ── */
-	.stats { display: grid; grid-template-columns: repeat(4, 1fr); gap: 10px; }
+	.stats { display: grid; grid-template-columns: 1.25fr repeat(4, 1fr); gap: 8px; }
 	.stat {
 		background: var(--card); border: 1px solid var(--card-border);
-		border-radius: 14px; box-shadow: var(--shadow);
-		padding: 11px 12px; text-align: center;
+		border-radius: 11px; box-shadow: var(--shadow);
+		padding: 8px 6px; text-align: center;
 	}
 	.stat b {
-		display: block; font-size: 20px; font-weight: 800;
+		display: block; font-size: 17px; font-weight: 800;
 		font-variant-numeric: tabular-nums; letter-spacing: -0.3px;
 	}
-	.stat span { display: block; margin-top: 3px; font-size: 11px; color: var(--faint); font-weight: 600; }
+	.stat span { display: block; margin-top: 2px; font-size: 10px; color: var(--faint); font-weight: 600; }
+	.stat.rate {
+		background: linear-gradient(160deg, rgba(16, 185, 129, 0.14), var(--card) 70%);
+		border-color: rgba(16, 185, 129, 0.28);
+	}
+	.stat.rate b { color: var(--success); font-size: 19px; }
+	.rate-bar {
+		height: 4px; border-radius: 999px; background: var(--track);
+		overflow: hidden; margin: 5px 3px 0;
+	}
+	.rate-bar i {
+		display: block; height: 100%; width: 0%;
+		border-radius: 999px; background: linear-gradient(90deg, #10b981, #34d399);
+		transition: width 0.35s cubic-bezier(0.2, 0.8, 0.2, 1);
+	}
 
 	/* ── 日志 ── */
 	.log-head {
 		display: flex; align-items: center; justify-content: space-between;
-		font-size: 11px; font-weight: 700; letter-spacing: 0.5px;
+		font-size: 10.5px; font-weight: 700; letter-spacing: 0.5px;
 		color: var(--muted); text-transform: uppercase;
 		padding: 0 4px;
 	}
 	.log-head span { color: var(--faint); font-weight: 600; letter-spacing: 0; text-transform: none; }
 	.log {
 		background: var(--log-bg);
-		border-radius: 14px;
+		border-radius: 11px;
 		border: 1px solid rgba(148, 163, 184, 0.16);
 		box-shadow: var(--shadow);
 		overflow-y: auto;
-		padding: 10px 12px;
+		padding: 8px 10px;
 		font-family: "Cascadia Code", "JetBrains Mono", Consolas, "SFMono-Regular", monospace;
-		font-size: 11.5px; line-height: 1.65;
+		font-size: 11px; line-height: 1.55;
 		color: var(--log-text);
-		min-height: 120px;
+		min-height: 84px;
 	}
 	.log::-webkit-scrollbar { width: 8px; }
 	.log::-webkit-scrollbar-thumb { background: rgba(148, 163, 184, 0.25); border-radius: 999px; }
@@ -176,8 +190,8 @@
 	footer { display: flex; align-items: center; gap: 10px; }
 	.spacer { flex: 1; }
 	button {
-		font-family: inherit; font-size: 13px; font-weight: 650;
-		border-radius: 11px; padding: 10px 16px;
+		font-family: inherit; font-size: 12px; font-weight: 650;
+		border-radius: 9px; padding: 7px 12px;
 		cursor: pointer; border: 1px solid transparent;
 		transition: transform 0.12s ease, box-shadow 0.2s ease, opacity 0.2s ease;
 	}
@@ -194,7 +208,14 @@
 		box-shadow: 0 12px 26px rgba(79, 124, 255, 0.35);
 	}
 	button.primary:hover { box-shadow: 0 16px 32px rgba(79, 124, 255, 0.45); }
+	button.ghost {
+		background: var(--card); color: var(--muted);
+		border-color: var(--card-border);
+	}
+	button.ghost:hover { color: var(--text); background: var(--card); }
 	button:disabled { opacity: 0.55; cursor: default; }
+	button.primary:disabled { box-shadow: none; }
+	button.primary:disabled:hover { box-shadow: none; }
 	.hidden { display: none !important; }
 </style>
 </head>
@@ -223,6 +244,11 @@
 	</div>
 
 	<div class="stats">
+		<div class="stat rate">
+			<b id="rate">0%</b>
+			<span id="rateSub">布通 0/0</span>
+			<div class="rate-bar"><i id="rateFill"></i></div>
+		</div>
 		<div class="stat"><b id="routed">0</b><span>已布网络</span></div>
 		<div class="stat"><b id="failed">0</b><span>失败网络</span></div>
 		<div class="stat"><b id="segments">0</b><span>走线段</span></div>
@@ -235,7 +261,9 @@
 	<footer>
 		<button class="danger" id="stopBtn">停止布线</button>
 		<div class="spacer"></div>
-		<button class="primary hidden" id="closeBtn">关闭窗口</button>
+		<button class="ghost" id="settingsBtn" disabled>布线设置</button>
+		<button class="primary" id="rerunBtn" disabled>重新布线</button>
+		<button class="ghost hidden" id="closeBtn">关闭窗口</button>
 	</footer>
 </div>
 
@@ -314,7 +342,13 @@
 
 		function setStats(stats) {
 			if (!stats) return;
-			$('routed').textContent = String(stats.routedNets || 0);
+			var total = Number(stats.totalNets) || 0;
+			var routed = Number(stats.routedNets) || 0;
+			var rate = total > 0 ? Math.round((routed / total) * 100) : 0;
+			$('rate').textContent = rate + '%';
+			$('rateSub').textContent = '布通 ' + routed + '/' + total;
+			$('rateFill').style.width = rate + '%';
+			$('routed').textContent = String(routed);
 			$('failed').textContent = String(stats.failedNets || 0);
 			$('segments').textContent = String(stats.segments || 0);
 			$('vias').textContent = String(stats.vias || 0);
@@ -334,12 +368,21 @@
 			$('title').textContent = title;
 		}
 
+		/** 布线中：只能停止；结束后：可重新布线 / 打开设置 / 关闭 */
+		function setControls(running) {
+			$('stopBtn').classList.toggle('hidden', !running);
+			$('stopBtn').disabled = false;
+			$('stopBtn').textContent = '停止布线';
+			$('closeBtn').classList.toggle('hidden', running);
+			$('settingsBtn').disabled = running;
+			$('rerunBtn').disabled = running;
+		}
+
 		function finish(summary, errorMessage) {
 			finished = true;
 			stopTimer();
 			$('bar').classList.add('idle');
-			$('stopBtn').classList.add('hidden');
-			$('closeBtn').classList.remove('hidden');
+			setControls(false);
 
 			if (errorMessage) {
 				setState('error', '布线失败');
@@ -378,6 +421,20 @@
 			post({ type: 'close' });
 		});
 
+		$('rerunBtn').addEventListener('click', function () {
+			if (!finished) return;
+			// 立即锁住按钮，等待主线程回送 begin
+			$('rerunBtn').disabled = true;
+			$('settingsBtn').disabled = true;
+			$('subtitle').textContent = '正在重新布线...';
+			post({ type: 'rerun' });
+		});
+
+		$('settingsBtn').addEventListener('click', function () {
+			if (!finished) return;
+			post({ type: 'openSettings' });
+		});
+
 		window.addEventListener('message', function (event) {
 			var data = event && event.data;
 			if (!data || data.source !== 'rb-host') return;
@@ -385,6 +442,12 @@
 			switch (data.type) {
 				case 'begin':
 					if (data.version) $('version').textContent = 'v' + data.version;
+					// 重新布线：把上一轮的完成态复位成运行态
+					finished = false;
+					$('bar').classList.remove('idle');
+					setState('running', '正在布线');
+					setProgress(0, '正在初始化...', '准备中');
+					setControls(true);
 					startedAt = data.startedAt || Date.now();
 					startTimer();
 					$('timer').textContent = elapsedText();
