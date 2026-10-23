@@ -314,6 +314,60 @@ export function capsuleToCircles(
 }
 
 /**
+ * POLYGON 焊盘形状 → 等效 RECT（w×h + 旋转角，度）。
+ *
+ * 部分封装库（如 STM32F407 的 LQFP144）把矩形焊盘存成绝对坐标多边形：
+ * `["POLYGON", [x0,y0,"L",x1,y1,...]]`，顶点质心恰为焊盘中心。
+ * 旧解析把 shape[1]（顶点数组）当宽度、shape[2]（undefined）当高度，
+ * padShapeToCircles 产出 NaN 障碍圆、padShapeDistance 返回 NaN ——
+ * 这些焊盘在障碍模型里整体「隐形」，QFP 引脚排成排失守。
+ *
+ * 归一化：解析顶点（跳过 "L"/"A" 指令标记）→ 质心回零 → 按最长边方向
+ * 旋转到主轴 → 轴对齐包围盒。旋转矩形焊盘（4 顶点）结果精确；
+ * 一般多边形为保守近似。返回 null 表示不可解析。
+ */
+export function polygonToRect(shape: any[]): { w: number; h: number; rotationDeg: number } | null {
+	const raw = Array.isArray(shape[1]) ? shape[1] : null;
+	if (!raw) return null;
+	const pts: Array<{ x: number; y: number }> = [];
+	for (let i = 0; i + 1 < raw.length; i++) {
+		if (typeof raw[i] === 'number' && typeof raw[i + 1] === 'number') {
+			pts.push({ x: raw[i], y: raw[i + 1] });
+			i++;
+		}
+	}
+	// 闭合多边形的首尾重复顶点只算一次
+	if (pts.length >= 2) {
+		const f = pts[0], l = pts[pts.length - 1];
+		if (Math.abs(f.x - l.x) < 0.01 && Math.abs(f.y - l.y) < 0.01) pts.pop();
+	}
+	if (pts.length < 3) return null;
+	let cx = 0, cy = 0;
+	for (const p of pts) { cx += p.x; cy += p.y; }
+	cx /= pts.length; cy /= pts.length;
+	// 主轴 = 最长边方向（矩形焊盘的长边即长轴）
+	let bestLen2 = -1, theta = 0;
+	for (let i = 0; i < pts.length; i++) {
+		const q = pts[(i + 1) % pts.length];
+		const ex = q.x - pts[i].x, ey = q.y - pts[i].y;
+		const l2 = ex * ex + ey * ey;
+		if (l2 > bestLen2) { bestLen2 = l2; theta = Math.atan2(ey, ex); }
+	}
+	const cosT = Math.cos(-theta), sinT = Math.sin(-theta);
+	let minX = Infinity, maxX = -Infinity, minY = Infinity, maxY = -Infinity;
+	for (const p of pts) {
+		const px = p.x - cx, py = p.y - cy;
+		const rx = px * cosT - py * sinT;
+		const ry = px * sinT + py * cosT;
+		if (rx < minX) minX = rx;
+		if (rx > maxX) maxX = rx;
+		if (ry < minY) minY = ry;
+		if (ry > maxY) maxY = ry;
+	}
+	return { w: maxX - minX, h: maxY - minY, rotationDeg: (theta * 180) / Math.PI };
+}
+
+/**
  * 焊盘物理轮廓 → 圆群（未膨胀），unit: mil。
  *
  * 长焊盘（OVAL/RECT 胶囊）用「两端帽圆 + 密集侧向填充圆」表示：
@@ -325,11 +379,21 @@ export function capsuleToCircles(
 export function padShapeToCircles(
 	pad: { pad: any[]; hole?: any[] | null; rotation?: number },
 ): Array<{ x: number; y: number; r: number; blockerOnly?: boolean }> {
-	const shape = Array.isArray(pad.pad) ? pad.pad : [];
+	const rawShape = Array.isArray(pad.pad) ? pad.pad : [];
+	// POLYGON（绝对坐标顶点）先归一化成 RECT：顶点已含旋转，pad.rotation 不再叠加
+	let shape = rawShape;
+	let rotationDeg = pad.rotation ?? 0;
+	if (String(rawShape[0] ?? '').toUpperCase() === 'POLYGON') {
+		const rect = polygonToRect(rawShape);
+		if (!rect) return [];
+		shape = ['RECT', rect.w, rect.h];
+		rotationDeg = rect.rotationDeg;
+	}
 	const w = shape[1] ?? 0;
 	const h = shape[2] ?? 0;
 	const shapeName = String(shape[0] ?? 'ELLIPSE').toUpperCase();
-	const rot = ((pad.rotation ?? 0) * Math.PI) / 180;
+	// NaN 防御：非有限尺寸一律按无铜皮处理（返回孔圆），不让 NaN 流进障碍集
+	const rot = ((rotationDeg ?? 0) * Math.PI) / 180;
 	const cosR = Math.cos(rot), sinR = Math.sin(rot);
 	const rotAll = (arr: Array<{ x: number; y: number; r: number; blockerOnly?: boolean }>) =>
 		arr.map(c => {
@@ -345,28 +409,47 @@ export function padShapeToCircles(
 	// 通孔焊盘的铜皮外形仍按 pad 形状建模：孔只影响钻孔，不应缩小铜皮障碍。
 	// （旧逻辑把带孔焊盘一律当圆，RECT 角部会漏出 ~1mil，造成贴边 DRC）
 	const hole = pad.hole;
-	if (w === 0 || h === 0) {
+	// !(w > 0) 同时拦住 0 / NaN（NaN 与任何比较均为 false，=== 0 拦不住）
+	if (!(w > 0) || !(h > 0)) {
 		const r = Array.isArray(hole) && hole.length >= 2 ? Math.max(0, hole[1] ?? 0) / 2 : 0;
 		return r > 0 ? [{ x: 0, y: 0, r }] : [];
 	}
 
-	if (shapeName === 'RECT' && Math.abs(w - h) <= Math.min(w, h) * 0.3) {
-		// 近方形矩形焊盘：3 圆体覆盖主体 + 4 角圆覆盖角部
-		// （外接圆会封死相邻焊盘间隙；3 圆体的角部外露会造成 TH Pad 违规）
-		const rBody = w / 2;
-		const out = [
-			{ x: 0, y: h / 2 - rBody, r: rBody },
-			{ x: 0, y: 0, r: rBody },
-			{ x: 0, y: -(h / 2 - rBody), r: rBody },
-		];
-		const k = 0.65; // 角圆中心内缩系数
-		for (const sx of [-1, 1]) {
-			for (const sy of [-1, 1]) {
-				const cxp = (sx * w) / 2 * k;
-				const cyp = (sy * h) / 2 * k;
-				const rc = (1 - k) * Math.hypot(w / 2, h / 2);
-				out.push({ x: cxp, y: cyp, r: rc });
+	if (shapeName === 'RECT' || shapeName === 'ROUNDRECT') {
+		if (Math.abs(w - h) <= Math.min(w, h) * 0.3) {
+			// 近方形矩形焊盘：3 圆体覆盖主体 + 4 角圆覆盖角部
+			// （外接圆会封死相邻焊盘间隙；3 圆体的角部外露会造成 TH Pad 违规）
+			const rBody = w / 2;
+			const out = [
+				{ x: 0, y: h / 2 - rBody, r: rBody },
+				{ x: 0, y: 0, r: rBody },
+				{ x: 0, y: -(h / 2 - rBody), r: rBody },
+			];
+			const k = 0.65; // 角圆中心内缩系数
+			for (const sx of [-1, 1]) {
+				for (const sy of [-1, 1]) {
+					const cxp = (sx * w) / 2 * k;
+					const cyp = (sy * h) / 2 * k;
+					const rc = (1 - k) * Math.hypot(w / 2, h / 2);
+					out.push({ x: cxp, y: cyp, r: rc });
+				}
 			}
+			return rotAll(out);
+		}
+		// 长条矩形/圆角矩形（FPC、连接器焊盘常见）：主体按胶囊 + 两端各一个角圆。
+		// 胶囊会漏掉矩形角部（23.4×77.5 焊盘角外露 ~17.8mil，走线贴角造成
+		// SMD Pad↔Track 间距违规）。角圆取端帽圆心、半径 = 短半边·√2：边界
+		// 恰好过 4 个角点并完整盖住短边；横向比焊盘宽 ~0.21×短边（保守方向，
+		// 把本就过不了 DRC 的窄缝正确堵死）。blockerOnly：只做碰撞判定，
+		// 不产生切点（切线可能切进焊盘中段）。
+		const out = capsuleOutline(w, h);
+		const rCorner = (Math.min(w, h) / 2) * Math.SQRT2;
+		const halfC = Math.max(w, h) / 2 - Math.min(w, h) / 2;
+		const vertical = h >= w;
+		for (const s of [-1, 1]) {
+			out.push(vertical
+				? { x: 0, y: s * halfC, r: rCorner, blockerOnly: true }
+				: { x: s * halfC, y: 0, r: rCorner, blockerOnly: true });
 		}
 		return rotAll(out);
 	}
@@ -383,11 +466,21 @@ export function padShapeDistance(
 	pad: { pad: any[]; hole?: any[] | null; rotation?: number },
 	dx: number, dy: number,
 ): number {
-	const shape = Array.isArray(pad.pad) ? pad.pad : [];
+	const rawShape = Array.isArray(pad.pad) ? pad.pad : [];
+	// POLYGON（绝对坐标顶点）先归一化成 RECT：顶点已含旋转，pad.rotation 不再叠加
+	let shape = rawShape;
+	let rotationDeg = pad.rotation ?? 0;
+	if (String(rawShape[0] ?? '').toUpperCase() === 'POLYGON') {
+		const rect = polygonToRect(rawShape);
+		if (!rect) return Math.hypot(dx, dy);
+		shape = ['RECT', rect.w, rect.h];
+		rotationDeg = rect.rotationDeg;
+	}
 	const w = shape[1] ?? 0, h = shape[2] ?? 0;
 	const shapeName = String(shape[0] ?? 'ELLIPSE').toUpperCase();
-	if (w <= 0 || h <= 0) return Math.hypot(dx, dy);
-	const rot = ((pad.rotation ?? 0) * Math.PI) / 180;
+	// !(w > 0) 同时拦住 0 / NaN：NaN 尺寸按无铜皮处理（点到焊盘距离=欧氏距离）
+	if (!(w > 0) || !(h > 0)) return Math.hypot(dx, dy);
+	const rot = ((rotationDeg ?? 0) * Math.PI) / 180;
 	const cosR = Math.cos(rot), sinR = Math.sin(rot);
 	const lx = dx * cosR + dy * sinR;
 	const ly = -dx * sinR + dy * cosR;
@@ -740,17 +833,28 @@ export function padExitModel(
 	sideHint: { x: number; y: number },
 ): PadExitModel | null {
 	const shape = Array.isArray(pad.pad) ? pad.pad : [];
-	const w = shape[1] ?? 0;
-	const h = shape[2] ?? 0;
+	let w = shape[1] ?? 0;
+	let h = shape[2] ?? 0;
+	let rotation = pad.rotation ?? 0;
 	const shapeName = String(shape[0] ?? 'ELLIPSE').toUpperCase();
-	// 通孔圆焊盘：无轴向
-	if (Array.isArray(pad.hole) && pad.hole.length >= 2 && pad.hole[1] > 0) return null;
-	// 长宽比不足：无明确轴向
+	if (shapeName === 'POLYGON') {
+		// 绝对坐标顶点归一化成 RECT：铜皮轮廓才是出线依据，封装里常见的
+		// 微小钻孔标记（如 LQFP144 的 8.5mil 孔）不否定轴向
+		const rect = polygonToRect(shape);
+		if (!rect) return null;
+		w = rect.w;
+		h = rect.h;
+		rotation = rect.rotationDeg;
+	} else if (Array.isArray(pad.hole) && pad.hole.length >= 2 && pad.hole[1] > 0) {
+		// 通孔圆焊盘：无轴向
+		return null;
+	}
+	// 长宽比不足：无明确轴向（!isFinite 拦住 NaN，NaN 与任何比较均为 false）
 	const longAx = Math.max(w, h), shortAx = Math.min(w, h);
-	if (longAx < shortAx * 1.4 || shortAx < 1e-6) return null;
+	if (!Number.isFinite(longAx) || longAx < shortAx * 1.4 || shortAx < 1e-6) return null;
 
 	// 长轴方向：本地 +Y 旋转 rotation 度（EDA 角度约定：逆时针为正）
-	const rot = ((pad.rotation ?? 0) * Math.PI) / 180;
+	const rot = (rotation * Math.PI) / 180;
 	// 本地长轴：h >= w 时沿 Y，否则沿 X
 	let axLocal: number, ayLocal: number;
 	if (h >= w) { axLocal = 0; ayLocal = 1; } else { axLocal = 1; ayLocal = 0; }

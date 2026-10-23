@@ -57,6 +57,8 @@ export interface PadEdgeOptions {
 	filletRadiusMil?: number;
 	/** 候选点相对焊盘边界的外扩余量（mil） */
 	marginMil?: number;
+	/** 外部取消探针：VR 求解的协作让出点轮询，「停止布线」立即生效 */
+	isCancelled?: () => boolean;
 }
 
 export interface PadEdgeResult {
@@ -244,6 +246,7 @@ export async function routePadEdge(
 		dstCands.map(c => ({ x: c.x, y: c.y, cost: c.length })),
 		routeObs, net, expands, opts.budgetMs,
 		{ x: src.x, y: src.y }, { x: dst.x, y: dst.y },
+		opts.isCancelled,
 	);
 	if (!res.ok || !res.src || !res.dst) return { ok: false, prims: [], length: 0 };
 

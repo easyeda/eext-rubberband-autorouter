@@ -274,7 +274,7 @@
 		<div class="spacer"></div>
 		<button class="ghost" id="settingsBtn" disabled>布线设置</button>
 		<button class="primary" id="rerunBtn" disabled>重新布线</button>
-		<button class="ghost hidden" id="closeBtn">关闭窗口</button>
+		<button class="ghost" id="closeBtn">关闭窗口</button>
 	</footer>
 </div>
 
@@ -386,12 +386,11 @@
 			$('title').textContent = title;
 		}
 
-		/** 布线中：只能停止；结束后：可重新布线 / 打开设置 / 关闭 */
+		/** 布线中：可停止 / 关闭窗口（关窗不取消布线）；结束后：可重新布线 / 打开设置 / 关闭 */
 		function setControls(running) {
 			$('stopBtn').classList.toggle('hidden', !running);
 			$('stopBtn').disabled = false;
 			$('stopBtn').textContent = '停止布线';
-			$('closeBtn').classList.toggle('hidden', running);
 			$('settingsBtn').disabled = running;
 			$('rerunBtn').disabled = running;
 		}

@@ -238,11 +238,13 @@ export async function routeConnection(
 	net = '',
 	expands: number[] = [150, 500],
 	budgetMs: number = SOLVE_BUDGET_MS,
+	isCancelled?: () => boolean,
 ): Promise<RouteConnectionResult> {
 	const res = await routeBetweenEndpoints(
 		[{ x: src.x, y: src.y, cost: 0 }],
 		[{ x: dst.x, y: dst.y, cost: 0 }],
 		obstacles, net, expands, budgetMs,
+		undefined, undefined, isCancelled,
 	);
 	return { ok: res.ok, prims: res.prims };
 }
@@ -251,6 +253,9 @@ export async function routeConnection(
  * 多端点寻路：源/目标各一组候选点，求「引出段 + 路径 + 引入段」总长最小的走线。
  *
  * refA/refB：走廊剪枝用的参考线段（通常是两焊盘中心）；缺省用首个候选点。
+ * isCancelled：外部取消探针 —— 在每个协作让出点轮询（≤16ms 粒度），
+ * 取消后立即放弃求解。没有它，「停止布线」要等当前边整条兜底链
+ * （直连×2 + 边界候选 + 底层 + 过孔候选，预算 3s×N）烧完才能停。
  */
 export async function routeBetweenEndpoints(
 	srcCands: RouteEndpoint[],
@@ -261,6 +266,7 @@ export async function routeBetweenEndpoints(
 	budgetMs: number = SOLVE_BUDGET_MS,
 	refA?: { x: number; y: number },
 	refB?: { x: number; y: number },
+	isCancelled?: () => boolean,
 ): Promise<CandidateRouteResult> {
 	if (!srcCands.length || !dstCands.length) return { ok: false, prims: [] };
 	// 圆障碍列表（胶囊兜底转为圆群）
@@ -309,9 +315,15 @@ export async function routeBetweenEndpoints(
 		// 每一级之间主动让出，保证 EDA 主线程始终可响应
 		if (ei > 0) await yieldToHost();
 
+		if ((globalThis as any).__RB_DEBUG__) {
+			const wr = subset.filter(o => !o.blockerOnly).length;
+			const np = subset.filter(o => o.noPrune).length;
+			console.log(`[VR][dbg] 走廊级别${ei} expand=${expand}: 子集=${subset.length} 可绕=${wr} noPrune=${np}`);
+		}
+
 		const deadline = Date.now() + budgetMs;
 		(globalThis as any).__RB_PHASE__ = 'vr:solve';
-		const res = await solveMulti(srcCands, dstCands, subset, net, deadline);
+		const res = await solveMulti(srcCands, dstCands, subset, net, deadline, isCancelled);
 		(globalThis as any).__RB_PHASE__ = 'vr:validate';
 		if (res.ok && await validatePrimsAgainst(res.prims, all, net)) return res;
 	}
@@ -378,7 +390,12 @@ async function solveMulti(
 	obstacles: RBObstacle[],
 	net = '',
 	deadline: number = Date.now() + SOLVE_BUDGET_MS,
+	isCancelled?: () => boolean,
 ): Promise<CandidateRouteResult> {
+	// 取消探针：每个协作让出点轮询一次（异常安全）
+	const cancelled = (): boolean => {
+		try { return isCancelled?.() === true; } catch { return false; }
+	};
 	// 拆分：可绕行圆（建图）与纯阻挡圆（填充内部网格 / 焊盘自身轮廓，只参与碰撞检查）
 	const circles: RBObstacle[] = [];
 	const blockers: RBObstacle[] = [];
@@ -434,6 +451,7 @@ async function solveMulti(
 				lastYield = now;
 				await yieldToHost();
 			}
+			if (cancelled()) { timedOut = true; break; }
 		}
 		for (let j = i + 1; j < n; j++) {
 			if ((j & 31) === 0) {
@@ -443,6 +461,7 @@ async function solveMulti(
 					lastYield = now;
 					await yieldToHost();
 				}
+				if (cancelled()) { timedOut = true; break; }
 			}
 			const cj = circles[j];
 			if (net && cj.net === net && !cj.forceBlock) continue;
@@ -506,6 +525,7 @@ async function solveMulti(
 				lastYield = now;
 				await yieldToHost();
 			}
+			if (cancelled()) return { ok: false, prims: [] };
 		}
 		const pts = ptsByCircle[i];
 		if (pts.length < 2) continue;
@@ -593,6 +613,7 @@ async function solveMulti(
 				lastYield = now;
 				await yieldToHost();
 			}
+			if (cancelled()) return { ok: false, prims: [] };
 		}
 		const top = heapPop();
 		if (!top) break;
@@ -620,6 +641,32 @@ async function solveMulti(
 	if (bestDst < 0) {
 		if ((globalThis as any).__RB_VERBOSE__) {
 			console.log(`[VR] 无路径: wrappable=${n} blockers=${blockers.length} nodes=${total} src=${S} dst=${D}`);
+		}
+		if ((globalThis as any).__RB_DEBUG__) {
+			// 诊断 1：src 终端的合法切线数（0 = 图内即被封死）
+			for (let i = 0; i < S; i++) console.log(`[VR][dbg] src#${i}(${nodes[i].x.toFixed(0)},${nodes[i].y.toFixed(0)}) 邻接=${nodes[i].adj.length}`);
+			// 诊断 2：从 src 出发的 BFS 可达分量范围
+			const seen = new Array<boolean>(total).fill(false);
+			const q: number[] = [];
+			for (let i = 0; i < S; i++) { seen[i] = true; q.push(i); }
+			for (let h = 0; h < q.length; h++) for (const e of nodes[q[h]].adj) if (!seen[e.to]) { seen[e.to] = true; q.push(e.to); }
+			let mnx = Infinity, mxx = -Infinity, mny = Infinity, mxy = -Infinity, withCircle = 0;
+			for (const v of q) {
+				if (nodes[v].circle < 0) continue;
+				withCircle++;
+				mnx = Math.min(mnx, nodes[v].x); mxx = Math.max(mxx, nodes[v].x);
+				mny = Math.min(mny, nodes[v].y); mxy = Math.max(mxy, nodes[v].y);
+			}
+			console.log(`[VR][dbg] 可达=${q.length}/${total} 切点圆=${withCircle}/${n} bbox=(${mnx.toFixed(0)},${mny.toFixed(0)})→(${mxx.toFixed(0)},${mxy.toFixed(0)})`);
+			// 诊断 3：直连线上压着的圆（按距离排序 top8，看是谁封的路）
+			const onLine = everything
+				.map((c, k) => ({ c, d: pointSegDist(c.x, c.y, nodes[0].x, nodes[0].y, nodes[S].x, nodes[S].y) }))
+				.filter(e => e.d < e.c.r + 2)
+				.sort((a, b) => a.d - b.d)
+				.slice(0, 8);
+			for (const e of onLine) {
+				console.log(`[VR][dbg] 挡线: (${e.c.x.toFixed(0)},${e.c.y.toFixed(0)})r${e.c.r.toFixed(1)} net=${e.c.net ?? '-'} L${e.c.layer ?? '*'} block=${!!e.c.blockerOnly} noPrune=${!!e.c.noPrune} 距=${e.d.toFixed(1)}`);
+			}
 		}
 		return { ok: false, prims: [] };
 	}

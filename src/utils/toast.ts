@@ -32,5 +32,7 @@ export function showError(message: string): void {
  * @param message - 提示消息
  */
 export function showWarning(message: string): void {
-	eda.sys_ToastMessage.showMessage(message, 'warning');
+	// ESYS_ToastMessageType.WARNING 的值是 'warn'（不是 'warning'）——
+	// 传错枚举值 EDA 不识别，吐司背景色会退化成默认样式
+	eda.sys_ToastMessage.showMessage(message, 'warn');
 }

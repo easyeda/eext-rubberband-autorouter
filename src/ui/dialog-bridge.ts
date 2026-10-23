@@ -26,6 +26,10 @@ const DIALOG_ID_PREFIX = 'rb-dialog-';
  * 在沙箱里可能为 undefined，回退到 window.innerWidth 会拿到错误尺寸，
  * 表现为 x/y 失效或弹窗仍出现在中间）。
  *
+ * 已知 API bug（2026-10-23，客户端 4.1.84 实测）：openIFrame 的 props.x/y
+ * 被客户端忽略——任意 id、任意 x/y（含 0,0）都落在同一级联默认位。
+ * 这里照常传坐标：API 修复后贴边定位自动生效，无需再改代码。
+ *
  * 取不到视口尺寸时返回空对象，让 EDA 使用默认居中位置。
  */
 export function rightEdgePosition(width: number, height: number): { x?: number; y?: number } {

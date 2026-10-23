@@ -170,6 +170,57 @@ export class TopologicalRouter {
 			}
 		}
 
+		// 无网络焊盘（NC 脚、安装孔、屏蔽框脚、半孔工艺脚……）不是可布线对象，
+		// 但铜皮真实存在：EDA 的 DRC 照查间距，走线/过孔压上去就是 0mil 违规
+		//（实测 FPC 空脚、电流表 U2 NC 脚十余处 min=0.0mil）。上面的
+		// getAllPrimitivesByNet 按网络枚举永远拿不到它们，这里从
+		// pcb_PrimitivePad.getAll() 补齐：只进 allPads 当障碍（net=''），
+		// 不进 padMap（无网络不可布线）。
+		try {
+			const seenNetless = new Set(allPads.map(p => `${p.x.toFixed(2)},${p.y.toFixed(2)}`));
+			const padPrims = await eda.pcb_PrimitivePad.getAll();
+			let netlessAdded = 0;
+			for (const sp of padPrims) {
+				const p = sp as any;
+				const net: string = p.net ?? p.netName ?? '';
+				if (net) continue;   // 有网络的焊盘已在上面按网络枚举收集
+				const x: number = p.x ?? p.center?.x ?? 0;
+				const y: number = p.y ?? p.center?.y ?? 0;
+				if (!x && !y) continue;
+				const key = `${x.toFixed(2)},${y.toFixed(2)}`;
+				if (seenNetless.has(key)) continue;
+				seenNetless.add(key);
+				const padShape = Array.isArray(p.pad) ? p.pad : [];
+				let wMil = padShape.length >= 3 ? (padShape[1] ?? 0) : 0;
+				let hMil = padShape.length >= 3 ? (padShape[2] ?? 0) : 0;
+				const hole = p.hole;
+				const holeMil = Array.isArray(hole) && hole.length >= 2 ? (hole[1] ?? 0) : 0;
+				if (wMil === 0 && hMil === 0) { wMil = 32; hMil = 34; }
+				const rawLayer: number = p.layerId ?? p.layer ?? 1;
+				// TH 判定只认 layer 12：层 1/2 SMD 带封装库干扰小孔（如 LQFP 的
+				// hole=8.5mil 假孔）不是通孔，误判会把它挤出 SMD 出线候选名单
+				let padType: 'th' | 'smd' | 'via' = 'smd';
+				if (rawLayer === 12) padType = 'th';
+				else if (p.isVia || p.type === 'via') padType = 'via';
+				let layer: number = rawLayer;
+				if (padType === 'smd' && (rawLayer === 12 || rawLayer > 2)) layer = 1;
+				allPads.push({
+					x, y, net: '', id: p.globalIndex || p.uuid || `netless_${allPads.length}`,
+					layer, padType, holeDiameter: holeMil,
+					radius: Math.max(wMil / 2, hMil / 2, holeMil / 2),
+					bodyRadius: Math.max(Math.min(wMil, hMil) / 2, holeMil / 2),
+					rotation: p.rotation ?? 0,
+					index: allPads.length,
+				});
+				netlessAdded++;
+			}
+			if (netlessAdded) {
+				this.onLog?.(`补充 ${netlessAdded} 个无网络焊盘作为障碍（NC 脚/安装孔等，DRC 照查间距）`, 'info');
+			}
+		} catch (err) {
+			console.warn('[TopologicalRouter] 无网络焊盘收集失败:', err);
+		}
+
 		this.onLog?.(`解析完成：${allPads.length} 个焊盘，${padMap.size} 个可布线网络`, 'info');
 		return { padMap, allPads };
 	}
