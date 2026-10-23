@@ -11,7 +11,7 @@
 import {
 	RBObstacle, RBPrimitive, capsuleToCircles,
 	buildPolylineObstacle,
-	pointSegDist, padExitModel, padShapeToCircles, padShapeDistance,
+	pointSegDist, padExitModel, padShapeToCircles, padShapeDistance, fanoutFillet,
 } from './rubberband-engine';
 import { routeConnection } from './visibility-router';
 import { buildExitCandidates, routePadEdge, stubFeasible, PadTerminal } from './edge-router';
@@ -333,7 +333,9 @@ export class PlanningEngine {
 			const net = networks[ni];
 			const pct = 20 + Math.floor((ni / networks.length) * 55);
 			this.progress(pct, `布线网络 ${ni + 1}/${networks.length}: ${net.name}`);
-			const ok = await this.routeNetEdges(net);
+			// 第一遍·线段级快扫：先把「一布就通」的边全部收割（不追求单网
+			// 完整再下一网）；有剩余边的网进入撕毁重布/兜底轮做全链收尾
+			const ok = await this.routeNetEdges(net, 'quick');
 			if (!ok) pendingNets.push(net);
 		}
 
@@ -372,7 +374,13 @@ export class PlanningEngine {
 					}
 				}
 				const rip = this.routedOrder.filter(n => seals.has(n)).slice(-3);
-				if (!rip.length) { next.push(net); continue; }
+				if (!rip.length) {
+					// 快扫遗留：未被封口的网补一次完整链尝试（快扫只试直连，
+					// 这些网还没享受过边界候选退避/换层链）；仍失败才顺延
+					const rok = await this.routeNetEdges(net);
+					if (!rok) next.push(net);
+					continue;
+				}
 				this.log(`第 ${pass + 1} 轮：网络 ${net.name} 撕毁 ${rip.join(', ')} 重试`, 'warn');
 				// 快照被撕网络的原走线：本动作绝不净损失已布网络——
 				// 任一被撕网重布失败即整体回滚到动作前的已知好状态
@@ -1153,8 +1161,17 @@ export class PlanningEngine {
 		return { total: net.pads.length, routed };
 	}
 
-	/** 布一个网络的全部 MST 连接（纯规划；单条失败不再丢弃整网已布部分） */
-	private async routeNetEdges(net: { name: string; pads: EnginePad[] }): Promise<boolean> {
+	/**
+	 * 布一个网络的全部 MST 连接（纯规划；单条失败不再丢弃整网已布部分）。
+	 *
+	 * mode：
+	 *  - 'quick'：线段级快扫 —— 每条边只试最便宜的单层直连（两级走廊在
+	 *    同一次求解里），失败立即放弃此边，绝不烧退避/换层链。全网先扫完
+	 *    一遍收割「一布就通」的边（用户策略：先完成能完成的，不追求单网
+	 *    完整再下一网）。
+	 *  - 'full'：完整链（边界候选退避 + 底层 + 过孔换层候选），收尾轮用。
+	 */
+	private async routeNetEdges(net: { name: string; pads: EnginePad[] }, mode: 'full' | 'quick' = 'full'): Promise<boolean> {
 		const drc = this.drc;
 		const edges = this.computeMST(net.pads);
 		const edgeKey = (si: number, di: number) => `${net.pads[si].id}->${net.pads[di].id}`;
@@ -1183,7 +1200,12 @@ export class PlanningEngine {
 			let rendered: RenderedPrim[] | null = null;
 			const edgeVias: PlannedVia[] = [];
 
-			if (crossLayerSmd && !this.allowViaInPad) {
+			if (mode === 'quick') {
+				// 快扫只求直连；跨层 SMD 对必须过孔换层（无单层路径），留给收尾轮
+				if (crossLayerSmd && !this.allowViaInPad) continue;
+				rendered = await this.directEdgeRoute(src, dst, net.name, routingLayer);
+				if (!rendered) continue;
+			} else if (crossLayerSmd && !this.allowViaInPad) {
 				// 顶层 SMD 引出段 + 焊盘外过孔 + 底层路径；不会在任一焊盘上打孔
 				const viaCand = await this.viaEdgeCandidate(src, dst, net.name);
 				if (viaCand) {
@@ -1202,16 +1224,18 @@ export class PlanningEngine {
 
 				rendered = topSolution;
 
-				// 并排焊盘（连接器/IC 引脚排）：中部焊盘沿排法向先冲出引脚区再走
-				// 最短路，给侧边焊盘留出平行出线走廊 —— 直连最短路的出线方向自由，
-				// 常贴着排向滑出，把侧边焊盘唯一的出口封死。预留出线略长（≤35%）
-				// 也采纳：走廊价值不在长度。
+				// 并排焊盘（连接器/IC 引脚排）：仅当直连的出线方向贴着排向滑出
+				//（会封死侧边焊盘唯一的垂直出口）时，改走法向预留出线；出线本来
+				// 就垂直于排的直连保持原样 —— 切线出发拐角天然平滑，也省一次求解
 				const srcRow = this.rowInfo.get(src.id);
 				if (srcRow && srcRow.depth > 0.4) {
-					const stubSol = await this.rowEscapeRoute(src, dst, srcRow, net.name, routingLayer);
-					if (stubSol && (!rendered || renderedLength(stubSol) < renderedLength(rendered) * 1.35 + 20)) {
-						topSolution = stubSol;
-						rendered = stubSol;
+					const hugsRow = !rendered || this.exitHugsRow(rendered[0], src, srcRow);
+					if (hugsRow) {
+						const stubSol = await this.rowEscapeRoute(src, dst, srcRow, net.name, routingLayer);
+						if (stubSol && (!rendered || renderedLength(stubSol) < renderedLength(rendered) * 1.35 + 20)) {
+							topSolution = stubSol;
+							rendered = stubSol;
+						}
 					}
 				}
 
@@ -1428,14 +1452,43 @@ export class PlanningEngine {
 			if (!stubFeasible(term, ex, ey, obs, netName)) continue;
 			const r = await routeConnection({ x: ex, y: ey }, { x: other.x, y: other.y }, obs, netName, [150, 500], 3000);
 			if (!r.ok || !r.prims.length) continue;
-			return [
+			const prims: RenderedPrim[] = [
 				{ kind: 'line', net: netName, layer, x1: pad.x, y1: pad.y, x2: ex, y2: ey },
 				...r.prims.map(pr => pr.kind === 'line'
 					? { kind: 'line' as const, net: netName, layer, x1: pr.x1, y1: pr.y1, x2: pr.x2, y2: pr.y2 }
 					: { kind: 'arc' as const, net: netName, layer, cx: pr.cx, cy: pr.cy, r: pr.r, startAngle: pr.startAngle, sweep: pr.sweep }),
 			];
+			// 引出段→路径首段的拐点圆角（G1 切线过渡）：预留出线与后续路径
+			// 常呈大角度拐弯，直角/尖角既难看又挤占侧边焊盘的出线净空
+			const head = prims.length >= 2 && prims[0].kind === 'line' && prims[1].kind === 'line'
+				? fanoutFillet(
+					{ x1: prims[0].x1!, y1: prims[0].y1!, x2: prims[0].x2!, y2: prims[0].y2! },
+					{ x1: prims[1].x1!, y1: prims[1].y1!, x2: prims[1].x2!, y2: prims[1].y2! },
+					Math.min(24, this.drc.traceWidthMil * 3),
+				)
+				: null;
+			return head ? [...(head.prims as RenderedPrim[]), ...prims.slice(2)] : prims;
 		}
 		return null;
+	}
+
+	/** 首段出线方向是否贴着排向滑出（|dot| > 0.5·|dir|）—— 会封死同排侧边焊盘的垂直出口 */
+	private exitHugsRow(first: RenderedPrim, pad: EnginePad, row: { dx: number; dy: number }): boolean {
+		let dx = 0, dy = 0;
+		if (first.kind === 'line') {
+			dx = (first.x2 ?? 0) - (first.x1 ?? 0);
+			dy = (first.y2 ?? 0) - (first.y1 ?? 0);
+		} else {
+			// 弧：起点沿弧前进 1/4 段的弦方向
+			const a0 = first.startAngle ?? 0;
+			const a1 = a0 + (first.sweep ?? 0) * 0.25;
+			const cx = first.cx ?? 0, cy = first.cy ?? 0, r = first.r ?? 0;
+			dx = cx + r * Math.cos(a1) - (cx + r * Math.cos(a0));
+			dy = cy + r * Math.sin(a1) - (cy + r * Math.sin(a0));
+		}
+		const len = Math.hypot(dx, dy);
+		if (len < 1e-6) return true;   // 零长首段（罕见）：按贴排处理
+		return Math.abs(dx * row.dx + dy * row.dy) > len * 0.5;
 	}
 
 	/**
@@ -1584,13 +1637,21 @@ export class PlanningEngine {
 			grid.sort((p, q) => rank(p) - rank(q) || p.d - q.d);
 			const good = grid.filter(s => s.kind !== 'router').slice(0, 6);
 			for (const g of good) {
-				out.push({
-					x: g.x, y: g.y,
-					stub: g.kind === 'line' ? lineStub(g.x, g.y) : [
-						{ kind: 'line', net: netName, layer: 1, x1: pad.x, y1: pad.y, x2: g.bend!.x, y2: g.bend!.y },
-						{ kind: 'line', net: netName, layer: 1, x1: g.bend!.x, y1: g.bend!.y, x2: g.x, y2: g.y },
-					],
-				});
+				let stub: RenderedPrim[];
+				if (g.kind === 'line') {
+					stub = lineStub(g.x, g.y);
+				} else {
+					const s1: RenderedPrim = { kind: 'line', net: netName, layer: 1, x1: pad.x, y1: pad.y, x2: g.bend!.x, y2: g.bend!.y };
+					const s2: RenderedPrim = { kind: 'line', net: netName, layer: 1, x1: g.bend!.x, y1: g.bend!.y, x2: g.x, y2: g.y };
+					// L 形拐角切线圆角：直角拐弯既难看又挤占邻侧净空
+					const f = fanoutFillet(
+						{ x1: s1.x1!, y1: s1.y1!, x2: s1.x2!, y2: s1.y2! },
+						{ x1: s2.x1!, y1: s2.y1!, x2: s2.x2!, y2: s2.y2! },
+						Math.min(24, this.drc.traceWidthMil * 3),
+					);
+					stub = f ? [...(f.prims as RenderedPrim[])] : [s1, s2];
+				}
+				out.push({ x: g.x, y: g.y, stub });
 			}
 			// 直线 / L 形全灭时落点仍可能可达（邻盘净距圈之间有斜向通道）：
 			// 用可视图路由器铺顶层引出段，可绕开直线与单拐覆盖不到的形态。

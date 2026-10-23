@@ -1,3 +1,5 @@
+<p align="center"><img src="images/logo.png" width="112" alt="橡皮筋自动布线器" /></p>
+
 # 橡皮筋自动布线
 
 基于拓扑橡皮筋算法的 PCB 自动布线工具，使用纯 JavaScript 实现，无需外部服务。
@@ -30,7 +32,7 @@
 
 ### 方法 1：从 .eext 文件安装
 
-1. 下载 `rubberband-autorouter_v0.0.64.eext` 文件
+1. 下载 `rubberband-autorouter_v0.0.81.eext` 文件
 2. 打开嘉立创 EDA 专业版
 3. 进入 **扩展管理** (Extensions)
 4. 点击 **从本地安装** (Install from local)

@@ -396,6 +396,10 @@ async function solveMulti(
 	const cancelled = (): boolean => {
 		try { return isCancelled?.() === true; } catch { return false; }
 	};
+	// 分相计时（__RB_DEBUG__ 时输出）：定位单次求解的耗时大头
+	const __t0 = Date.now();
+	let __mark = __t0, __tPair = 0, __tTerm = 0, __tArc = 0, __tDij = 0;
+	const __dbg = !!(globalThis as any).__RB_DEBUG__;
 	// 拆分：可绕行圆（建图）与纯阻挡圆（填充内部网格 / 焊盘自身轮廓，只参与碰撞检查）
 	const circles: RBObstacle[] = [];
 	const blockers: RBObstacle[] = [];
@@ -438,10 +442,19 @@ async function solveMulti(
 	};
 
 	// 1. 圆-圆公切线（4 种侧别组合）
-	//    配对数是 O(n²)，是本求解器的主要开销：定期让出主线程并在超预算时提前收手
+	//    配对数是 O(n²)，实测占单次求解 70~90%（Dijkstra≈0）：x 序扫描 +
+	//    距离截断 —— 相距超过 r1+r2+K 的两圆之间不存在有价值的公切线
+	//    路由边（长直切线要么被中间障碍判死，要么退化成「横穿整片空地」
+	//    的大斜线，正是布线效果变差的来源），直接跳过
 	let lastYield = Date.now();
 	let timedOut = false;
-	for (let i = 0; i < n && !timedOut; i++) {
+	const __xOrder = circles.map((_, idx) => idx).sort((a, b) => circles[a].x - circles[b].x);
+	let __maxR = 0;
+	for (const c of circles) if (c.r > __maxR) __maxR = c.r;
+	let __pairsVisited = 0;
+	const __pairsAll = (n * (n - 1)) / 2;
+	for (let oi = 0; oi < n && !timedOut; oi++) {
+		const i = __xOrder[oi];
 		const ci = circles[i];
 		if (net && ci.net === net && !ci.forceBlock) continue;
 		{
@@ -453,8 +466,11 @@ async function solveMulti(
 			}
 			if (cancelled()) { timedOut = true; break; }
 		}
-		for (let j = i + 1; j < n; j++) {
-			if ((j & 31) === 0) {
+		const reach = ci.r + __maxR + 800;
+		for (let oj = oi + 1; oj < n; oj++) {
+			const j = __xOrder[oj];
+			if (circles[j].x - ci.x > reach) break;
+			if ((++__pairsVisited & 31) === 0) {
 				const now = Date.now();
 				if (now > deadline) { timedOut = true; break; }
 				if (now - lastYield >= YIELD_INTERVAL_MS) {
@@ -483,6 +499,7 @@ async function solveMulti(
 	}
 	if (timedOut) return { ok: false, prims: [] };
 
+	__tPair = Date.now() - __mark; __mark = Date.now();
 	// 2. 终端（出线候选）↔ 圆切线
 	const connectTerminal = (termIdx: number) => {
 		const term = nodes[termIdx];
@@ -503,6 +520,7 @@ async function solveMulti(
 	};
 	for (let k = 0; k < S + D; k++) connectTerminal(k);
 
+	__tTerm = Date.now() - __mark; __mark = Date.now();
 	// 3. 源候选 ↔ 目标候选 直连（无障碍阻挡时）—— 最短路径的常见情形
 	for (let i = 0; i < S; i++) {
 		const a = nodes[i];
@@ -516,6 +534,7 @@ async function solveMulti(
 		}
 	}
 
+	__tTerm += Date.now() - __mark; __mark = Date.now();
 	// 4. 同圆弧边：切点按角度排序，相邻切点之间双向连弧（弧几何合法即建边）
 	for (let i = 0; i < n; i++) {
 		{
@@ -636,6 +655,12 @@ async function solveMulti(
 				heapPush(nd, e.to);
 			}
 		}
+	}
+
+	__tArc = Date.now() - __mark; __mark = Date.now();
+	__tDij = __mark - __t0 - __tPair - __tTerm - __tArc;
+	if (__dbg) {
+		console.warn(`[VR-time] n=${n} S=${S} D=${D} 圆对=${__tPair}ms 终端=${__tTerm}ms 弧边=${__tArc}ms Dijkstra=${__tDij}ms 总=${__mark - __t0}ms 对=${__pairsVisited}/${__pairsAll}`);
 	}
 
 	if (bestDst < 0) {

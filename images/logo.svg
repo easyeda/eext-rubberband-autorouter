@@ -1,0 +1,23 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" width="512" height="512" role="img" aria-label="橡皮筋自动布线器">
+	<defs>
+		<linearGradient id="rb-bg" x1="0" y1="0" x2="1" y2="1">
+			<stop offset="0" stop-color="#4F7CFF"/>
+			<stop offset="1" stop-color="#8B5CF6"/>
+		</linearGradient>
+		<linearGradient id="rb-sheen" x1="0" y1="0" x2="0" y2="1">
+			<stop offset="0" stop-color="#ffffff" stop-opacity="0.16"/>
+			<stop offset="0.55" stop-color="#ffffff" stop-opacity="0"/>
+		</linearGradient>
+	</defs>
+	<!-- 底板 -->
+	<rect x="4" y="4" width="248" height="248" rx="60" fill="url(#rb-bg)"/>
+	<rect x="4" y="4" width="248" height="248" rx="60" fill="url(#rb-sheen)"/>
+	<!-- 飞线：对角焊盘之间的直连，穿过中间焊盘 -->
+	<line x1="62" y1="194" x2="194" y2="62" stroke="#ffffff" stroke-opacity="0.5" stroke-width="6" stroke-linecap="round"/>
+	<!-- 橡皮筋走线：从对角焊盘拉出，沿切线圆弧绕开中间焊盘，再拉向另一角 -->
+	<path d="M62 194L129.91 191.97A64 64 0 0 0 191.97 129.91L194 62" fill="none" stroke="#FFC64A" stroke-width="20" stroke-linecap="round" stroke-linejoin="round"/>
+	<!-- 焊盘：对角两块 + 中间一块（避让对象） -->
+	<rect x="39" y="171" width="46" height="46" rx="15" fill="#ffffff"/>
+	<rect x="171" y="39" width="46" height="46" rx="15" fill="#ffffff"/>
+	<rect x="106" y="106" width="44" height="44" rx="14" fill="#ffffff"/>
+</svg>
