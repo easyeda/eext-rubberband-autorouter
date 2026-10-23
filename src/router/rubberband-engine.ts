@@ -368,6 +368,24 @@ export function polygonToRect(shape: any[]): { w: number; h: number; rotationDeg
 }
 
 /**
+ * EDA API 的焊盘形状单位陷阱：ELLIPSE 的两维单位不一致 ——
+ * 实测 [ELLIPSE,1.7,66.9] / [ELLIPSE,2.6,102.4] / [ELLIPSE,1.575,62]
+ * 均满足「第一维毫米 = 第二维 mil」（1mm = 39.37mil，物理上是同一圆形焊盘）。
+ * 按两维都是 mil 消化会把圆焊盘变成 1.7×67mil 的细长条障碍，几乎不设防
+ * （实测 +5V 走线压过 +3.3V 焊盘铜皮，pad-trk 侵入 14.6mil）。
+ * 规则：第一维先按毫米换算成 mil；与第二维一致（圆形）取一致值；
+ * 不一致（真椭圆）按「第一维毫米、第二维 mil」处理。
+ */
+function normalizeEllipseUnits(shape: any[]): any[] {
+	if (!Array.isArray(shape) || String(shape[0] ?? '').toUpperCase() !== 'ELLIPSE') return shape;
+	const a = shape[1], b = shape[2];
+	if (!(a > 0) || !(b > 0)) return shape;
+	const aMil = a * 39.3701;
+	if (Math.abs(aMil - b) <= Math.max(0.5, b * 0.02)) return ['ELLIPSE', b, b];
+	return ['ELLIPSE', aMil, b];
+}
+
+/**
  * 焊盘物理轮廓 → 圆群（未膨胀），unit: mil。
  *
  * 长焊盘（OVAL/RECT 胶囊）用「两端帽圆 + 密集侧向填充圆」表示：
@@ -381,9 +399,10 @@ export function padShapeToCircles(
 ): Array<{ x: number; y: number; r: number; blockerOnly?: boolean }> {
 	const rawShape = Array.isArray(pad.pad) ? pad.pad : [];
 	// POLYGON（绝对坐标顶点）先归一化成 RECT：顶点已含旋转，pad.rotation 不再叠加
-	let shape = rawShape;
+	// ELLIPSE 先做单位归一化（第一维毫米陷阱）
+	let shape = normalizeEllipseUnits(rawShape);
 	let rotationDeg = pad.rotation ?? 0;
-	if (String(rawShape[0] ?? '').toUpperCase() === 'POLYGON') {
+	if (String(shape[0] ?? '').toUpperCase() === 'POLYGON') {
 		const rect = polygonToRect(rawShape);
 		if (!rect) return [];
 		shape = ['RECT', rect.w, rect.h];
@@ -468,9 +487,10 @@ export function padShapeDistance(
 ): number {
 	const rawShape = Array.isArray(pad.pad) ? pad.pad : [];
 	// POLYGON（绝对坐标顶点）先归一化成 RECT：顶点已含旋转，pad.rotation 不再叠加
-	let shape = rawShape;
+	// ELLIPSE 先做单位归一化（第一维毫米陷阱）
+	let shape = normalizeEllipseUnits(rawShape);
 	let rotationDeg = pad.rotation ?? 0;
-	if (String(rawShape[0] ?? '').toUpperCase() === 'POLYGON') {
+	if (String(shape[0] ?? '').toUpperCase() === 'POLYGON') {
 		const rect = polygonToRect(rawShape);
 		if (!rect) return Math.hypot(dx, dy);
 		shape = ['RECT', rect.w, rect.h];
@@ -832,7 +852,7 @@ export function padExitModel(
 	pad: { pad: any[]; hole?: any[] | null; rotation?: number },
 	sideHint: { x: number; y: number },
 ): PadExitModel | null {
-	const shape = Array.isArray(pad.pad) ? pad.pad : [];
+	const shape = normalizeEllipseUnits(Array.isArray(pad.pad) ? pad.pad : []);
 	let w = shape[1] ?? 0;
 	let h = shape[2] ?? 0;
 	let rotation = pad.rotation ?? 0;

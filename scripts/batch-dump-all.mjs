@@ -7,10 +7,9 @@ import * as fs from 'fs';
 import * as path from 'path';
 import { fileURLToPath } from 'url';
 import { spawnSync } from 'child_process';
+import { STRUCT_VERSION } from './struct-version.mjs';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
-// PlanningInput 结构版本：字段/口径变化（如新增 padShapes 口径、网络字段改名）时 +1
-export const STRUCT_VERSION = 2;
 
 const force = process.argv.includes('--force');
 const filterIdx = process.argv.indexOf('--filter');
@@ -73,10 +72,25 @@ for (const name of cases) {
 		const invoke = cli([
 			'invoke', '--session', sessionId, '--ext-uuid', 'eda',
 			'--code-file', path.join(ROOT, 'scripts', 'cli-dump62.js'),
-			'--timeout', '300000',
-		], 330000);
+			'--timeout', '600000',
+		], 630000);
 		if (!invoke.json?.ok) throw new Error(`invoke 失败: ${(invoke.json ? JSON.stringify(invoke.json).slice(0, 500) : invoke.raw.slice(0, 500))}`);
-		const v = invoke.json.value ?? {};
+		const meta = invoke.json.value ?? {};
+		if (!meta.token || !meta.chunkCount) throw new Error(`返回缺少分块元数据: ${JSON.stringify(meta).slice(0, 300)}`);
+		// 分块取回（单次响应上限 8MB）
+		let json = '';
+		for (let i = 0; i < meta.chunkCount; i++) {
+			const part = cli([
+				'invoke', '--session', sessionId, '--ext-uuid', 'eda',
+				'--code-file', path.join(ROOT, 'scripts', 'cli-dump62.js'),
+				'--args', JSON.stringify({ mode: 'chunk', token: meta.token, i }),
+				'--timeout', '120000',
+			], 150000);
+			if (!part.json?.ok) throw new Error(`块 ${i}/${meta.chunkCount} 取回失败: ${JSON.stringify(part.json).slice(0, 300)}`);
+			json += part.json.value.data;
+			if (part.json.value.done) break;
+		}
+		const v = JSON.parse(json);
 		if (!v.input) throw new Error(`返回缺少 input`);
 		const wrapped = {
 			structVersion: STRUCT_VERSION,
@@ -88,7 +102,7 @@ for (const name of cases) {
 			input: v.input,
 		};
 		fs.writeFileSync(outFile, JSON.stringify(wrapped, null, 1), 'utf8');
-		console.log(`[${done}/${cases.length}] ${name}: 焊盘 ${v.totalPads}（注入无网络 ${v.added}）网络 ${v.nets?.length}（${Math.round((Date.now() - t0) / 100) / 10}s）`);
+		console.log(`[${done}/${cases.length}] ${name}: 焊盘 ${v.totalPads}（注入无网络 ${v.added}）网络 ${v.nets?.length}（${Math.round((Date.now() - t0) / 100) / 10}s，${meta.chunkCount} 块）`);
 		summary.push({ case: name, status: 'dumped', pads: v.totalPads, nets: v.nets?.length, sec: Math.round((Date.now() - t0) / 1000) });
 	} catch (e) {
 		console.error(`[${done}/${cases.length}] ${name}: 失败 — ${String(e?.message ?? e).slice(0, 300)}`);

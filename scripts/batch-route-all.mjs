@@ -11,7 +11,7 @@ import * as fs from 'fs';
 import * as path from 'path';
 import { fileURLToPath } from 'url';
 import { spawnSync, spawn as nodeSpawn } from 'child_process';
-import { STRUCT_VERSION } from './batch-dump-all.mjs';
+import { STRUCT_VERSION } from './struct-version.mjs';
 
 // 与 batch-dump-all.mjs 同源的 STRUCT_VERSION（单一来源）；不匹配的 dump 会被跳过/重导
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
@@ -83,9 +83,9 @@ function drcAudit(input, result) {
 			if (p.kind === 'line') sampleLine(p, n.name); else sampleArc(p, n.name);
 		}
 	}
-	// 焊盘/过孔也入网格（圆近似：r 取外接半径）
+	// 焊盘/过孔也入网格（圆近似：r 取外接半径；矩形焊盘带形状供精复核）
 	for (const p of input.allPads) {
-		add(p.x, p.y, { kind: 'pad', net: p.net, r: p.radius });
+		add(p.x, p.y, { kind: 'pad', net: p.net, r: p.radius, shape: input.padShapes[`${p.x.toFixed(2)},${p.y.toFixed(2)}`] ?? null });
 	}
 	for (const v of result.vias) {
 		add(v.x, v.y, { kind: 'via', net: v.net, r: v.dia / 2 });
@@ -93,6 +93,7 @@ function drcAudit(input, result) {
 	const pairMin = new Map();   // 'netA|netB' → {min, x, y, kinds}
 	const consider = (na, nb, d, x, y, ka, kb) => {
 		if (na === nb) return;
+		if (ka === 'pad' && kb === 'pad') return;   // 路由不改焊盘：pad-pad 重叠是外接圆近似假象
 		const k = na < nb ? `${na}|${nb}` : `${nb}|${na}`;
 		const kinds = na < nb ? `${ka}-${kb}` : `${kb}-${ka}`;
 		const cur = pairMin.get(k);
@@ -112,8 +113,16 @@ function drcAudit(input, result) {
 	}
 	function checkPair(A, B) {
 		if (A.net === B.net) return;
-		const d = Math.hypot(A.x - B.x, A.y - B.y) - (A.kind === 'trk' ? 0 : A.r) - (B.kind === 'trk' ? 0 : B.r);
+		let d = Math.hypot(A.x - B.x, A.y - B.y) - (A.kind === 'trk' ? 0 : A.r) - (B.kind === 'trk' ? 0 : B.r);
 		if (d > needTP + 2) return;
+		// 旋转矩形精复核：外接圆近似会冤杀引脚间穿线的合法走线
+		if (A.kind === 'pad' && A.shape) {
+			const exact = padRectDistance({ ...A.shape, px: A.x, py: A.y }, B.x, B.y);
+			if (exact !== null) d = exact;
+		} else if (B.kind === 'pad' && B.shape) {
+			const exact = padRectDistance({ ...B.shape, px: B.x, py: B.y }, A.x, A.y);
+			if (exact !== null) d = exact;
+		}
 		consider(A.net, B.net, d, (A.x + B.x) / 2, (A.y + B.y) / 2, A.kind, B.kind);
 	}
 	const violations = [];
@@ -125,6 +134,21 @@ function drcAudit(input, result) {
 	}
 	violations.sort((a, b) => a.min - b.min);
 	return { violations: violations.slice(0, 80), violationCount: violations.length };
+}
+
+/** 旋转矩形焊盘的符号距离（>0 在外部）：审计的精复核，替代外接圆近似 */
+function padRectDistance(shape, x, y) {
+	const pad = Array.isArray(shape?.pad) ? shape.pad : null;
+	if (!pad || pad[0] === 'ELLIPSE') return null;
+	const w = (pad[1] ?? 0) / 2, h = (pad[2] ?? 0) / 2;
+	if (!(w > 0) || !(h > 0)) return null;
+	const rot = ((shape.rotation ?? 0) * Math.PI) / 180;
+	const dx = x - (shape.px ?? 0), dy = y - (shape.py ?? 0);
+	const c = Math.cos(-rot), s = Math.sin(-rot);
+	const lx = dx * c - dy * s, ly = dx * s + dy * c;
+	const ox = Math.abs(lx) - w, oy = Math.abs(ly) - h;
+	if (ox > 0 && oy > 0) return Math.hypot(ox, oy);
+	return Math.max(ox, oy);
 }
 
 // ── 接缝缺陷审计（开口/锐角/近整圆弧）──
@@ -141,9 +165,10 @@ function jointAudit(result) {
 			const l = Math.hypot(dx, dy) || 1;
 			return { x: dx / l, y: dy / l };
 		}
+		// 弧的行进切线只取决于扫向（CCW: (-sin,cos)，CW: (sin,-cos)），与起/终点无关
 		const a = (p.startAngle ?? 0) + (end ? (p.sweep ?? 0) : 0);
 		const s = (p.sweep ?? 0) >= 0 ? 1 : -1;
-		return end ? { x: Math.sin(a) * s, y: -Math.cos(a) * s } : { x: -Math.sin(a) * s, y: Math.cos(a) * s };
+		return s > 0 ? { x: -Math.sin(a), y: Math.cos(a) } : { x: Math.sin(a), y: -Math.cos(a) };
 	};
 	const angDiff = (a, b) => {
 		let d = Math.abs(Math.atan2(a.y, a.x) - Math.atan2(b.y, b.x)) % TAU;
@@ -158,8 +183,10 @@ function jointAudit(result) {
 		for (let i = 0; i < prims.length - 1; i++) {
 			const a = prims[i], b = prims[i + 1];
 			const ae = ptOf(a, true), bs = ptOf(b, false);
-			joints++;
 			const gap = Math.hypot(ae.x - bs.x, ae.y - bs.y);
+			// MST 边边界：相邻边不共端点（间隔≈边长），不是缺陷 —— 只查边内接缝
+			if (gap > 15) continue;
+			joints++;
 			if (gap > 0.5) { gaps++; issues.push({ net: net.name, type: 'gap', mil: Math.round(gap * 10) / 10, at: [Math.round(ae.x), Math.round(ae.y)] }); }
 			const turn = angDiff(tanOf(a, true), tanOf(b, false));
 			if (turn > 30) { sharp++; issues.push({ net: net.name, type: 'sharp', deg: Math.round(turn), at: [Math.round(ae.x), Math.round(ae.y)] }); }
