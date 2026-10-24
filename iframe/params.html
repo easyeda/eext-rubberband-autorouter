@@ -437,10 +437,10 @@
 					</div>
 					<div class="control">
 						<select id="budgetSec">
-							<option value="300">5 分钟</option>
 							<option value="600">10 分钟</option>
-							<option value="900" selected>15 分钟</option>
-							<option value="1800">30 分钟</option>
+							<option value="1200">20 分钟</option>
+							<option value="1800" selected>30 分钟</option>
+							<option value="3600">60 分钟</option>
 							<option value="0">不限时</option>
 						</select>
 					</div>
@@ -554,7 +554,7 @@
 			escapeClearanceMil: 0,
 			ripupRounds: 3,
 			powerNetsFirst: false,
-			budgetMs: 900000,
+			budgetMs: 1800000,
 			livePreview: true,
 			finalOptimize: true,
 			viaFallback: true,
@@ -712,9 +712,9 @@
 			setNumberPair('escapeClearanceMil', 'escapeClearanceMilNum', o.escapeClearanceMil);
 			$('ripupRounds').value = String(o.ripupRounds);
 			var budgetSec = Math.round((Number(o.budgetMs) || 0) / 1000);
-			if (budgetSec !== 0 && budgetSec !== 300 && budgetSec !== 600 && budgetSec !== 900 && budgetSec !== 1800) {
-				// 旧版本可能保存过 60/120 秒等值：归入最近的档位
-				budgetSec = budgetSec >= 1350 ? 1800 : budgetSec >= 750 ? 900 : budgetSec >= 450 ? 600 : 300;
+			if (budgetSec !== 0 && budgetSec !== 600 && budgetSec !== 1200 && budgetSec !== 1800 && budgetSec !== 3600) {
+				// 旧版本可能保存过 300/900 秒等值：归入最近的档位
+				budgetSec = budgetSec >= 2700 ? 3600 : budgetSec >= 1500 ? 1800 : budgetSec >= 900 ? 1200 : 600;
 			}
 			$('budgetSec').value = String(budgetSec);
 			$('netOrder').value = o.netOrder || 'auto';

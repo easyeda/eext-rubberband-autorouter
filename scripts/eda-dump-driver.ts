@@ -121,6 +121,26 @@ export async function dumpInput(opts: DumpOptions = {}) {
 				}
 				const hole = p.hole ?? p.holeAspect ?? [];
 				const holeMil = Array.isArray(hole) && hole.length >= 2 ? (hole[1] ?? 0) : 0;
+				// 形状缺失回退：先用形状缓存（位置精确匹配 / 2mil 邻近匹配）；
+				// 再不行才用默认尺寸。盲猜 32×34mil 在 0.5mm 间距的引脚排里
+				// 会让相邻焊盘障碍圈互相吞没，把每个端点封死（实测整板 0 布通）。
+				if (wMil === 0 && hMil === 0) {
+					const cached = padShapes[`${x.toFixed(2)},${y.toFixed(2)}`];
+					let shape = cached?.pad;
+					if (!Array.isArray(shape)) {
+						let best: any = null, bd = 2;
+						for (const k of Object.keys(padShapes)) {
+							const [kx, ky] = k.split(',').map(Number);
+							const dd = Math.hypot(kx - x, ky - y);
+							if (dd < bd) { bd = dd; best = padShapes[k].pad; }
+						}
+						shape = best;
+					}
+					if (Array.isArray(shape) && shape.length >= 3) {
+						wMil = shape[1] ?? 0;
+						hMil = shape[2] ?? 0;
+					}
+				}
 				if (wMil === 0 && hMil === 0) { wMil = 32; hMil = 34; }
 				const rawLayer: number = p.layerId ?? p.layer ?? 1;
 				let padType: 'th' | 'smd' | 'via' = 'smd';

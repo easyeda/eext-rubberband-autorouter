@@ -137,6 +137,26 @@ export class TopologicalRouter {
 					}
 					const hole = p.hole ?? p.holeAspect ?? [];
 					const holeMil = Array.isArray(hole) && hole.length >= 2 ? (hole[1] ?? 0) : 0;
+					// 形状缺失回退：优先用焊盘形状缓存（同坐标 / 2mil 邻近），
+					// 盲猜 32×34mil 在 0.5mm 间距引脚排里会让相邻焊盘障碍圈互相
+					// 吞没、封死所有端点（实测整板 0 布通）
+					if (wMil === 0 && hMil === 0) {
+						const keyOfPad = `${x.toFixed(2)},${y.toFixed(2)}`;
+						const cached = this.padShapeCache.get(keyOfPad);
+						let shape: any[] | null = cached?.pad ?? null;
+						if (!Array.isArray(shape)) {
+							let bd = 2;
+							for (const [k, v] of this.padShapeCache) {
+								const [kx, ky] = k.split(',').map(Number);
+								const dd = Math.hypot(kx - x, ky - y);
+								if (dd < bd) { bd = dd; shape = v.pad; }
+							}
+						}
+						if (Array.isArray(shape) && shape.length >= 3) {
+							wMil = shape[1] ?? 0;
+							hMil = shape[2] ?? 0;
+						}
+					}
 					if (wMil === 0 && hMil === 0) { wMil = 32; hMil = 34; }
 
 					const rawLayer: number = p.layerId ?? p.layer ?? 1;
@@ -450,11 +470,6 @@ export class TopologicalRouter {
 			const { padMap, allPads } = await this.collectPads();
 			if (padMap.size === 0) throw new Error('没有可布线的网络');
 
-			this.onProgress?.({ stage: '构建障碍', percentage: 15, message: '正在构建障碍物...' });
-			const staticObstacles = await this.collectStaticObstacles(drc);
-
-			// 用户排除的网络不参与规划：焊盘仍保留在 allPads 里作为障碍，
-			// 已有走线也仍由 collectStaticObstacles 当作静态铜处理，不做任何删改。
 			const excluded = new Set(options.excludeNets ?? []);
 			const networks = Array.from(padMap.entries())
 				.filter(([name]) => !excluded.has(name))
@@ -463,6 +478,24 @@ export class TopologicalRouter {
 				this.onLog?.(`按设置排除 ${Array.from(excluded).filter(n => padMap.has(n)).length} 个网络`, 'info');
 			}
 			if (networks.length === 0) throw new Error('所有网络都被排除，没有可布线的网络');
+
+			// 清掉本轮要布的网络在画布上的既有走线/过孔（含上一次会话留下的）。
+			// 否则它们会被 collectStaticObstacles 当成永久静态铜：每个焊盘旁都在
+			// 相邻网络的旧线 → 新布线自堵，整板 0 布通（2026-10-24 实测
+			// case/rubberband-router：468 段旧线把 14 个网络全部封死）。
+			// 这与「重新布线」语义一致；排除网络的手工走线不受影响。
+			if (options.clearExistingTraces !== false) {
+				this.onProgress?.({ stage: '清理旧走线', percentage: 12, message: '正在清理待布网络的既有走线...' });
+				try {
+					const purged = await this.purgeNetsBatch(new Set(networks.map(n => n.name)));
+					if (purged.prims > 0) {
+						this.onLog?.(`已清理 ${purged.nets} 个网络的 ${purged.prims} 段既有走线（重新布线）`, 'info');
+					}
+				} catch { /* 清理失败不阻断布线 */ }
+			}
+
+			this.onProgress?.({ stage: '构建障碍', percentage: 15, message: '正在构建障碍物...' });
+			const staticObstacles = await this.collectStaticObstacles(drc);
 			this.totalNets = networks.length;
 			// 飞线布通率的分母：参与布线的焊盘总数（排除网络不计）
 			this.totalPads = networks.reduce((sum, n) => sum + n.pads.length, 0);
@@ -547,9 +580,10 @@ export class TopologicalRouter {
 				}
 			}
 
-			if (!options.livePreview) {
-				await this.flushPending();
-			}
+			// 无论是否实时预览，都必须等画布写入队列排空再报完成 ——
+			// 否则进度条已 100%、按钮可点，画布却还在逐网重绘（用户可见的
+			// 「拆线重试」假象，2026-10-24 实测）
+			await this.flushPending();
 
 			// 以规划结果为准刷新统计
 			if (!this.shouldCancel) {
@@ -767,6 +801,35 @@ export class TopologicalRouter {
 			this.onLog?.(`已清理网络 ${name} 的 ${leftover} 个残留图元`, 'info');
 		}
 		this.touchedNets.delete(name);
+	}
+
+	/**
+	 * 批量清理一组网络的既有走线/过孔（重新布线语义）。
+	 * 一次扫描文档按网络名过滤，避免逐网 getAll 的 O(网数 × 图元数) 开销。
+	 */
+	private async purgeNetsBatch(netNames: Set<string>): Promise<{ nets: number; prims: number }> {
+		const hits = new Set<string>();
+		let prims = 0;
+		const collect = async (getAll: () => Promise<any[]>, del: (ids: string[]) => Promise<unknown>) => {
+			try {
+				const list = await getAll();
+				const ids: string[] = [];
+				for (const it of list ?? []) {
+					const n = (it as any)?.net;
+					if (!n || !netNames.has(n)) continue;
+					const id = (it as any)?.primitiveId;
+					if (typeof id === 'string' && id) { ids.push(id); hits.add(n); }
+				}
+				if (ids.length) {
+					await del(ids);
+					prims += ids.length;
+				}
+			} catch { /* 该类图元读取/删除失败不影响其它 */ }
+		};
+		await collect(() => eda.pcb_PrimitiveLine.getAll(), (ids) => eda.pcb_PrimitiveLine.delete(ids));
+		await collect(() => eda.pcb_PrimitiveArc.getAll(), (ids) => eda.pcb_PrimitiveArc.delete(ids));
+		await collect(() => eda.pcb_PrimitiveVia.getAll(), (ids) => eda.pcb_PrimitiveVia.delete(ids));
+		return { nets: hits.size, prims };
 	}
 
 	/** 按网络名扫描文档并删除其全部图元，返回实际发现的残留数量 */

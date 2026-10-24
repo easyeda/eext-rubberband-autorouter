@@ -368,21 +368,26 @@ export function polygonToRect(shape: any[]): { w: number; h: number; rotationDeg
 }
 
 /**
- * EDA API 的焊盘形状单位陷阱：ELLIPSE 的两维单位不一致 ——
- * 实测 [ELLIPSE,1.7,66.9] / [ELLIPSE,2.6,102.4] / [ELLIPSE,1.575,62]
- * 均满足「第一维毫米 = 第二维 mil」（1mm = 39.37mil，物理上是同一圆形焊盘）。
- * 按两维都是 mil 消化会把圆焊盘变成 1.7×67mil 的细长条障碍，几乎不设防
- * （实测 +5V 走线压过 +3.3V 焊盘铜皮，pad-trk 侵入 14.6mil）。
- * 规则：第一维先按毫米换算成 mil；与第二维一致（圆形）取一致值；
- * 不一致（真椭圆）按「第一维毫米、第二维 mil」处理。
+ * EDA API 的焊盘形状单位陷阱：ELLIPSE 两维单位可能不一致 ——
+ * 实测全量 101 工程 6493 个 ELLIPSE：5421 例满足「第二维 ≈ 第一维×39.37」
+ * （第一维毫米、第二维 mil，物理上是同一圆形焊盘，如 [1.7,66.9]），
+ * 1070 例两维完全相等（同单位；其中 1001 例经焊盘半径交叉验证为 mil，
+ * 仅 2 例为亚毫米级的 mm）。
+ *
+ * 旧规则「第一维一律当毫米」会把 [66.9,66.9]（mil）放大 39 倍成 2634mil
+ * 巨型障碍，直接堵死整板（rubberband-router 基准板 14 网全灭的根因）。
+ * 因此只在「混合单位特征成立」时归一化；两维相等/无关时原样返回。
+ * 亚毫米圆形（a==b 且 <1mil）按毫米换算（物理上不存在 0.5mil 焊盘）。
  */
 function normalizeEllipseUnits(shape: any[]): any[] {
 	if (!Array.isArray(shape) || String(shape[0] ?? '').toUpperCase() !== 'ELLIPSE') return shape;
 	const a = shape[1], b = shape[2];
 	if (!(a > 0) || !(b > 0)) return shape;
-	const aMil = a * 39.3701;
-	if (Math.abs(aMil - b) <= Math.max(0.5, b * 0.02)) return ['ELLIPSE', b, b];
-	return ['ELLIPSE', aMil, b];
+	// 混合单位特征：第一维毫米、第二维 mil，且物理上是圆
+	if (Math.abs(a * 39.3701 - b) <= Math.max(0.5, b * 0.02)) return ['ELLIPSE', b, b];
+	// 两维相等：同单位。亚毫米级视为 mm（0.5mil 焊盘物理不存在）
+	if (Math.abs(a - b) <= 0.01 && a < 1) return ['ELLIPSE', a * 39.3701, b * 39.3701];
+	return shape;
 }
 
 /**

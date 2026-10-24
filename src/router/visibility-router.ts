@@ -466,7 +466,7 @@ async function solveMulti(
 			}
 			if (cancelled()) { timedOut = true; break; }
 		}
-		const reach = ci.r + __maxR + 800;
+		const reach = (globalThis as any).__NO_PAIR_CULL__ ? Infinity : ci.r + __maxR + 800;
 		for (let oj = oi + 1; oj < n; oj++) {
 			const j = __xOrder[oj];
 			if (circles[j].x - ci.x > reach) break;

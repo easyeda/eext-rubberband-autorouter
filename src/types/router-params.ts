@@ -29,6 +29,8 @@ export interface RouterUiOptions {
 	allowViaInPad: boolean;
 	/** 允许布线的铜层 ID（1 = 顶层，2 = 底层；顶层始终可用） */
 	routeLayers: number[];
+	/** 布线前清除待布网络的既有走线（重新布线语义；默认开启） */
+	clearExistingTraces: boolean;
 	/** 不参与布线的网络名：保持画布现状，不做任何删改 */
 	excludeNets: string[];
 	/** 网络排序策略（auto = 按 PCB 布局专业规则自动规划） */
@@ -41,12 +43,13 @@ export const DEFAULT_ROUTER_OPTIONS: RouterUiOptions = {
 	escapeClearanceMil: 0,
 	ripupRounds: 3,
 	powerNetsFirst: false,
-	budgetMs: 900000,
+	budgetMs: 1800000,
 	livePreview: true,
 	finalOptimize: true,
 	viaFallback: true,
 	allowViaInPad: false,
 	routeLayers: [1, 2],
+	clearExistingTraces: true,
 	excludeNets: [],
 	netOrder: 'auto',
 };
@@ -75,12 +78,13 @@ export function normalizeRouterOptions(input: Partial<RouterUiOptions> | undefin
 		escapeClearanceMil: clamp(o.escapeClearanceMil, 0, 40, DEFAULT_ROUTER_OPTIONS.escapeClearanceMil),
 		ripupRounds: Math.round(clamp(o.ripupRounds, 0, 6, DEFAULT_ROUTER_OPTIONS.ripupRounds)),
 		powerNetsFirst: !!o.powerNetsFirst,
-		budgetMs: clamp(o.budgetMs, 0, 1800000, DEFAULT_ROUTER_OPTIONS.budgetMs),
+		budgetMs: clamp(o.budgetMs, 0, 3600000, DEFAULT_ROUTER_OPTIONS.budgetMs),
 		livePreview: o.livePreview !== false,
 		finalOptimize: o.finalOptimize !== false,
 		viaFallback: o.viaFallback !== false,
 		allowViaInPad: o.allowViaInPad === true,
 		routeLayers: [...layers].sort((a, b) => a - b),
+		clearExistingTraces: o.clearExistingTraces !== false,
 		excludeNets: excluded,
 		netOrder: NET_ORDERS.includes(o.netOrder) ? o.netOrder : 'auto',
 	};
