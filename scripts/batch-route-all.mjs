@@ -24,6 +24,8 @@ const budgetMs = Number(argOf('--budget', 240000));
 const filter = process.argv.includes('--filter') ? process.argv[process.argv.indexOf('--filter') + 1] : null;
 const limit = Number(argOf('--limit', 0)) || Infinity;
 const redump = process.argv.includes('--redump');
+// --reaudit：不重跑引擎，用既有 result.json + dump 重算 DRC/接缝审计并刷新 digest
+const reaudit = process.argv.includes('--reaudit');
 
 const dumpsDir = path.join(ROOT, 'tmp', 'dumps');
 const resultsDir = path.join(ROOT, 'tmp', 'results');
@@ -67,7 +69,7 @@ function drcAudit(input, result) {
 		const n = Math.max(1, Math.ceil(d / STEP));
 		for (let i = 0; i <= n; i++) {
 			const t = i / n;
-			add((p.x1 ?? 0) + ((p.x2 ?? 0) - (p.x1 ?? 0)) * t, (p.y1 ?? 0) + ((p.y2 ?? 0) - (p.y1 ?? 0)) * t, { kind: 'trk', net });
+			add((p.x1 ?? 0) + ((p.x2 ?? 0) - (p.x1 ?? 0)) * t, (p.y1 ?? 0) + ((p.y2 ?? 0) - (p.y1 ?? 0)) * t, { kind: 'trk', net, layer: p.layer });
 		}
 	};
 	const sampleArc = (p, net) => {
@@ -75,7 +77,7 @@ function drcAudit(input, result) {
 		const n = Math.max(2, Math.ceil(Math.abs(sw) * r / STEP));
 		for (let i = 0; i <= n; i++) {
 			const a = (p.startAngle ?? 0) + (sw * i) / n;
-			add((p.cx ?? 0) + r * Math.cos(a), (p.cy ?? 0) + r * Math.sin(a), { kind: 'trk', net });
+			add((p.cx ?? 0) + r * Math.cos(a), (p.cy ?? 0) + r * Math.sin(a), { kind: 'trk', net, layer: p.layer });
 		}
 	};
 	for (const n of result.nets) {
@@ -84,11 +86,12 @@ function drcAudit(input, result) {
 		}
 	}
 	// 焊盘/过孔也入网格（圆近似：r 取外接半径；矩形焊盘带形状供精复核）
+	// 层语义：SMD 焊盘只挡本层（L1/L2），TH/过孔（layer 12 / undefined）全层
 	for (const p of input.allPads) {
-		add(p.x, p.y, { kind: 'pad', net: p.net, r: p.radius, shape: input.padShapes[`${p.x.toFixed(2)},${p.y.toFixed(2)}`] ?? null });
+		add(p.x, p.y, { kind: 'pad', net: p.net, r: p.radius, layer: p.layer === 12 ? undefined : p.layer, shape: input.padShapes[`${p.x.toFixed(2)},${p.y.toFixed(2)}`] ?? null });
 	}
-	for (const v of result.vias) {
-		add(v.x, v.y, { kind: 'via', net: v.net, r: v.dia / 2 });
+	for (const v of result.vias ?? []) {
+		add(v.x, v.y, { kind: 'via', net: v.net, r: v.dia / 2, layer: undefined });
 	}
 	const pairMin = new Map();   // 'netA|netB' → {min, x, y, kinds}
 	const consider = (na, nb, d, x, y, ka, kb) => {
@@ -113,6 +116,8 @@ function drcAudit(input, result) {
 	}
 	function checkPair(A, B) {
 		if (A.net === B.net) return;
+		// 层不交集不违规：顶层 SMD 焊盘与底层走线可合法交叉
+		if (A.layer !== undefined && B.layer !== undefined && A.layer !== B.layer) return;
 		let d = Math.hypot(A.x - B.x, A.y - B.y) - (A.kind === 'trk' ? 0 : A.r) - (B.kind === 'trk' ? 0 : B.r);
 		if (d > needTP + 2) return;
 		// 旋转矩形精复核：外接圆近似会冤杀引脚间穿线的合法走线
@@ -207,6 +212,42 @@ const mod = await import('data:text/javascript;base64,' + Buffer.from(built.outp
 
 const summary = [];
 let idx = 0;
+if (reaudit) {
+	// 审计口径迭代后离线刷新全部 digest（引擎结果不动，秒级/工程）
+	for (const name of dumps) {
+		idx++;
+		const dir = path.join(resultsDir, name);
+		const resultFile = path.join(dir, 'result.json');
+		if (!fs.existsSync(resultFile)) { summary.push({ case: name, status: 'noResult' }); continue; }
+		const result = JSON.parse(fs.readFileSync(resultFile, 'utf8'));
+		const dump = JSON.parse(fs.readFileSync(path.join(dumpsDir, `${name}-dump.json`), 'utf8'));
+		const input = dump.input ?? dump;
+		const drc = drcAudit(input, result);
+		const joints = jointAudit(result);
+		const digest = {
+			case: name,
+			routed: result.summary.routed, total: result.summary.total,
+			rate: result.summary.rate,
+			failed: result.summary.failed,
+			partial: (result.summary.partial ?? []).map(n => ({ name: n, prims: result.nets.find(x => x.name === n)?.prims.length ?? 0 })),
+			vias: (result.vias ?? []).length,
+			wallS: result.summary.wallS,
+			drcCount: drc.violationCount,
+			drcTop: drc.violations.slice(0, 10),
+			joints: { gaps: joints.gaps, sharp: joints.sharp, bigArcs: joints.bigArcs, issues: joints.issues.slice(0, 8) },
+		};
+		result.drc = drc;
+		result.joints = joints;
+		fs.writeFileSync(resultFile, JSON.stringify(result), 'utf8');
+		fs.writeFileSync(path.join(dir, 'digest.json'), JSON.stringify(digest, null, 1), 'utf8');
+		console.log(`[${idx}/${dumps.length}] ${name}: DRC ${drc.violationCount} 接缝 ${joints.gaps + joints.sharp + joints.bigArcs}`);
+		summary.push({ case: name, routed: result.summary.routed, total: result.summary.total, rate: result.summary.rate, drc: drc.violationCount, joints: joints.gaps + joints.sharp + joints.bigArcs, wallS: result.summary.wallS });
+	}
+	summary.sort((a, b) => (a.rate ?? 1e9) - (b.rate ?? 1e9));
+	fs.writeFileSync(path.join(resultsDir, '_summary.json'), JSON.stringify(summary, null, 1), 'utf8');
+	console.log(`[reaudit] ${summary.length} 工程审计已刷新（层感知 + 矩形精复核口径）`);
+	process.exit(0);
+}
 for (const name of dumps) {
 	idx++;
 	if (idx > limit) break;
@@ -260,6 +301,7 @@ for (const name of dumps) {
 		drc,
 		joints,
 		nets: result.nets.map(n => ({ name: n.name, prims: n.prims })),
+		vias: result.vias,
 		routedOrder: result.routedNets,
 	};
 	fs.writeFileSync(path.join(outDir, 'result.json'), JSON.stringify(payload), 'utf8');

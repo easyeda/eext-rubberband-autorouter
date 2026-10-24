@@ -6,8 +6,6 @@
 /node_modules/
 /.eslintcache
 debug.log
-/docs/*
-!/docs/PRD.md
 /build/
 /case/
 /tmp/
