@@ -1174,6 +1174,8 @@ export class PlanningEngine {
 	private async routeNetEdges(net: { name: string; pads: EnginePad[] }, mode: 'full' | 'quick' = 'full'): Promise<boolean> {
 		const drc = this.drc;
 		const edges = this.computeMST(net.pads);
+		// 注：曾试验「短边先布」改边序 —— 隔离板 9 → 6 回归（边序扰动改变
+		// 各边走廊争夺结果），且目标问题（同走廊反平行）并未解决，已回退。
 		const edgeKey = (si: number, di: number) => `${net.pads[si].id}->${net.pads[di].id}`;
 		// 部分连通的网络在撕毁/重试之间保留已完成的连接，只补未完成的边；
 		// 否则重试会重复布线并叠加过孔。
@@ -1226,7 +1228,10 @@ export class PlanningEngine {
 
 				// 并排焊盘（连接器/IC 引脚排）：仅当直连的出线方向贴着排向滑出
 				//（会封死侧边焊盘唯一的垂直出口）时，改走法向预留出线；出线本来
-				// 就垂直于排的直连保持原样 —— 切线出发拐角天然平滑，也省一次求解
+				// 就垂直于排的直连保持原样 —— 切线出发拐角天然平滑，也省一次求解。
+				// 注：dst 端预留 / 密排补试候选两个分支实测引发隔离板 9→6 级联
+				// 回归（额外求解改变各网走廊争夺），已回退 —— case12 发卡属
+				// 拥塞相关的局部最优，留待路径级美学（折返惩罚）统一处理。
 				const srcRow = this.rowInfo.get(src.id);
 				if (srcRow && srcRow.depth > 0.4) {
 					const hugsRow = !rendered || this.exitHugsRow(rendered[0], src, srcRow);
@@ -1431,11 +1436,12 @@ export class PlanningEngine {
 		pad: EnginePad, other: EnginePad,
 		row: { dx: number; dy: number; gap: number; depth: number },
 		netName: string, layer: number,
+		asDst = false,
 	): Promise<RenderedPrim[] | null> {
 		const vx = other.x - pad.x, vy = other.y - pad.y;
 		const dist = Math.hypot(vx, vy);
 		if (dist < 1) return null;
-		// 排法向 = 排向旋转 90°；目标几乎在排向上（贴排走线）时预留无意义
+		// 排法向 = 排向旋转 90°；对侧焊盘几乎在排向上（贴排走线）时预留无意义
 		const nx = -row.dy, ny = row.dx;
 		const perp = Math.abs(vx * nx + vy * ny);
 		if (perp < dist * 0.3) return null;
@@ -1446,28 +1452,51 @@ export class PlanningEngine {
 		);
 		const term = this.padTerminal(pad);
 		const obs = this.layerObstacles(netName, layer, true);
+		// 预留侧：朝对侧焊盘方向冲出（asDst 时路径从对侧过来，同样面向来向）
 		const side = (vx * nx + vy * ny) >= 0 ? 1 : -1;
+		const filletR = Math.min(24, this.drc.traceWidthMil * 3);
+		const mapPath = (prims: RenderedPrim[]): RenderedPrim[] => prims.map(pr => pr.kind === 'line'
+			? { kind: 'line' as const, net: netName, layer, x1: pr.x1, y1: pr.y1, x2: pr.x2, y2: pr.y2 }
+			: { kind: 'arc' as const, net: netName, layer, cx: pr.cx, cy: pr.cy, r: pr.r, startAngle: pr.startAngle, sweep: pr.sweep });
+		const stubOf = (ex: number, ey: number): RenderedPrim =>
+			asDst
+				? { kind: 'line', net: netName, layer, x1: ex, y1: ey, x2: pad.x, y2: pad.y }
+				: { kind: 'line', net: netName, layer, x1: pad.x, y1: pad.y, x2: ex, y2: ey };
 		for (const s of [side, -side]) {
 			const ex = pad.x + nx * s * L, ey = pad.y + ny * s * L;
 			if (!stubFeasible(term, ex, ey, obs, netName)) continue;
-			const r = await routeConnection({ x: ex, y: ey }, { x: other.x, y: other.y }, obs, netName, [150, 500], 3000);
+			// asDst：对侧焊盘 → 冲出点；否则冲出点 → 对侧焊盘
+			const r = asDst
+				? await routeConnection({ x: other.x, y: other.y }, { x: ex, y: ey }, obs, netName, [150, 500], 3000, () => this.checkCancelled())
+				: await routeConnection({ x: ex, y: ey }, { x: other.x, y: other.y }, obs, netName, [150, 500], 3000, () => this.checkCancelled());
 			if (!r.ok || !r.prims.length) continue;
-			const prims: RenderedPrim[] = [
-				{ kind: 'line', net: netName, layer, x1: pad.x, y1: pad.y, x2: ex, y2: ey },
-				...r.prims.map(pr => pr.kind === 'line'
-					? { kind: 'line' as const, net: netName, layer, x1: pr.x1, y1: pr.y1, x2: pr.x2, y2: pr.y2 }
-					: { kind: 'arc' as const, net: netName, layer, cx: pr.cx, cy: pr.cy, r: pr.r, startAngle: pr.startAngle, sweep: pr.sweep }),
-			];
-			// 引出段→路径首段的拐点圆角（G1 切线过渡）：预留出线与后续路径
-			// 常呈大角度拐弯，直角/尖角既难看又挤占侧边焊盘的出线净空
-			const head = prims.length >= 2 && prims[0].kind === 'line' && prims[1].kind === 'line'
-				? fanoutFillet(
-					{ x1: prims[0].x1!, y1: prims[0].y1!, x2: prims[0].x2!, y2: prims[0].y2! },
-					{ x1: prims[1].x1!, y1: prims[1].y1!, x2: prims[1].x2!, y2: prims[1].y2! },
-					Math.min(24, this.drc.traceWidthMil * 3),
-				)
-				: null;
-			return head ? [...(head.prims as RenderedPrim[]), ...prims.slice(2)] : prims;
+			const path = mapPath(r.prims as RenderedPrim[]);
+			const stub = stubOf(ex, ey);
+			// 拐点圆角（G1 切线过渡）：预留段与路径的接缝常呈大角度
+			let prims: RenderedPrim[];
+			if (asDst) {
+				const last = path[path.length - 1];
+				const head = last && last.kind === 'line'
+					? fanoutFillet(
+						{ x1: last.x1!, y1: last.y1!, x2: last.x2!, y2: last.y2! },
+						{ x1: stub.x1!, y1: stub.y1!, x2: stub.x2!, y2: stub.y2! },
+						filletR,
+					)
+					: null;
+				prims = head
+					? [...path.slice(0, -1), ...(head.prims as RenderedPrim[])]
+					: [...path, stub];
+			} else {
+				const head = path.length >= 1 && path[0].kind === 'line'
+					? fanoutFillet(
+						{ x1: stub.x1!, y1: stub.y1!, x2: stub.x2!, y2: stub.y2! },
+						{ x1: path[0].x1!, y1: path[0].y1!, x2: path[0].x2!, y2: path[0].y2! },
+						filletR,
+					)
+					: null;
+				prims = head ? [...(head.prims as RenderedPrim[]), ...path.slice(1)] : [stub, ...path];
+			}
+			return prims;
 		}
 		return null;
 	}

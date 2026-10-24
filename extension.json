@@ -3,7 +3,7 @@
 	"uuid": "cb8695de3b6f4258a74f0c3b9aff73ea",
 	"displayName": "橡皮筋布线器",
 	"description": "基于拓扑橡皮筋算法的PCB自动布线工具，实现橡皮筋拉扯的布线效果。",
-	"version": "0.0.84",
+	"version": "0.0.85",
 	"publisher": "EasyEDA",
 	"engines": {
 		"eda": "^3.2.0"
