@@ -15,6 +15,7 @@ import {
 } from './rubberband-engine';
 import { routeConnection } from './visibility-router';
 import { buildExitCandidates, routePadEdge, stubFeasible, PadTerminal } from './edge-router';
+import { gridRoute } from './grid-router';
 import { DRCRules } from './drc-rules';
 
 // ─────────────────────────────────────────────
@@ -255,6 +256,8 @@ export class PlanningEngine {
 	private evictionAttempts = 0;
 	/** 当前规划截止时间（驱逐等尾段逻辑也需要感知预算） */
 	private planDeadline = Number.POSITIVE_INFINITY;
+	/** 网格兜底的总时间预算（毫秒）：占整轮预算的一小部分，防止兜底吃掉主线时间 */
+	private gridBudgetMs = 0;
 	private logs: Array<{ level: string; message: string }> = [];
 	private cancelled = false;
 	private planOptions: PlanOptions = {};
@@ -315,6 +318,10 @@ export class PlanningEngine {
 		const budgetMs = input.budgetMs ?? 0;
 		const deadline = budgetMs > 0 ? Date.now() + budgetMs : Number.POSITIVE_INFINITY;
 		this.planDeadline = deadline;
+		// 网格兜底预算：有界预算取 20%（至少 60s），不限时给 600s 上限
+		this.gridBudgetMs = Number.isFinite(budgetMs) && budgetMs > 0
+			? Math.max(60_000, budgetMs * 0.2)
+			: 600_000;
 
 		// 网络排序（auto = 专业自动规划；地网络永远最后）
 		const networks = this.sortNetworks(input.networks);
@@ -1295,6 +1302,16 @@ export class PlanningEngine {
 				}
 			}
 
+			// 兜底：网格 A* 求解（可视图失败的典型原因是端点被邻盘净距圈封死、
+			// 或必经点不在切点图上）。只在完整链（非快扫）里启用，单边代价可控。
+			if (!rendered && mode !== 'quick') {
+				const g = await this.gridFallbackEdge(src, dst, net.name);
+				if (g) {
+					rendered = g.prims;
+					edgeVias.push(...g.vias);
+				}
+			}
+
 			if (!rendered) {
 				this.log(`网络 ${net.name}: ${src.id}(${src.x.toFixed(0)},${src.y.toFixed(0)}) → ${dst.id}(${dst.x.toFixed(0)},${dst.y.toFixed(0)}) 未找到路径`, 'warn');
 				continue;   // 其余连接继续布，已布部分不回滚
@@ -1344,6 +1361,59 @@ export class PlanningEngine {
 			complete ? 'success' : 'warn',
 		);
 		return complete;
+	}
+
+	/**
+	 * 网格 A* 兜底（单条连接）：可视图失败后接管。
+	 *
+	 * 网格求解把障碍光栅化成占据图，从焊盘内部多点起步，因此能处理
+	 * 可视图的固有盲区：端点被邻盘净距圈覆盖、路径需要从任意点穿过。
+	 * 返回的折线/过孔在生成时已按膨胀障碍避让，最后再做一次焊盘净距复核。
+	 */
+	private async gridFallbackEdge(
+		src: EnginePad, dst: EnginePad, netName: string,
+	): Promise<{ prims: RenderedPrim[]; vias: PlannedVia[] } | null> {
+		if (this.checkCancelled()) return null;
+		if (this.gridBudgetMs <= 0) return null;   // 兜底预算耗尽：不再尝试，留给主线
+		const layers = this.hasBottomLayer ? [1, 2] : [1];
+		const obstacles = [
+			...this.staticObstacles,
+			...this.padObstacles(this.allPads, netName),
+			...this.dynamicObstacles,
+		];
+		const viaDia = Math.max(24, this.drc.traceWidthMil * 2);
+		const viaHole = Math.max(12, this.drc.traceWidthMil);
+		const t0 = Date.now();
+		const res = await gridRoute({
+			src: { x: src.x, y: src.y },
+			dst: { x: dst.x, y: dst.y },
+			srcPad: { x: src.x, y: src.y, r: src.bodyRadius || src.radius },
+			dstPad: { x: dst.x, y: dst.y, r: dst.bodyRadius || dst.radius },
+			obstacles,
+			net: netName,
+			layers,
+			cell: 8,
+			viaCostMil: Math.max(150, this.drc.traceWidthMil * 22),
+			budgetMs: Math.min(2000, Math.max(400, this.gridBudgetMs)),
+			isCancelled: () => this.checkCancelled(),
+		});
+		this.gridBudgetMs -= Date.now() - t0;
+		if (!res.ok || !res.prims.length) return null;
+		// 过孔落点复核（网格只保证线段避让，过孔铜环更大）
+		const vias: PlannedVia[] = [];
+		for (const v of res.vias) {
+			if (!this.viaPadClear(v.x, v.y, viaDia / 2, netName)) return null;
+			if (!this.viaObstacleClear(v.x, v.y, obstacles, viaDia / 2, netName)) return null;
+			vias.push({ net: netName, x: v.x, y: v.y, dia: viaDia, hole: viaHole });
+		}
+		const prims: RenderedPrim[] = res.prims.map(p => p.kind === 'line'
+			? { kind: 'line' as const, net: netName, layer: p.layer, x1: p.x1, y1: p.y1, x2: p.x2, y2: p.y2 }
+			: {
+				kind: 'arc' as const, net: netName, layer: p.layer,
+				cx: p.cx, cy: p.cy, r: p.r, startAngle: p.startAngle, sweep: p.sweep,
+			});
+		this.log(`网络 ${netName}: ${src.id}→${dst.id} 由网格兜底布通（${prims.length} 段${vias.length ? `，${vias.length} 过孔` : ''}）`, 'info');
+		return { prims, vias };
 	}
 
 	/** 把一个网络的全部 MST 连接登记为已完成（回滚「原本已完整布通」的走线时用） */

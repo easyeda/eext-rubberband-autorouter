@@ -24,6 +24,9 @@ const budgetMs = Number(argOf('--budget', 240000));
 const filter = process.argv.includes('--filter') ? process.argv[process.argv.indexOf('--filter') + 1] : null;
 const limit = Number(argOf('--limit', 0)) || Infinity;
 const redump = process.argv.includes('--redump');
+// --only a|b|c：只跑指定工程（按名字精确匹配，用于重点复测）
+const onlyArg = process.argv.includes('--only') ? process.argv[process.argv.indexOf('--only') + 1] : null;
+const onlySet = onlyArg ? new Set(onlyArg.split('|')) : null;
 // --reaudit：不重跑引擎，用既有 result.json + dump 重算 DRC/接缝审计并刷新 digest
 const reaudit = process.argv.includes('--reaudit');
 
@@ -32,6 +35,7 @@ const resultsDir = path.join(ROOT, 'tmp', 'results');
 
 let dumps = fs.readdirSync(dumpsDir).filter(f => f.endsWith('-dump.json')).map(f => f.replace(/-dump\.json$/, ''));
 if (filter) dumps = dumps.filter(n => n.includes(filter));
+if (onlySet) dumps = dumps.filter(n => onlySet.has(n));
 dumps.sort();
 
 function cli(args, timeoutMs = 60000) {
@@ -269,6 +273,17 @@ for (const name of dumps) {
 	}
 	const input = wrapped.input;
 	input.budgetMs = budgetMs;
+	// 与 EDA 侧 clearExistingTraces 对齐：待布网络的既有走线在布线前会被清理，
+	// 离线把这类静态障碍剔除，否则脏板会把所有网络互相封死（实测 1/14 vs 9/14）
+	{
+		const routed = new Set(input.networks.map(n => n.name));
+		const before = input.staticObstacles.length;
+		input.staticObstacles = input.staticObstacles.filter(o =>
+			!(o.group?.startsWith('line:') && o.net && routed.has(o.net)));
+		if (input.staticObstacles.length < before) {
+			console.log(`  [clean] ${name}: 移除 ${before - input.staticObstacles.length} 个旧走线障碍（重新布线语义）`);
+		}
+	}
 	const t0 = Date.now();
 	let result = null;
 	try {
