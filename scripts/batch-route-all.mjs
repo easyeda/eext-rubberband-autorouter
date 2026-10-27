@@ -286,9 +286,24 @@ for (const name of dumps) {
 	}
 	const t0 = Date.now();
 	let result = null;
+	const padStats = new Map();
 	try {
 		const eng = new mod.PlanningEngine();
-		result = await eng.plan(input, { isCancelled: () => false });
+		const engineLog = [];
+		result = await eng.plan(input, {
+			isCancelled: () => false,
+			onNetUpdate: (name, _prims, _vias, _ok, pads) => { if (pads) padStats.set(name, pads); },
+			onLog: (m, level) => {
+				engineLog.push(`[${level}] ${m}`);
+				// 只回显关键行，避免刷屏；完整日志落盘到结果目录
+				if (/\[耗时\]|未找到路径|网格兜底|hoist|接受新布局|时间预算/.test(m)) console.log(`    ${m}`);
+			},
+		});
+		try {
+			const dir = path.join(resultsDir, name);
+			fs.mkdirSync(dir, { recursive: true });
+			fs.writeFileSync(path.join(dir, 'engine.log'), engineLog.join('\n'), 'utf8');
+		} catch { /* 日志落盘失败不影响结果 */ }
 	} catch (e) {
 		console.error(`[${idx}/${dumps.length}] ${name}: 引擎异常 — ${String(e?.message ?? e).slice(0, 200)}`);
 		summary.push({ case: name, status: 'engineError', error: String(e?.message ?? e).slice(0, 200) });
@@ -298,6 +313,12 @@ for (const name of dumps) {
 	const routed = result.routedNets.length;
 	const total = input.networks.length;
 	const drc = drcAudit(input, result);
+	let padsTotal = 0, padsRouted = 0;
+	for (const n of input.networks) {
+		const st = padStats.get(n.name);
+		padsTotal += st ? st.total : n.pads.length;
+		padsRouted += st ? st.routed : 0;
+	}
 	const joints = jointAudit(result);
 	const outDir = path.join(resultsDir, name);
 	fs.mkdirSync(outDir, { recursive: true });
@@ -311,6 +332,9 @@ for (const name of dumps) {
 			failed: result.failed,
 			partial: result.partial,
 			vias: result.vias.length,
+			padRouted: padsRouted,
+			padTotal: padsTotal,
+			padRate: Math.round((padsRouted / Math.max(1, padsTotal)) * 1000) / 10,
 			wallS,
 		},
 		drc,
@@ -325,6 +349,9 @@ for (const name of dumps) {
 		case: name,
 		routed, total,
 		rate: payload.summary.rate,
+		padRouted: padsRouted,
+		padTotal: padsTotal,
+		padRate: payload.summary.padRate,
 		failed: result.failed,
 		partial: result.partial.map(n => ({
 			name: n,
@@ -340,7 +367,7 @@ for (const name of dumps) {
 		},
 	};
 	fs.writeFileSync(path.join(outDir, 'digest.json'), JSON.stringify(digest, null, 1), 'utf8');
-	console.log(`[${idx}/${dumps.length}] ${name}: ${routed}/${total}（${payload.summary.rate}%）DRC违规 ${drc.violationCount} 接缝缺陷 ${joints.gaps + joints.sharp + joints.bigArcs}，${wallS}s`);
+	console.log(`[${idx}/${dumps.length}] ${name}: ${routed}/${total}（${payload.summary.rate}%）焊盘 ${padsRouted}/${padsTotal}（${payload.summary.padRate}%）DRC违规 ${drc.violationCount} 接缝缺陷 ${joints.gaps + joints.sharp + joints.bigArcs}，${wallS}s`);
 	summary.push({ case: name, routed, total, rate: payload.summary.rate, drc: drc.violationCount, joints: joints.gaps + joints.sharp + joints.bigArcs, wallS });
 }
 

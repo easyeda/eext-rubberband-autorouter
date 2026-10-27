@@ -258,6 +258,8 @@ export class PlanningEngine {
 	private planDeadline = Number.POSITIVE_INFINITY;
 	/** 网格兜底的总时间预算（毫秒）：占整轮预算的一小部分，防止兜底吃掉主线时间 */
 	private gridBudgetMs = 0;
+	/** hoist 重排已尝试次数（全局限次，防时间失控） */
+	private hoistAttempts = 0;
 	private logs: Array<{ level: string; message: string }> = [];
 	private cancelled = false;
 	private planOptions: PlanOptions = {};
@@ -318,6 +320,7 @@ export class PlanningEngine {
 		const budgetMs = input.budgetMs ?? 0;
 		const deadline = budgetMs > 0 ? Date.now() + budgetMs : Number.POSITIVE_INFINITY;
 		this.planDeadline = deadline;
+		this.hoistAttempts = 0;
 		// 网格兜底预算：有界预算取 20%（至少 60s），不限时给 600s 上限
 		this.gridBudgetMs = Number.isFinite(budgetMs) && budgetMs > 0
 			? Math.max(60_000, budgetMs * 0.2)
@@ -328,6 +331,13 @@ export class PlanningEngine {
 
 		this.log(`网络顺序（${this.planOptions.netOrder ?? 'auto'}）：${networks.map(n => n.name).join(' → ')}`, 'info');
 		const pendingNets: Array<{ name: string; pads: EnginePad[] }> = [];
+
+		let __tPhase = Date.now();
+		const __phase = (label: string) => {
+			const now = Date.now();
+			this.log(`[耗时] ${label}: ${((now - __tPhase) / 1000).toFixed(1)}s（累计 ${((now - deadline + budgetMs) / 1000).toFixed(0)}s /${(budgetMs / 1000).toFixed(0)}s）`, 'info');
+			__tPhase = now;
+		};
 
 		// 第一轮：逐网络布线
 		for (let ni = 0; ni < networks.length; ni++) {
@@ -346,6 +356,7 @@ export class PlanningEngine {
 			if (!ok) pendingNets.push(net);
 		}
 
+		__phase('首轮快扫');
 		// 多轮撕毁重布
 		const ripupRounds = Math.max(0, Math.round(this.planOptions.ripupRounds ?? 3));
 		for (let pass = 0; pass < ripupRounds && pendingNets.length; pass++) {
@@ -385,7 +396,15 @@ export class PlanningEngine {
 					// 快扫遗留：未被封口的网补一次完整链尝试（快扫只试直连，
 					// 这些网还没享受过边界候选退避/换层链）；仍失败才顺延
 					const rok = await this.routeNetEdges(net);
-					if (!rok) next.push(net);
+					if (rok) continue;
+					// hoist：端点附近没抓到封口，但 MST 走廊上可能压着别的网。
+					// 把「堵在走廊上的网」挪到本网之后（先布本网再补它），
+					// 这是拥塞板提高连通率的关键手段；失败自动回滚不净损失。
+					if (this.hoistAttempts < 16 && Date.now() < deadline - 30_000) {
+						this.hoistAttempts++;
+						if (await this.tryHoistReroute(net, networks)) continue;
+					}
+					next.push(net);
 					continue;
 				}
 				this.log(`第 ${pass + 1} 轮：网络 ${net.name} 撕毁 ${rip.join(', ')} 重试`, 'warn');
@@ -484,6 +503,7 @@ export class PlanningEngine {
 			pendingNets.push(...next);
 		}
 
+		__phase('撕毁重布轮');
 		// 最终成组重布：以失败网的「焊盘中心连线」为走廊，撕掉走廊上其它网络的
 		// 走线/过孔（端点附近探测抓不到中段阻挡 —— 例如扇出排里外层网络的斜线
 		// 正好切过内层网络的必经通道），失败网按内向优先重布，再重布被拆网
@@ -609,6 +629,7 @@ export class PlanningEngine {
 			}
 		}
 
+		__phase('成组重布');
 		// 最后优化阶段：对已布网络重新求一次「中心到中心」最短路径，
 		// 成功且更短才替换，失败保留首轮连通走线。
 		if (this.planOptions.optimize === true && this.routedOrder.length > 0 &&
@@ -616,11 +637,20 @@ export class PlanningEngine {
 			await this.optimizeRoutes(networks);
 		}
 
+		__phase('最终优化');
+		// 网格抢救：对仍有缺失边的网络，逐边用网格 A* 再试一次（一次性）。
+		// 放在冲突消除之前：先保证连通率，再谈走线形态优化。
+		if (!this.checkCancelled() && Date.now() <= deadline) {
+			await this.gridRescuePhase(networks);
+		}
+
+		__phase('网格抢救');
 		// 冲突消除：被别的网络挡住而绕远的网络，重新安置到更短的通道
 		if (!this.checkCancelled() && Date.now() <= deadline) {
 			await this.resolveContention(networks);
 		}
 
+		__phase('冲突消除');
 		// 过孔换层兜底：单层容量不足时，失败网络走底层，两端用逃逸段+过孔连接
 		if (this.planOptions.allowViaFallback !== false && !this.checkCancelled() && Date.now() <= deadline) {
 			// 部分布通网络先做最后一轮逐边重试：回滚机制保证其有效走线完好，
@@ -1192,7 +1222,10 @@ export class PlanningEngine {
 		const attemptVias: PlannedVia[] = [];
 
 		for (const [si, di] of edges) {
-			if (this.checkCancelled()) return false;
+			if (this.checkCancelled() || Date.now() > this.planDeadline) return false;
+			// 预算纪律：单网重布（尤其带网格兜底的重试）不应无限推进，
+			// 否则收尾阶段会把整轮预算顶穿（实测超时 10 分钟以上）
+			if (Date.now() > this.planDeadline) return false;
 			const key = edgeKey(si, di);
 			if (done.has(key)) continue;
 			const src = net.pads[si], dst = net.pads[di];
@@ -1302,8 +1335,9 @@ export class PlanningEngine {
 				}
 			}
 
-			// 兜底：网格 A* 求解（可视图失败的典型原因是端点被邻盘净距圈封死、
-			// 或必经点不在切点图上）。只在完整链（非快扫）里启用，单边代价可控。
+			// 网格兜底：可视图失败后接管。重试次数不限 —— 实测收益正来自
+			// 「每轮盘面变化后再试」（限 3 次时基准板 9/14→7/14）；总代价由
+			// gridBudgetMs（整轮预算的 20%）封顶，配合逐边 deadline 检查兜底。
 			if (!rendered && mode !== 'quick') {
 				const g = await this.gridFallbackEdge(src, dst, net.name);
 				if (g) {
@@ -1364,6 +1398,58 @@ export class PlanningEngine {
 	}
 
 	/**
+	 * 网格抢救阶段：对每个仍有缺失边的网络，逐边用网格 A* 再试一次。
+	 *
+	 * 设计要点（实测教训）：网格求解的代价是「光栅化 + A*」，若放在
+	 * routeNetEdges 的重试链里，同一条边会在每轮重试中反复光栅化，
+	 * 大板上直接把整轮预算顶穿（F407 实测 30 分钟预算跑出 40 分钟 CPU）。
+	 * 因此改为**一次性**：每条缺失边最多尝试一次，且受 gridBudgetMs 约束。
+	 */
+	private async gridRescuePhase(networks: Array<{ name: string; pads: EnginePad[] }>): Promise<void> {
+		for (const net of networks) {
+			if (this.checkCancelled()) break;
+			if (this.gridBudgetMs <= 0) break;
+			if (Date.now() > this.planDeadline - 5_000) break;
+			if (this.routedOrder.includes(net.name)) continue;
+			const edges = this.computeMST(net.pads);
+			const done = this.routedEdges.get(net.name) ?? new Set<string>();
+			const missing = edges.filter(([si, di]) => !done.has(`${net.pads[si].id}->${net.pads[di].id}`));
+			if (!missing.length) continue;
+			let rescued = 0;
+			for (const [si, di] of missing) {
+				if (this.checkCancelled() || this.gridBudgetMs <= 0) break;
+				const src = net.pads[si], dst = net.pads[di];
+				const g = await this.gridFallbackEdge(src, dst, net.name);
+				if (!g) continue;
+				const rds = this.netRendered.get(net.name) ?? [];
+				rds.push(...mergePrims(g.prims));
+				this.netRendered.set(net.name, rds);
+				this.addRenderedToObstacles(mergePrims(g.prims));
+				this.plannedVias.push(...g.vias);
+				for (const v of g.vias) {
+					this.dynamicObstacles.push({
+						id: `via${this.obstacleIdCounter++}`, kind: 'circle', x: v.x, y: v.y,
+						r: v.dia / 2 + Math.max(this.drc.trackToTrackMil, this.drc.trackToPadMil) + this.drc.traceWidthMil / 2 + 0.1,
+						net: v.net, layer: undefined, group: `via:${v.net}:${v.x},${v.y}`, noPrune: true,
+					});
+				}
+				done.add(`${src.id}->${dst.id}`);
+				rescued++;
+			}
+			if (rescued) {
+				this.routedEdges.set(net.name, done);
+				const complete = edges.every(([si, di]) => done.has(`${net.pads[si].id}->${net.pads[di].id}`));
+				if (complete && !this.routedOrder.includes(net.name)) this.routedOrder.push(net.name);
+				this.callbacks.onNetUpdate?.(
+					net.name, mergePrims(this.netRendered.get(net.name) ?? []),
+					this.plannedVias.filter(v => v.net === net.name), true, this.padProgress(net, edges),
+				);
+				if (complete) this.log(`网络 ${net.name} 由网格抢救布通`, 'success');
+			}
+		}
+	}
+
+	/**
 	 * 网格 A* 兜底（单条连接）：可视图失败后接管。
 	 *
 	 * 网格求解把障碍光栅化成占据图，从焊盘内部多点起步，因此能处理
@@ -1414,6 +1500,110 @@ export class PlanningEngine {
 			});
 		this.log(`网络 ${netName}: ${src.id}→${dst.id} 由网格兜底布通（${prims.length} 段${vias.length ? `，${vias.length} 过孔` : ''}）`, 'info');
 		return { prims, vias };
+	}
+
+	/**
+	 * hoist 重排：把沿本网 MST 走廊阻挡的已布网络挪到本网之后。
+	 *
+	 * 与「撕毁重布」的区别：后者按端点附近的封口挑对象（局部），hoist 按
+	 * **整条走廊的遮挡量**挑对象（全局）——拥塞板上失败网常被中段的一两条
+	 * 长线挡住，端点处却什么都没抓到。
+	 *
+	 * 安全约束与其它拆网动作一致：先快照，本网布通且被挪网全部布回才接受，
+	 * 否则整体回滚，绝不净损失已布网络。被挪网最多 2 个、焊盘数 ≤12
+	 * （重布代价与焊盘数成正比），全局尝试次数受限。
+	 */
+	private async tryHoistReroute(
+		net: { name: string; pads: EnginePad[] },
+		networks: Array<{ name: string; pads: EnginePad[] }>,
+	): Promise<boolean> {
+		if (this.checkCancelled() || Date.now() > this.planDeadline) return false;
+		const corridor = this.drc.trackToTrackMil + this.drc.traceWidthMil + 20;
+		const score = new Map<string, number>();
+		for (const [ia, ib] of this.computeMST(net.pads)) {
+			const pa = net.pads[ia], pb = net.pads[ib];
+			for (const o of this.dynamicObstacles) {
+				if (o.soft || !o.net || o.net === net.name) continue;
+				if (!this.routedOrder.includes(o.net)) continue;
+				if (pointSegDist(o.x, o.y, pa.x, pa.y, pb.x, pb.y) < o.r + corridor) {
+					score.set(o.net, (score.get(o.net) ?? 0) + 1);
+				}
+			}
+		}
+		if (!score.size) return false;
+		const picks = [...score.entries()].sort((a, b) => b[1] - a[1]).slice(0, 2)
+			.map(([n]) => networks.find(x => x.name === n))
+			.filter((n): n is { name: string; pads: EnginePad[] } => !!n)
+			.filter(n => n.pads.length <= 12);
+		if (!picks.length) return false;
+
+		// 快照：被挪网 + 本网（本网可能带部分走线）
+		const savedOrder = [...this.routedOrder];
+		const saved = new Map<string, { prims: RenderedPrim[]; vias: PlannedVia[]; idx: number }>();
+		for (const p of picks) {
+			saved.set(p.name, {
+				prims: [...(this.netRendered.get(p.name) ?? [])],
+				vias: this.plannedVias.filter(v => v.net === p.name),
+				idx: this.routedOrder.indexOf(p.name),
+			});
+		}
+		const savedSelf = {
+			prims: [...(this.netRendered.get(net.name) ?? [])],
+			vias: this.plannedVias.filter(v => v.net === net.name),
+			doneEdges: new Set(this.routedEdges.get(net.name) ?? []),
+		};
+		for (const p of picks) this.ripupNet(p.name);
+
+		const okNet = await this.routeNetEdges(net);
+		let okAll = okNet;
+		if (okNet) {
+			// 被挪网按「先布的原顺序」补回（逆序撕裂，正序补回更容易贴合）
+			for (let i = picks.length - 1; i >= 0; i--) {
+				if (!(await this.routeNetEdges(picks[i]))) { okAll = false; break; }
+			}
+		}
+
+		if (okNet && okAll) {
+			this.log(`hoist：${net.name} 提前于 ${picks.map(p => p.name).join(', ')} 布通`, 'success');
+			return true;
+		}
+
+		// 回滚：本网与被挪网全部恢复到动作前
+		this.ripupNetInternal(net.name, true);
+		for (const p of picks) this.ripupNetInternal(p.name, true);
+		if (savedSelf.prims.length) {
+			this.netRendered.set(net.name, [...savedSelf.prims]);
+			this.addRenderedToObstacles(mergePrims(savedSelf.prims));
+		}
+		this.routedEdges.set(net.name, new Set(savedSelf.doneEdges));
+		this.plannedVias = this.plannedVias.filter(v => v.net !== net.name).concat(savedSelf.vias);
+		for (const p of picks) {
+			const sv = saved.get(p.name)!;
+			if (sv.prims.length) {
+				this.netRendered.set(p.name, [...sv.prims]);
+				this.addRenderedToObstacles(mergePrims(sv.prims));
+			}
+			this.plannedVias = this.plannedVias.filter(v => v.net !== p.name).concat(sv.vias);
+			this.markAllEdgesDone(p);
+		}
+		// 过孔障碍重新登记 + 顺序恢复
+		for (const v of this.plannedVias) {
+			if (v.net !== net.name && !picks.some(p => p.name === v.net)) continue;
+			this.dynamicObstacles.push({
+				id: `via${this.obstacleIdCounter++}`, kind: 'circle',
+				x: v.x, y: v.y,
+				r: v.dia / 2 + Math.max(this.drc.trackToTrackMil, this.drc.trackToPadMil) + this.drc.traceWidthMil / 2 + 0.1,
+				net: v.net, layer: undefined, group: `via:${v.net}:${v.x},${v.y}`, noPrune: true,
+			});
+		}
+		this.routedOrder = savedOrder;
+		// 画布同步
+		for (const p of picks) {
+			const sv = saved.get(p.name)!;
+			this.callbacks.onNetUpdate?.(p.name, mergePrims(sv.prims), sv.vias, sv.prims.length > 0, this.padProgress(p));
+		}
+		this.callbacks.onNetUpdate?.(net.name, mergePrims(savedSelf.prims), savedSelf.vias, savedSelf.prims.length > 0, this.padProgress(net));
+		return false;
 	}
 
 	/** 把一个网络的全部 MST 连接登记为已完成（回滚「原本已完整布通」的走线时用） */
@@ -1710,7 +1900,7 @@ export class PlanningEngine {
 			const grid: Slot[] = [];
 			let rej = { own: 0, pads: 0, via: 0 };
 			for (let gx = x0; gx <= pad.x + R; gx += step) {
-				if (this.checkCancelled()) return out;
+				if (this.checkCancelled() || Date.now() > this.planDeadline) return out;
 				for (let gy = y0; gy <= pad.y + R; gy += step) {
 					const d = Math.hypot(gx - pad.x, gy - pad.y);
 					if (d < pad.radius || d > R) continue;
@@ -1757,7 +1947,7 @@ export class PlanningEngine {
 			if (good.length === 0) {
 				let routerOk = 0;
 				for (const g of grid.filter(s => s.kind === 'router').slice(0, 6)) {
-					if (this.checkCancelled()) return out;
+					if (this.checkCancelled() || Date.now() > this.planDeadline) return out;
 					const r = await routePadEdge(term, cornerTerm(g.x, g.y), localTop, netName,
 						{ isCancelled: () => this.checkCancelled() });
 					if (!r.ok || r.prims.length === 0) continue;
@@ -1981,7 +2171,7 @@ export class PlanningEngine {
 				stubFeasible(cornerTerm(cx, cy), gx2, gy2, localTop, net.name);
 			const step = 8;
 			for (let gx = Math.ceil((pad.x - R) / step) * step; gx <= pad.x + R; gx += step) {
-				if (this.checkCancelled()) return false;
+				if (this.checkCancelled() || Date.now() > this.planDeadline) return false;
 				for (let gy = Math.ceil((pad.y - R) / step) * step; gy <= pad.y + R; gy += step) {
 					const d = Math.hypot(gx - pad.x, gy - pad.y);
 					if (d < pad.radius || d > R) continue;
@@ -2166,7 +2356,7 @@ export class PlanningEngine {
 
 		let routed = false;
 		for (const [endA, endB] of pairs.slice(0, 4)) {
-			if (this.checkCancelled()) return false;
+			if (this.checkCancelled() || Date.now() > this.planDeadline) return false;
 			// 底层优先直连（任意角度最短线），被挡时才跑可视图
 			const bottomBlocked = bottomObs.some(o =>
 				!o.soft && o.net !== net.name &&
