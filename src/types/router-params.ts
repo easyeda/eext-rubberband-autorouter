@@ -81,7 +81,9 @@ export function normalizeRouterOptions(input: Partial<RouterUiOptions> | undefin
 		escapeClearanceMil: clamp(o.escapeClearanceMil, 0, 40, DEFAULT_ROUTER_OPTIONS.escapeClearanceMil),
 		ripupRounds: Math.round(clamp(o.ripupRounds, 0, 6, DEFAULT_ROUTER_OPTIONS.ripupRounds)),
 		powerNetsFirst: !!o.powerNetsFirst,
-		budgetMs: clamp(o.budgetMs, 0, 3600000, DEFAULT_ROUTER_OPTIONS.budgetMs),
+		// 「不限时」档位已取消：旧配置里的 0 归到 60 分钟（引擎内部同样封顶 60 分钟，
+		// 实测不限时跑 9.8 小时布通率反而比 30 分钟预算低）
+		budgetMs: o.budgetMs && o.budgetMs > 0 ? clamp(o.budgetMs, 60_000, 3_600_000, DEFAULT_ROUTER_OPTIONS.budgetMs) : 3_600_000,
 		livePreview: o.livePreview !== false,
 		finalOptimize: o.finalOptimize !== false,
 		viaFallback: o.viaFallback !== false,
