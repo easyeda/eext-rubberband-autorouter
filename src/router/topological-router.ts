@@ -20,6 +20,7 @@ import {
 	mergePrims, isGroundNetName, isPowerNetName,
 } from './planning-engine';
 import { createPlanningWorker } from './worker-source';
+import { parsePolygonPath } from './polygon-parse';
 import {
 	RouterUiOptions, RouteStats, RouteSummary, BoardInspection,
 } from '../types/router-params';
@@ -77,7 +78,91 @@ export class TopologicalRouter {
 	private netPadStats = new Map<string, { total: number; routed: number }>();
 	private totalPads = 0;
 
-	private applyQueue: Promise<void> = Promise.resolve();
+	/**
+	 * 主线程写入调度器（差量合并 + 限速）：引擎在 worker 里只管输出，
+	 * 这里的写入绝不反压引擎。同网合并 = 队列中该网只保留最新任务
+	 * （任务自含「删旧写新」语义，最新状态覆盖旧状态）；写入间隔让出
+	 * 30ms CPU，避免 EDA 写盘的同步开销挤占 worker 的算力
+	 * （实测不节流时快扫 26s → 56s）。
+	 */
+	/** 定稿闸门：收尾对账开始后，在途的逐网消息一律忽略（否则旧几何会把终态覆盖回去） */
+	private finalizing = false;
+	/** 单网最后写入时刻（限频用） */
+	private lastWriteAt = new Map<string, number>();
+	/** 单网已写入几何的签名（收尾时跳过无变化的重写） */
+	private netWrittenSig = new Map<string, string>();
+	/** 节拍刷新的待写队列（name → 最新几何；prims 为空表示该网要删除） */
+	private livePending = new Map<string, { prims: RenderedPrim[]; vias: PlannedVia[] }>();
+	private liveTimer: ReturnType<typeof setInterval> | null = null;
+	/** 画布刷新间隔：全局统一 5 秒一次（用户指定） */
+	private readonly LIVE_INTERVAL_MS = 5000;
+
+	private ensureLiveTimer(): void {
+		if (this.liveTimer) return;
+		this.liveTimer = setInterval(() => { void this.flushLive(); }, this.LIVE_INTERVAL_MS);
+	}
+
+	/** 节拍到点：把累积的最新几何批量写入画布 */
+	private async flushLive(): Promise<void> {
+		if (this.finalizing || !this.livePending.size) return;
+		const batch = [...this.livePending.entries()];
+		this.livePending.clear();
+		for (const [name, g] of batch) {
+			if (this.finalizing) { this.livePending.clear(); return; }
+			try {
+				if (!g.prims.length) await this.deleteNet(name);
+				else await this.writeNet(name, g.prims, g.vias);
+			} catch (err) {
+				console.warn('[TopologicalRouter] 节拍写入失败:', err);
+			}
+		}
+	}
+
+	private stopLiveTimer(): void {
+		if (this.liveTimer) {
+			clearInterval(this.liveTimer);
+			this.liveTimer = null;
+		}
+		this.livePending.clear();
+	}
+
+	private applyPending = new Map<string, () => Promise<void>>();
+	private applyDraining = false;
+	private applyWaiters: Array<() => void> = [];
+
+	private enqueueWrite(key: string, task: () => Promise<void>): void {
+		this.applyPending.set(key, task);   // 同 key 合并：引擎最新状态覆盖旧任务
+		void this.drainApplies();
+	}
+
+	private async drainApplies(): Promise<void> {
+		if (this.applyDraining) return;
+		this.applyDraining = true;
+		for (;;) {
+			const next = this.applyPending.entries().next();
+			if (next.done || !next.value) break;
+			const key = next.value[0];
+			const task = next.value[1];
+			this.applyPending.delete(key);
+			try {
+				await task();
+			} catch (err) {
+				console.warn('[TopologicalRouter] 写入任务失败:', err);
+				this.onLog?.('写入图元失败：' + (err instanceof Error ? err.message : String(err)), 'error');
+			}
+			if (this.applyPending.size) await new Promise<void>(r => setTimeout(r, 30));
+		}
+		this.applyDraining = false;
+		const waiters = this.applyWaiters.splice(0);
+		for (const w of waiters) w();
+	}
+
+	/** 等待写入队列排空（run 收尾/finish 前调用） */
+	private applyIdle(): Promise<void> {
+		if (!this.applyDraining && !this.applyPending.size) return Promise.resolve();
+		return new Promise<void>(resolve => this.applyWaiters.push(resolve));
+	}
+
 	private worker: Worker | null = null;
 	private engine: PlanningEngine | null = null;
 	private forceFinish: (() => void) | null = null;
@@ -120,7 +205,9 @@ export class TopologicalRouter {
 				const netPads: EnginePad[] = [];
 				for (const prim of primitives) {
 					const p = prim as any;
-					if (p.type !== undefined && p.type !== 1) continue; // 只要焊盘
+					// type: 1 = SMD 焊盘，2 = 通孔焊盘（旧实现只收 1，TH 焊盘对路由器隐形 ——
+					// 实测走线穿过 RST 通孔焊盘 0.2mil，EDA DRC 报 TH Pad to Track）
+					if (p.type !== undefined && p.type !== 1 && p.type !== 2) continue;
 					const x: number = p.center?.x ?? p.x ?? p.startX ?? 0;
 					const y: number = p.center?.y ?? p.y ?? p.startY ?? 0;
 					if (x === 0 && y === 0 && !p.center) continue;
@@ -329,25 +416,7 @@ export class TopologicalRouter {
 	/** 收集静态铜层障碍（折线/线条/填充/板框），不含焊盘 */
 	private async collectStaticObstacles(drc: DRCRules): Promise<RBObstacle[]> {
 		const obstacles: RBObstacle[] = [];
-		const parsePath = (polygon: any[]): Array<{ x: number; y: number }> => {
-			if (!polygon || polygon.length < 3) return [];
-			if (polygon[0] === 'R' && polygon.length >= 5) {
-				const x = polygon[1], y = polygon[2], w = polygon[3], h = polygon[4];
-				return [
-					{ x, y: y - h }, { x: x + w, y: y - h },
-					{ x: x + w, y }, { x, y }, { x, y: y - h },
-				];
-			}
-			const pts: Array<{ x: number; y: number }> = [];
-			let i = 0;
-			while (i < polygon.length) {
-				if (typeof polygon[i] === 'number' && typeof polygon[i + 1] === 'number') {
-					pts.push({ x: polygon[i], y: polygon[i + 1] });
-					i += 2;
-				} else i++;
-			}
-			return pts;
-		};
+		const parsePath = parsePolygonPath;
 
 		// 折线（含无网络走线与板框）：拐点圆可绕行 + 沿线阻挡圆
 		const polylines = await eda.pcb_PrimitivePolyline.getAll();
@@ -381,6 +450,18 @@ export class TopologicalRouter {
 			const l = line as any;
 			const net: string = l.net ?? '';
 			const layer: number = l.layerId ?? l.layer ?? 1;
+			if (layer === 11) {
+				// 板框常用「4 条独立 Line」绘制（不是闭合 Polyline）——漏收
+				// 就是过孔打在板框上、走线贴边（实测用户板）。口径与 Polyline
+				// 板框一致：阻挡所有层 + trackToBoard 间距。
+				const lw = l.lineWidth ?? 10;
+				const r = lw / 2 + drc.trackToBoardMil + drc.traceWidthMil / 2;
+				obstacles.push(...buildPolylineObstacle(
+					[{ x: l.startX ?? 0, y: l.startY ?? 0 }, { x: l.endX ?? 0, y: l.endY ?? 0 }],
+					r, undefined, undefined, 'board', true,
+				));
+				continue;
+			}
 			if (layer !== 1 && layer !== 2 && layer !== 12) continue;
 			const lw = l.lineWidth ?? 10;
 			const lineClear = Math.max(drc.trackToLineMil, 8);
@@ -389,6 +470,41 @@ export class TopologicalRouter {
 				[{ x: l.startX ?? 0, y: l.startY ?? 0 }, { x: l.endX ?? 0, y: l.endY ?? 0 }],
 				r, net || undefined, layer, `line:${l.primitiveId ?? ''}`,
 			));
+		}
+
+		// 圆弧（板框圆角 + 圆弧走线）：采样成折线障碍
+		const arcs = await eda.pcb_PrimitiveArc.getAll();
+		for (const arc of arcs) {
+			const o = arc as any;
+			const net: string = o.net ?? '';
+			const layer: number = o.layerId ?? o.layer ?? 1;
+			const lw = o.lineWidth ?? 10;
+			const sx = o.startX ?? 0, sy = o.startY ?? 0;
+			const ex = o.endX ?? 0, ey = o.endY ?? 0;
+			const sweep = (o.arcAngle ?? 0) * Math.PI / 180;
+			const L = Math.hypot(ex - sx, ey - sy);
+			if (!sweep || Math.abs(Math.sin(sweep / 2)) < 1e-6 || L < 1e-6) continue;
+			// 由弦 + 扫角反推圆心（sweep 正 = 数学正方向，与 EDA 渲染约定一致）
+			const R = L / (2 * Math.abs(Math.sin(sweep / 2)));
+			const sgn = sweep > 0 ? 1 : -1;
+			const h = sgn * R * Math.cos(sweep / 2);
+			const nx = -(ey - sy) / L, ny = (ex - sx) / L;
+			const cx = (sx + ex) / 2 + h * nx, cy = (sy + ey) / 2 + h * ny;
+			const a0 = Math.atan2(sy - cy, sx - cx);
+			const pts: Array<{ x: number; y: number }> = [];
+			const steps = Math.max(6, Math.ceil(Math.abs(sweep) / (Math.PI / 12)));   // ≤15°/步
+			for (let k = 0; k <= steps; k++) {
+				const ang = a0 + (Math.abs(sweep) * k) / steps * sgn;
+				pts.push({ x: cx + R * Math.cos(ang), y: cy + R * Math.sin(ang) });
+			}
+			if (layer === 11) {
+				const r = lw / 2 + drc.trackToBoardMil + drc.traceWidthMil / 2;
+				obstacles.push(...buildPolylineObstacle(pts, r, undefined, undefined, 'board', true));
+			} else if (layer === 1 || layer === 2 || layer === 12) {
+				const lineClear = Math.max(drc.trackToLineMil, 8);
+				const r = lw / 2 + lineClear + drc.traceWidthMil / 2 + 2;
+				obstacles.push(...buildPolylineObstacle(pts, r, net || undefined, layer, `arc:${sx.toFixed(0)},${sy.toFixed(0)}`));
+			}
 		}
 
 		// 填充（铜皮矩形/多边形，无网络视为禁布）
@@ -406,6 +522,30 @@ export class TopologicalRouter {
 			if (pts.length >= 3) {
 				obstacles.push(...buildPolygonObstacle(pts, r, net || undefined, layer, `fill:${pts[0]?.x},${pts[0]?.y}`, true));
 			}
+		}
+
+		// 既有过孔（设计里手工放置 / 上一轮残留）：贯通各层的铜环，布线必须避让。
+		// 旧实现完全没收集——实测 39 个既有过孔对路由器隐形，走线直接压过
+		// （EDA DRC 报 Hole to Track / SMD Pad to Via）。
+		// 注：clearExistingTraces 会先删除待布网络的过孔，故此处只剩真正需要避让的。
+		const viaPrims = await eda.pcb_PrimitiveVia.getAll();
+		const viaClear = Math.max(drc.trackToTrackMil, drc.trackToPadMil);
+		for (const v of viaPrims ?? []) {
+			const vp = v as any;
+			const vx = vp.x ?? vp.center?.x;
+			const vy = vp.y ?? vp.center?.y;
+			if (typeof vx !== 'number' || typeof vy !== 'number') continue;
+			const dia = Number(vp.diameter) || 24;
+			obstacles.push({
+				id: `via${obstacles.length}`,
+				kind: 'circle',
+				x: vx, y: vy,
+				r: dia / 2 + viaClear + drc.traceWidthMil / 2 + 0.1,
+				net: vp.net || undefined,
+				layer: undefined,
+				group: `via:${vp.net ?? ''}:${vx.toFixed(1)},${vy.toFixed(1)}`,
+				noPrune: true,
+			});
 		}
 
 		this.onLog?.(`静态障碍：${obstacles.length} 个圆（阻挡 ${obstacles.filter(o => o.blockerOnly).length}）`, 'info');
@@ -443,7 +583,10 @@ export class TopologicalRouter {
 			this.netPadStats.clear();
 			this.totalPads = 0;
 			this.padShapeCache.clear();
-			this.applyQueue = Promise.resolve();
+			this.applyPending.clear();
+			this.applyDraining = false;
+			const ws = this.applyWaiters.splice(0);
+			for (const w of ws) w();
 			this.totalNets = 0;
 
 			this.onProgress?.({ stage: '读取规则', percentage: 3, message: '正在读取 DRC 间距规则...' });
@@ -551,7 +694,7 @@ export class TopologicalRouter {
 			}
 
 			// 等待所有实时写入完成
-			await this.applyQueue;
+			await this.applyIdle();
 
 			// 最终对账：完全失败的网不得残留图元；部分连通的网要保留已布走线
 			// （否则一条连接失败会把整网其它已布好的线段一并删掉）。
@@ -568,22 +711,58 @@ export class TopologicalRouter {
 
 			// 收尾对账：EDA 的批量删除偶发不生效，运行中途被替换掉的尝试走线
 			// 可能残留在画布上（与最终走线叠画、引发 DRC 冲突）。规划结束后
-			// 文档已空闲，按最终规划逐网清写一遍，保证画布与引擎终态一致。
+			// 文档已空闲，按**引擎终态**（result）逐网清写一遍——不能用消息
+			// 历史（pendingPlanned）：引擎结尾还有终局修复（拆除违规过孔等），
+			// 消息历史停在修复之前，画布会残留已被引擎丢弃的图元（实测过孔
+			// 间距违规在画布上复现、引擎侧却已清除）。
 			if (options.livePreview !== false && !this.shouldCancel) {
-				for (const name of new Set([...this.routedNames, ...this.failedNames])) {
-					const planned = this.pendingPlanned.get(name);
-					if (planned && planned.prims.length) {
-						await this.writeNet(name, planned.prims, planned.vias, true);
-					} else {
-						await this.purgeNetFromDocument(name);
-					}
+				this.finalizing = true;   // 定稿：之后的迟到消息不再写画布
+				const finalPrims = new Map<string, RenderedPrim[]>();
+				const finalVias = new Map<string, PlannedVia[]>();
+				for (const n of result.nets) finalPrims.set(n.name, n.prims);
+				for (const v of result.vias) {
+					const arr = finalVias.get(v.net) ?? [];
+					arr.push(v);
+					finalVias.set(v.net, arr);
 				}
+				// 一次性全局清理：逐网 purgeNetFromDocument 会为每个网全文档
+				// 扫描 3 类图元 × 2 轮（64 个网 = 数百次全扫，实测收尾吃掉
+				// ~400s）。这里把所有托管网络一次扫完批量删，然后直接写入。
+				const managed = new Set<string>([
+					...this.routedNames, ...this.failedNames,
+					...finalPrims.keys(), ...finalVias.keys(),
+					...this.touchedNets, ...this.netPrimIds.keys(),
+				]);
+				const purgedTotal = await this.purgeManagedNets(managed);
+				if (purgedTotal) this.onLog?.(`收尾：一次性清理 ${purgedTotal} 个图元`, 'info');
+				// 记录已清空：writeNet 内部的 deleteNet 会因此直接返回，
+				// 不再触发按网名的全文档扫描
+				this.netPrimIds.clear();
+				this.touchedNets.clear();
+				for (const name of managed) {
+					const prims = finalPrims.get(name) ?? [];
+					const vias = finalVias.get(name) ?? [];
+					if (!prims.length) continue;
+					await this.writeNet(name, prims, vias, true);
+				}
+				// 关键：清空 pendingPlanned。它保存的是消息历史（终局修复之前
+				// 的几何），下面的 flushPending 若无脑重写，会把刚写好的终态
+				// 覆盖回旧几何 —— 这正是「引擎已去重、画布仍残留违规过孔」的元凶。
+				this.pendingPlanned.clear();
 			}
 
 			// 无论是否实时预览，都必须等画布写入队列排空再报完成 ——
 			// 否则进度条已 100%、按钮可点，画布却还在逐网重绘（用户可见的
 			// 「拆线重试」假象，2026-10-24 实测）
 			await this.flushPending();
+
+			// 兜底核对：画布必须与引擎终态完全一致。实测 EDA 的按 ID 删除
+			// 偶发漏删、重复写入会留下同坐标幽灵过孔（引擎侧已去重，画布仍在，
+			// EDA DRC 照样报 Track to Via）。这里按终态扫描一次，删掉多余的，
+			// 数量不符的整网重写。
+			if (options.livePreview !== false && !this.shouldCancel) {
+				await this.reconcileCanvas(result);
+			}
 
 			// 以规划结果为准刷新统计
 			if (!this.shouldCancel) {
@@ -617,6 +796,8 @@ export class TopologicalRouter {
 			this.worker = null;
 			this.engine = null;
 			this.forceFinish = null;
+			this.finalizing = false;
+			this.stopLiveTimer();
 			this.isRouting = false;
 		}
 	}
@@ -632,7 +813,7 @@ export class TopologicalRouter {
 				settled = true;
 				this.forceFinish = null;
 				// 等实时写入队列清空再收尾
-				this.applyQueue.then(fn, fn);
+				this.applyIdle().then(fn, fn);
 			};
 
 			this.forceFinish = () => finish(() => resolve({
@@ -672,7 +853,7 @@ export class TopologicalRouter {
 								routed: Number(msg.pads.routed) || 0,
 							});
 						}
-						this.enqueue(() => this.applyNet(msg.name, msg.prims ?? [], msg.vias ?? [], msg.ok !== false));
+						this.enqueueWrite('net:' + msg.name, () => this.applyNet(msg.name, msg.prims ?? [], msg.vias ?? [], msg.ok !== false));
 						break;
 					case 'ripup':
 						for (const name of msg.names ?? []) {
@@ -681,7 +862,7 @@ export class TopologicalRouter {
 							const padStat = this.netPadStats.get(name);
 							if (padStat) padStat.routed = 0;
 						}
-						this.enqueue(() => this.applyRipup(msg.names ?? []));
+						this.enqueueWrite('ripup:' + (msg.names ?? []).join(','), () => this.applyRipup(msg.names ?? []));
 						break;
 					case 'done':
 						finish(() => resolve(msg.result as PlanningResult));
@@ -718,7 +899,7 @@ export class TopologicalRouter {
 					this.failedNames.add(name);
 				}
 				if (pads) this.netPadStats.set(name, { total: pads.total, routed: pads.routed });
-				this.enqueue(() => this.applyNet(name, prims, vias, ok));
+				this.enqueueWrite('net:' + name, () => this.applyNet(name, prims, vias, ok));
 			},
 			onRipup: (names) => {
 				for (const name of names) {
@@ -727,7 +908,7 @@ export class TopologicalRouter {
 					const padStat = this.netPadStats.get(name);
 					if (padStat) padStat.routed = 0;
 				}
-				this.enqueue(() => this.applyRipup(names));
+				this.enqueueWrite('ripup:' + names.join(','), () => this.applyRipup(names));
 			},
 			isCancelled: () => this.shouldCancel,
 		});
@@ -735,17 +916,9 @@ export class TopologicalRouter {
 
 	// ── 画布写入 ────────────────────────────────
 
-	private enqueue(task: () => Promise<void>): void {
-		this.applyQueue = this.applyQueue
-			.then(task)
-			.catch(err => {
-				console.warn('[TopologicalRouter] 写入任务失败:', err);
-				this.onLog?.('写入图元失败：' + (err instanceof Error ? err.message : String(err)), 'error');
-			});
-	}
-
 	/** 实时模式：替换该网络的画布图元；预览关闭时仅暂存 */
 	private async applyNet(name: string, prims: RenderedPrim[], vias: PlannedVia[], ok: boolean): Promise<void> {
+		if (this.finalizing) return;   // 收尾后不再接受逐网消息
 		if (!ok) {
 			// 失败网络的残缺图元不写入，避免半截走线
 			if (this.currentOptions?.livePreview !== false) await this.deleteNet(name);
@@ -759,15 +932,26 @@ export class TopologicalRouter {
 			this.emitStats();
 			return;
 		}
-		await this.writeNet(name, prims, vias);
+		// 全局节拍刷新：画布统一每 5 秒刷新一次（用户指定）。不再「引擎报一次
+		// 就写一次」——撕毁重试中同一网络一轮会输出 5+ 次，每次都 delete+create
+		// 全部图元并触发 EDA 重算飞线，是预览模式最大的时间开销。现在是把期间
+		// 累积的最新几何存进 livePending，节拍到了一次性批量写入。
+		// 最终几何仍由收尾对账（引擎终态）保证，刷新节拍不会丢更新。
+		this.livePending.set(name, { prims, vias });
+		this.ensureLiveTimer();
 	}
 
 	private async applyRipup(names: string[]): Promise<void> {
+		if (this.finalizing) return;
 		for (const name of names) {
 			this.netGeom.delete(name);
 			this.pendingPlanned.delete(name);
+			this.lastWriteAt.delete(name);
+			this.netWrittenSig.delete(name);
 			if (this.currentOptions?.livePreview === false) continue;
-			await this.deleteNet(name);
+			// 删除也进节拍队列（立即删同样触发 EDA 重算），prims 为空表示删除
+			this.livePending.set(name, { prims: [], vias: [] });
+			this.ensureLiveTimer();
 		}
 		this.emitStats();
 	}
@@ -832,6 +1016,101 @@ export class TopologicalRouter {
 		return { nets: hits.size, prims };
 	}
 
+	/**
+	 * 画布 ↔ 引擎终态兜底核对。
+	 * EDA 的按 ID 删除偶发漏删、重复写入会留下同坐标幽灵过孔（引擎侧已去重，
+	 * 画布仍在 → EDA DRC 照样报 Track to Via）。这里按终态扫描：删掉多余的
+	 * 过孔，走线数量不符的整网重写（每个网最多重写一次，防止死循环）。
+	 */
+	private async reconcileCanvas(result: PlanningResult): Promise<void> {
+		const primsOf = new Map<string, RenderedPrim[]>();
+		const viasOf = new Map<string, PlannedVia[]>();
+		for (const n of result.nets) primsOf.set(n.name, n.prims);
+		for (const v of result.vias) {
+			const arr = viasOf.get(v.net) ?? [];
+			arr.push(v);
+			viasOf.set(v.net, arr);
+		}
+		const managed = new Set<string>([...this.touchedNets, ...this.netPrimIds.keys(), ...primsOf.keys(), ...viasOf.keys()]);
+		const rewritten = new Set<string>();
+		for (let round = 0; round < 3; round++) {
+			let changed = 0;
+			// 1) 过孔：不在终态里的、超额的，一律删除
+			try {
+				const want = new Map<string, number>();
+				for (const v of result.vias) {
+					const k = `${v.net}|${v.x.toFixed(1)}|${v.y.toFixed(1)}`;
+					want.set(k, (want.get(k) ?? 0) + 1);
+				}
+				const seen = new Map<string, number>();
+				const del: string[] = [];
+				for (const v of (await eda.pcb_PrimitiveVia.getAll()) ?? []) {
+					const anyV = v as any;
+					const net = String(anyV.net ?? '');
+					if (!managed.has(net)) continue;
+					const x = Number(anyV.x ?? anyV.center?.x);
+					const y = Number(anyV.y ?? anyV.center?.y);
+					if (!Number.isFinite(x) || !Number.isFinite(y)) continue;
+					const k = `${net}|${x.toFixed(1)}|${y.toFixed(1)}`;
+					const remain = want.get(k) ?? 0;
+					const used = seen.get(k) ?? 0;
+					const id = anyV.primitiveId;
+					if (!remain || used >= remain) { if (id) del.push(id); }
+					else seen.set(k, used + 1);
+				}
+				if (del.length) {
+					await eda.pcb_PrimitiveVia.delete(del);
+					changed += del.length;
+					this.onLog?.(`画布核对：删除 ${del.length} 个多余过孔`, 'info');
+				}
+			} catch { /* ignore */ }
+			// 2) 走线/圆弧数量核对：不符的整网重写
+			try {
+				const lines = (await eda.pcb_PrimitiveLine.getAll()) ?? [];
+				const arcs = (await eda.pcb_PrimitiveArc.getAll()) ?? [];
+				const count = new Map<string, number>();
+				for (const l of lines as any[]) { if (managed.has(l.net)) count.set(l.net, (count.get(l.net) ?? 0) + 1); }
+				for (const a of arcs as any[]) { if (managed.has(a.net)) count.set(a.net, (count.get(a.net) ?? 0) + 1); }
+				const rewrite: string[] = [];
+				for (const name of managed) {
+					if (rewritten.has(name)) continue;
+					const expect = (primsOf.get(name) ?? []).length;
+					const actual = count.get(name) ?? 0;
+					if (actual !== expect) rewrite.push(name);
+				}
+				for (const name of rewrite) {
+					rewritten.add(name);
+					await this.purgeNetFromDocument(name);
+					const ps = primsOf.get(name) ?? [];
+					if (ps.length) await this.writeNet(name, ps, viasOf.get(name) ?? [], true);
+					changed++;
+				}
+				if (rewrite.length) this.onLog?.(`画布核对：重写 ${rewrite.length} 个网络（数量与引擎终态不符）`, 'warn');
+			} catch { /* ignore */ }
+			if (!changed) break;
+			await new Promise(r => setTimeout(r, 200));
+		}
+	}
+
+	/** 一次性清理多个网络的全部图元（各扫描一次，批量删除） */
+	private async purgeManagedNets(nets: Set<string>): Promise<number> {
+		let removed = 0;
+		const classes = ['pcb_PrimitiveLine', 'pcb_PrimitiveArc', 'pcb_PrimitiveVia'] as const;
+		for (const cls of classes) {
+			try {
+				const items = await (eda as any)[cls].getAll();
+				const ids = (items ?? [])
+					.filter((o: any) => nets.has(String(o?.net ?? '')))
+					.map((o: any) => o?.primitiveId)
+					.filter((id: any): id is string => typeof id === 'string' && !!id);
+				if (ids.length) {
+					await (eda as any)[cls].delete(ids);
+					removed += ids.length;
+				}
+			} catch { /* ignore */ }
+		}
+		return removed;
+	}
 	/** 按网络名扫描文档并删除其全部图元，返回实际发现的残留数量 */
 	private async purgeNetFromDocument(name: string): Promise<number> {
 		let removed = 0;
@@ -958,8 +1237,20 @@ export class TopologicalRouter {
 		}
 
 		this.netGeom.set(name, { segments: written, vias: rec.vias.length });
+		this.netWrittenSig.set(name, this.netSig(prims, vias));
 		if (rec.lines.length || rec.arcs.length || rec.vias.length) this.touchedNets.add(name);
 		this.emitStats();
+	}
+
+	/** 几何签名：用于跳过无变化的重写（坐标加权和 + 数量） */
+	private netSig(prims: RenderedPrim[], vias: PlannedVia[]): string {
+		let acc = 0;
+		for (const p of prims) {
+			acc += (p.x1 ?? p.cx ?? 0) * 0.37 + (p.y1 ?? p.cy ?? 0) * 0.11
+				+ (p.x2 ?? p.r ?? 0) * 0.07 + (p.y2 ?? p.startAngle ?? 0) * 0.03 + (p.sweep ?? 0) * 0.5;
+		}
+		for (const v of vias) acc += v.x * 0.37 + v.y * 0.11;
+		return prims.length + '|' + vias.length + '|' + acc.toFixed(2);
 	}
 
 	private async flushPending(): Promise<void> {

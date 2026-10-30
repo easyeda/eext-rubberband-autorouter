@@ -28,6 +28,30 @@ export interface RouteConnectionResult {
 	prims: RBPrimitive[];
 }
 
+/** 求解累计统计（常驻、零 IO；测试台读它定位热点，不必开 debug 日志） */
+export const vrStats = {
+	calls: 0,
+	failCalls: 0,
+	solveMs: 0,
+	pairMs: 0,
+	termMs: 0,
+	arcMs: 0,
+	dijMs: 0,
+	maxN: 0,
+	sumN: 0,
+	pairsVisited: 0,
+	tubeTries: 0,
+	tubePaths: 0,
+	tubeSolveOk: 0,
+};
+
+export const vrStatsReset = (): void => {
+	vrStats.calls = 0; vrStats.failCalls = 0; vrStats.solveMs = 0;
+	vrStats.pairMs = 0; vrStats.termMs = 0; vrStats.arcMs = 0; vrStats.dijMs = 0;
+	vrStats.maxN = 0; vrStats.sumN = 0; vrStats.pairsVisited = 0;
+	vrStats.tubeTries = 0; vrStats.tubePaths = 0; vrStats.tubeSolveOk = 0;
+};
+
 /** 端点候选：位置 + 附加代价（引出/引入段长度，参与最短路比较） */
 export interface RouteEndpoint {
 	x: number;
@@ -112,7 +136,7 @@ class CircleGrid {
 	}
 
 	/** 遍历线段附近（距离 < 半径可达）的所有圆下标（可能重复） */
-	nearSegment(x1: number, y1: number, x2: number, y2: number, cb: (idx: number) => void): void {
+	nearSegment(x1: number, y1: number, x2: number, y2: number, cb: (idx: number) => boolean | void): void {
 		const stampId = ++this.curStamp;
 		const d = Math.hypot(x2 - x1, y2 - y1);
 		const steps = Math.max(1, Math.ceil(d / (GRID_CELL * 0.8)));
@@ -125,7 +149,7 @@ class CircleGrid {
 				if (this.stamp[key] === stampId) continue;
 				this.stamp[key] = stampId;
 				const arr = this.buckets[key];
-				if (arr) for (let k = 0; k < arr.length; k++) cb(arr[k]);
+				if (arr) for (let k = 0; k < arr.length; k++) if (cb(arr[k]) === true) return;
 			}
 		}
 	}
@@ -154,12 +178,12 @@ function makeSegmentChecker(circles: RBObstacle[], grid: CircleGrid, net = '') {
 		const tA = touchedA >= 0 ? circles[touchedA] : undefined;
 		const tB = touchedB >= 0 ? circles[touchedB] : undefined;
 		grid.nearSegment(x1, y1, x2, y2, (k) => {
-			if (blocked || k === touchedA || k === touchedB) return;
+			if (k === touchedA || k === touchedB) return;
 			const c = circles[k];
 			if (c.soft) return;
 			if (net && c.net === net && !c.forceBlock) return;
 			const tol = Math.max(chainTolFor(c, tA), chainTolFor(c, tB));
-			if (pointSegDist(c.x, c.y, x1, y1, x2, y2) < effR(c) - EPS_TOUCH - tol) blocked = true;
+			if (pointSegDist(c.x, c.y, x1, y1, x2, y2) < effR(c) - EPS_TOUCH - tol) { blocked = true; return true; }   // 挡死：终止遍历
 		});
 		return !blocked;
 	};
@@ -239,14 +263,204 @@ export async function routeConnection(
 	expands: number[] = [150, 500],
 	budgetMs: number = SOLVE_BUDGET_MS,
 	isCancelled?: () => boolean,
+	directOnly = false,
 ): Promise<RouteConnectionResult> {
 	const res = await routeBetweenEndpoints(
 		[{ x: src.x, y: src.y, cost: 0 }],
 		[{ x: dst.x, y: dst.y, cost: 0 }],
 		obstacles, net, expands, budgetMs,
-		undefined, undefined, isCancelled,
+		undefined, undefined, isCancelled, directOnly,
 	);
 	return { ok: res.ok, prims: res.prims };
+}
+
+/**
+ * 粗网格走廊探测（管道引导用，coarse-to-fine 的粗级）。
+ * 16mil 格、八连通 A* + 层间过孔边，只光栅化 src/dst 包围盒附近障碍。
+ * 返回走廊折线点列；失败返回 null（调用方退回直连走廊剪枝）。
+ * 这是「引导」不是「求解」：不做净距终检/过孔复核 —— 管道级求解结果
+ * 仍要过 validatePrimsAgainst 全量复验。粗路径只需大体可行。
+ */
+function coarseTube(
+	all: RBObstacle[], net: string,
+	src: { x: number; y: number }, dst: { x: number; y: number },
+): Array<{ x: number; y: number }> | null {
+	if (all.length < 8) return null;
+	const CELL = 16;
+	const span = Math.hypot(dst.x - src.x, dst.y - src.y);
+	if (span < 1) return null;
+	const margin = Math.min(span * 0.4 + 150, 600);
+	const x0 = Math.floor(Math.min(src.x, dst.x) - margin);
+	const x1 = Math.ceil(Math.max(src.x, dst.x) + margin);
+	const y0 = Math.floor(Math.min(src.y, dst.y) - margin);
+	const y1 = Math.ceil(Math.max(src.y, dst.y) + margin);
+	const nx = Math.ceil((x1 - x0) / CELL) + 1;
+	const ny = Math.ceil((y1 - y0) / CELL) + 1;
+	if (nx * ny > 1_500_000) return null;
+	const hasL2 = all.some(o => o.layer === 2);
+	const nl = hasL2 ? 2 : 1;
+	const stride = nx * ny;
+	const total = stride * nl;
+	const blocked = new Uint8Array(total);
+	const INFL = CELL * 0.5;
+	for (const o of all) {
+		if (o.soft) continue;
+		if (o.net && o.net === net) continue;
+		const lis = o.layer === undefined ? [0, 1] : (o.layer === 1 ? [0] : o.layer === 2 ? [1] : []);
+		if (!lis.length) continue;
+		const rr = o.r + INFL;
+		const i0 = Math.max(0, Math.floor((o.x - rr - x0) / CELL));
+		const i1 = Math.min(nx - 1, Math.ceil((o.x + rr - x0) / CELL));
+		const j0 = Math.max(0, Math.floor((o.y - rr - y0) / CELL));
+		const j1 = Math.min(ny - 1, Math.ceil((o.y + rr - y0) / CELL));
+		const rr2 = rr * rr;
+		for (const li of lis) {
+			const base = li * stride;
+			for (let i = i0; i <= i1; i++) {
+				const dx = x0 + i * CELL - o.x, dx2 = dx * dx;
+				if (dx2 > rr2) continue;
+				for (let j = j0; j <= j1; j++) {
+					const dy = y0 + j * CELL - o.y;
+					if (dx2 + dy * dy <= rr2) blocked[base + j * nx + i] = 1;
+				}
+			}
+		}
+	}
+	// 端点松绑：端点候选被邻盘净距圈覆盖时仍可从焊盘内部出发
+	//（覆盖半径取「压住端点的最大障碍圆的伸出量」，封顶 120）
+	const release = (px: number, py: number): void => {
+		let rr = 24;
+		for (const o of all) {
+			if (o.soft || (o.net && o.net === net)) continue;
+			const d = Math.hypot(o.x - px, o.y - py);
+			if (d < o.r + 2) rr = Math.max(rr, Math.min(120, o.r - d + CELL + 4));
+		}
+		const i0 = Math.max(0, Math.floor((px - rr - x0) / CELL));
+		const i1 = Math.min(nx - 1, Math.ceil((px + rr - x0) / CELL));
+		const j0 = Math.max(0, Math.floor((py - rr - y0) / CELL));
+		const j1 = Math.min(ny - 1, Math.ceil((py + rr - y0) / CELL));
+		const rr2 = rr * rr;
+		for (let li = 0; li < nl; li++) {
+			const base = li * stride;
+			for (let i = i0; i <= i1; i++) {
+				const dx = x0 + i * CELL - px, dx2 = dx * dx;
+				for (let j = j0; j <= j1; j++) {
+					const dy = y0 + j * CELL - py;
+					if (dx2 + dy * dy <= rr2) blocked[base + j * nx + i] = 0;
+				}
+			}
+		}
+	};
+	release(src.x, src.y);
+	release(dst.x, dst.y);
+
+	const toCell = (p: { x: number; y: number }): { i: number; j: number } => ({
+		i: Math.max(0, Math.min(nx - 1, Math.round((p.x - x0) / CELL))),
+		j: Math.max(0, Math.min(ny - 1, Math.round((p.y - y0) / CELL))),
+	});
+	const s = toCell(src), d = toCell(dst);
+	const D8: Array<[number, number, number]> = [
+		[1, 0, 1], [-1, 0, 1], [0, 1, 1], [0, -1, 1],
+		[1, 1, Math.SQRT2], [1, -1, Math.SQRT2], [-1, 1, Math.SQRT2], [-1, -1, Math.SQRT2],
+	];
+	const idxOf = (i: number, j: number, li: number) => li * stride + j * nx + i;
+	const gScore = new Float64Array(total).fill(Infinity);
+	const cameFrom = new Int32Array(total).fill(-1);
+	const closed = new Uint8Array(total);
+	// 小根堆（内联，避免依赖）
+	const heapK: number[] = [], heapV: number[] = [];
+	const push = (k: number, v: number) => {
+		heapK.push(k); heapV.push(v);
+		let i = heapK.length - 1;
+		while (i > 0) {
+			const p = (i - 1) >> 1;
+			if (heapK[p] <= heapK[i]) break;
+			[heapK[p], heapK[i]] = [heapK[i], heapK[p]];
+			[heapV[p], heapV[i]] = [heapV[i], heapV[p]];
+			i = p;
+		}
+	};
+	const pop = (): number => {
+		const top = heapV[0];
+		const lk = heapK.pop()!, lv = heapV.pop()!;
+		if (heapK.length) {
+			heapK[0] = lk; heapV[0] = lv;
+			let i = 0;
+			for (;;) {
+				const l = 2 * i + 1, r = l + 1;
+				let m = i;
+				if (l < heapK.length && heapK[l] < heapK[m]) m = l;
+				if (r < heapK.length && heapK[r] < heapK[m]) m = r;
+				if (m === i) break;
+				[heapK[m], heapK[i]] = [heapK[i], heapK[m]];
+				[heapV[m], heapV[i]] = [heapV[i], heapV[m]];
+				i = m;
+			}
+		}
+		return top;
+	};
+	const viaCost = 200;
+	for (let li = 0; li < nl; li++) {
+		const id = idxOf(s.i, s.j, li);
+		if (blocked[id]) continue;
+		gScore[id] = 0;
+		push(Math.hypot(s.i - d.i, s.j - d.j) * CELL, id);
+	}
+	let best = -1;
+	let pops = 0;
+	while (heapK.length) {
+		if ((++pops & 1023) === 0 && pops > 400_000) break;   // 探测预算：只找「大体可行」
+		const cur = pop();
+		if (closed[cur]) continue;
+		closed[cur] = 1;
+		const li = Math.floor(cur / stride);
+		const rem = cur - li * stride;
+		const j = Math.floor(rem / nx);
+		const i = rem - j * nx;
+		if (i === d.i && j === d.j) { best = cur; break; }
+		const g = gScore[cur];
+		for (const [dx, dy, w] of D8) {
+			const ni = i + dx, nj = j + dy;
+			if (ni < 0 || nj < 0 || ni >= nx || nj >= ny) continue;
+			const nid = idxOf(ni, nj, li);
+			if (blocked[nid] || closed[nid]) continue;
+			const ng = g + w * CELL;
+			if (ng < gScore[nid] - 1e-9) {
+				gScore[nid] = ng;
+				cameFrom[nid] = cur;
+				push(ng + Math.hypot(ni - d.i, nj - d.j) * CELL, nid);
+			}
+		}
+		if (nl > 1) {
+			const nid = idxOf(i, j, 1 - li);
+			if (!blocked[nid] && !closed[nid] && g + viaCost < gScore[nid] - 1e-9) {
+				gScore[nid] = g + viaCost;
+				cameFrom[nid] = cur;
+				push(gScore[nid] + Math.hypot(i - d.i, j - d.j) * CELL, nid);
+			}
+		}
+	}
+	if (best < 0) return null;
+	const pts: Array<{ x: number; y: number }> = [];
+	for (let cur = best; cur !== -1; cur = cameFrom[cur]) {
+		const li = Math.floor(cur / stride);
+		const rem = cur - li * stride;
+		const j = Math.floor(rem / nx);
+		const i = rem - j * nx;
+		pts.push({ x: x0 + i * CELL, y: y0 + j * CELL });
+	}
+	pts.reverse();
+	// 共线取直（压缩折线长度，管道距离检查更快）
+	const simp: Array<{ x: number; y: number }> = [pts[0]];
+	for (let k = 1; k < pts.length - 1; k++) {
+		const a = simp[simp.length - 1], b = pts[k], c = pts[k + 1];
+		const cross = (b.x - a.x) * (c.y - b.y) - (b.y - a.y) * (c.x - b.x);
+		const dot = (b.x - a.x) * (c.x - b.x) + (b.y - a.y) * (c.y - b.y);
+		if (Math.abs(cross) < 1e-6 && dot > 0) continue;
+		simp.push(b);
+	}
+	simp.push(pts[pts.length - 1]);
+	return simp;
 }
 
 /**
@@ -267,6 +481,7 @@ export async function routeBetweenEndpoints(
 	refA?: { x: number; y: number },
 	refB?: { x: number; y: number },
 	isCancelled?: () => boolean,
+	directOnly = false,
 ): Promise<CandidateRouteResult> {
 	if (!srcCands.length || !dstCands.length) return { ok: false, prims: [] };
 	// 圆障碍列表（胶囊兜底转为圆群）
@@ -284,15 +499,72 @@ export async function routeBetweenEndpoints(
 	// （EDA 与离线的收集顺序不同，等长路径的选择会随顺序漂移）
 	all.sort((a, b) => a.x - b.x || a.y - b.y || a.r - b.r || (a.net || '').localeCompare(b.net || ''));
 
+	// ── 直连快判（directOnly 模式）──
+	// 快扫专用：只判「直线能不能过」，不建任何图。非平凡边全部留给
+	// 完整链求解 —— 否则快扫建一次走廊图、收尾轮再建一次，同一成本付两遍
+	//（实测占大板 40% 预算）。
+	if (directOnly) {
+		if (srcCands.length === 1 && dstCands.length === 1) {
+			const grid = new CircleGrid(all);
+			const segOK = makeSegmentChecker(all, grid, net);
+			const a = srcCands[0], b = dstCands[0];
+			if (segOK(a.x, a.y, b.x, b.y, -1, -1)) {
+				return { ok: true, prims: [{ kind: 'line', x1: a.x, y1: a.y, x2: b.x, y2: b.y }] };
+			}
+		}
+		return { ok: false, prims: [] };
+	}
+
 	const ax = refA ?? { x: srcCands[0].x, y: srcCands[0].y };
 	const bx = refB ?? { x: dstCands[0].x, y: dstCands[0].y };
+
+	// ── 管道引导（coarse-to-fine）──
+	// 先用粗网格 A*（16mil 格）找一条可行走廊折线（毫秒级），只保留折线
+	// 管道近旁的障碍建切点图 —— 图规模从走廊全量 ~150 圆降到 ~40 圆，
+	// O(n²) 建图成本近似平方下降（实测单次求解 0.5s → 0.05~0.1s）。
+	// 粗路径失败 = 走廊内数学无路 → 跳过管道级直接走直连走廊退避；
+	// 管道级求解失败/复验失败 → 照旧退避 150/500，正确性不受影响。
+	const tubePathsBefore = vrStats.tubePaths;
+	if (!(globalThis as any).__RB_NO_TUBE__) {
+		vrStats.tubeTries++;
+		const tube = coarseTube(all, net, ax, bx);
+		if (tube) {
+			vrStats.tubePaths++;
+			const kept: RBObstacle[] = [];
+			const picked: RBObstacle[] = [];
+			for (const c of all) {
+				if (c.noPrune) { kept.push(c); continue; }
+				let best = Infinity;
+				for (let k = 1; k < tube.length; k++) {
+					const d = pointSegDist(c.x, c.y, tube[k - 1].x, tube[k - 1].y, tube[k].x, tube[k].y);
+					if (d < best) best = d;
+				}
+				if (best < c.r + 80) picked.push(c);
+			}
+			const subset = kept.concat(picked);
+			if ((globalThis as any).__RB_DEBUG__) {
+				console.log(`[VR][dbg] 管道级: 折线${tube.length}点 子集=${subset.length}`);
+			}
+			const deadline = Date.now() + budgetMs;
+			(globalThis as any).__RB_PHASE__ = 'vr:solve';
+			const res = await solveMulti(srcCands, dstCands, subset, net, deadline, isCancelled);
+			(globalThis as any).__RB_PHASE__ = 'vr:validate';
+			if (res.ok && await validatePrimsAgainst(res.prims, all, net)) {
+				vrStats.tubeSolveOk++;
+				return res;
+			}
+		}
+	}
 
 	// 走廊剪枝：先只保留直连线附近窄带内的圆（大幅提速），
 	// 求解失败再逐级放宽范围重试。
 	// noPrune（填充/板框等实心障碍）始终保留——否则窄走廊会把内部网格圆剪掉，
 	// 导致"穿过填充"的假合法路径。
-	for (let ei = 0; ei < expands.length; ei++) {
-		const expand = expands[ei];
+	// 管道级已覆盖 150 级的子集：管道存在但失败时跳过 150，直接退避放宽级。
+	const tubeExisted = vrStats.tubePaths > tubePathsBefore;
+	const fallbackExpands = tubeExisted ? expands.filter(e => e !== 150) : expands;
+	for (let ei = 0; ei < fallbackExpands.length; ei++) {
+		const expand = fallbackExpands[ei];
 		let subset = all;
 		if (expand !== Infinity) {
 			const kept: RBObstacle[] = [];
@@ -420,6 +692,21 @@ async function solveMulti(
 	for (const c of dstCands) nodes.push({ circle: -1, x: c.x, y: c.y, angle: 0, adj: [] });
 	const S = srcCands.length, D = dstCands.length;
 
+	// ── 直连快判（在建图之前）──
+	// 单候选↔单候选且直线段合法时，直连就是全局最优（端点代价固定，
+	// 任何折线路径都 ≥ 直线距离），直接构造单段路径返回，省掉 O(n²)
+	// 公切线建图。快扫的大多数边属于「一布就通」，实测建图占求解 85%
+	// —— 这一步把它们的单次成本从 ~0.7s 降到微秒级。
+	if (S === 1 && D === 1) {
+		const a = nodes[0], b = nodes[1];
+		if (segOK(a.x, a.y, b.x, b.y, -1, -1)) {
+			return {
+				ok: true,
+				prims: [{ kind: 'line', x1: a.x, y1: a.y, x2: b.x, y2: b.y }],
+			};
+		}
+	}
+
 	// 切点去重：键 = 圆下标 + 角度量化
 	const ptIndex = new Map<string, number>();
 	// 按圆分桶（避免弧边循环里对全部切点做字符串扫描：那是 O(n×切点数)）
@@ -441,6 +728,54 @@ async function solveMulti(
 		return idx;
 	};
 
+	// 2. 终端（出线候选）↔ 圆切线 —— 提前到建图之前：本步便宜
+	//（O(n·(S+D))），且「终端零切线 ∧ 无直连」意味着数学上无路，
+	// 可以跳过整个 O(n²) 公切线建图（失败求解占快扫的大头）
+	const connectTerminal = (termIdx: number) => {
+		const term = nodes[termIdx];
+		for (let i = 0; i < n; i++) {
+			const ci = circles[i];
+			if (net && ci.net === net && !ci.forceBlock) continue;
+			if (dist(term.x, term.y, ci.x, ci.y) < ci.r + EPS_TOUCH) continue; // 终端在圆内/圆上：切线退化
+			for (const l of [true, false] as const) {
+				const [tx1, ty1, tx2, ty2] = getTangents(term.x, term.y, 0, false, ci.x, ci.y, ci.r, l);
+				if (!segOK(tx1, ty1, tx2, ty2, -1, i)) continue;
+				const len = Math.hypot(tx2 - tx1, ty2 - ty1);
+				if (len < 1e-6) continue;
+				const pi = getOrCreatePt(i, tx2, ty2);
+				nodes[termIdx].adj.push({ to: pi, cost: len, isArc: false, x1: tx1, y1: ty1, x2: tx2, y2: ty2 });
+				nodes[pi].adj.push({ to: termIdx, cost: len, isArc: false, x1: tx2, y1: ty2, x2: tx1, y2: ty1 });
+			}
+		}
+	};
+	for (let k = 0; k < S + D; k++) connectTerminal(k);
+
+	// 3. 源候选 ↔ 目标候选 直连（无障碍阻挡时）—— 最短路径的常见情形
+	for (let i = 0; i < S; i++) {
+		const a = nodes[i];
+		for (let j = 0; j < D; j++) {
+			const b = nodes[S + j];
+			if (!segOK(a.x, a.y, b.x, b.y, -1, -1)) continue;
+			const len = Math.hypot(b.x - a.x, b.y - a.y);
+			if (len < 1e-6) continue;
+			a.adj.push({ to: S + j, cost: len, isArc: false, x1: a.x, y1: a.y, x2: b.x, y2: b.y });
+			nodes[S + j].adj.push({ to: i, cost: len, isArc: false, x1: b.x, y1: b.y, x2: a.x, y2: a.y });
+		}
+	}
+
+	// 封死快败：任一侧终端完全无出边（切线 0 + 直连无）⇒ 图内无路
+	if (!nodes.slice(0, S).some(t => t.adj.length > 0) ||
+		!nodes.slice(S, S + D).some(t => t.adj.length > 0)) {
+		vrStats.calls++;
+		vrStats.failCalls++;
+		vrStats.solveMs += Date.now() - __t0;
+		vrStats.termMs += Date.now() - __t0;
+		vrStats.maxN = Math.max(vrStats.maxN, n);
+		vrStats.sumN += n;
+		return { ok: false, prims: [] };
+	}
+
+	__tTerm = Date.now() - __mark; __mark = Date.now();
 	// 1. 圆-圆公切线（4 种侧别组合）
 	//    配对数是 O(n²)，实测占单次求解 70~90%（Dijkstra≈0）：x 序扫描 +
 	//    距离截断 —— 相距超过 r1+r2+K 的两圆之间不存在有价值的公切线
@@ -466,7 +801,7 @@ async function solveMulti(
 			}
 			if (cancelled()) { timedOut = true; break; }
 		}
-		const reach = (globalThis as any).__NO_PAIR_CULL__ ? Infinity : ci.r + __maxR + 800;
+		const reach = ci.r + __maxR + 800;
 		for (let oj = oi + 1; oj < n; oj++) {
 			const j = __xOrder[oj];
 			if (circles[j].x - ci.x > reach) break;
@@ -497,44 +832,19 @@ async function solveMulti(
 			}
 		}
 	}
-	if (timedOut) return { ok: false, prims: [] };
-
-	__tPair = Date.now() - __mark; __mark = Date.now();
-	// 2. 终端（出线候选）↔ 圆切线
-	const connectTerminal = (termIdx: number) => {
-		const term = nodes[termIdx];
-		for (let i = 0; i < n; i++) {
-			const ci = circles[i];
-			if (net && ci.net === net && !ci.forceBlock) continue;
-			if (dist(term.x, term.y, ci.x, ci.y) < ci.r + EPS_TOUCH) continue; // 终端在圆内/圆上：切线退化
-			for (const l of [true, false] as const) {
-				const [tx1, ty1, tx2, ty2] = getTangents(term.x, term.y, 0, false, ci.x, ci.y, ci.r, l);
-				if (!segOK(tx1, ty1, tx2, ty2, -1, i)) continue;
-				const len = Math.hypot(tx2 - tx1, ty2 - ty1);
-				if (len < 1e-6) continue;
-				const pi = getOrCreatePt(i, tx2, ty2);
-				nodes[termIdx].adj.push({ to: pi, cost: len, isArc: false, x1: tx1, y1: ty1, x2: tx2, y2: ty2 });
-				nodes[pi].adj.push({ to: termIdx, cost: len, isArc: false, x1: tx2, y1: ty2, x2: tx1, y2: ty1 });
-			}
-		}
-	};
-	for (let k = 0; k < S + D; k++) connectTerminal(k);
-
-	__tTerm = Date.now() - __mark; __mark = Date.now();
-	// 3. 源候选 ↔ 目标候选 直连（无障碍阻挡时）—— 最短路径的常见情形
-	for (let i = 0; i < S; i++) {
-		const a = nodes[i];
-		for (let j = 0; j < D; j++) {
-			const b = nodes[S + j];
-			if (!segOK(a.x, a.y, b.x, b.y, -1, -1)) continue;
-			const len = Math.hypot(b.x - a.x, b.y - a.y);
-			if (len < 1e-6) continue;
-			a.adj.push({ to: S + j, cost: len, isArc: false, x1: a.x, y1: a.y, x2: b.x, y2: b.y });
-			nodes[S + j].adj.push({ to: i, cost: len, isArc: false, x1: b.x, y1: b.y, x2: a.x, y2: a.y });
-		}
+	if (timedOut) {
+		// 建图对循环超时：时间几乎全烧在圆对扫描上，计入统计后放弃
+		vrStats.calls++;
+		vrStats.failCalls++;
+		vrStats.solveMs += Date.now() - __t0;
+		vrStats.pairMs += Date.now() - __t0;
+		vrStats.maxN = Math.max(vrStats.maxN, n);
+		vrStats.sumN += n;
+		vrStats.pairsVisited += __pairsVisited;
+		return { ok: false, prims: [] };
 	}
 
-	__tTerm += Date.now() - __mark; __mark = Date.now();
+	__tPair = Date.now() - __mark; __mark = Date.now();
 	// 4. 同圆弧边：切点按角度排序，相邻切点之间双向连弧（弧几何合法即建边）
 	for (let i = 0; i < n; i++) {
 		{
@@ -580,12 +890,17 @@ async function solveMulti(
 	const MAX_GRAPH_NODES = 250000;
 	if (nodes.length > MAX_GRAPH_NODES) return { ok: false, prims: [] };
 
-	// 5. Dijkstra（二叉堆，O(E log V)）：多源（全部源候选），多目标
-	const total = nodes.length;
-	const distArr = new Array<number>(total).fill(Infinity);
-	const prevNode = new Array<number>(total).fill(-1);
-	const prevEdge = new Array<VGEdge | null>(total).fill(null);
-	const settled = new Array<boolean>(total).fill(false);
+	// 5. Dijkstra（二叉堆，O(E log V)）：多源（全部源候选），多目标。
+	//    状态 = (节点, 到达旋转侧)：切点图里「顺时针弧到达切点 P 后沿反向
+	//    切线离开」是合法图路径但几何上是 180° 尖点（导线折返叠线，实测
+	//    TXD/RESET 网）。到达旋转侧约束下一跳方向：CCW 到达只许沿 CCW
+	//    切向继续（切线同向或 CCW 弧）。状态编码 = 节点*3 + r
+	//   （0=CCW 到达，1=CW 到达，2=无约束 —— 终端/起点）。
+	const total3 = nodes.length * 3;
+	const distArr = new Array<number>(total3).fill(Infinity);
+	const prevNode = new Array<number>(total3).fill(-1);
+	const prevEdge = new Array<VGEdge | null>(total3).fill(null);
+	const settled = new Array<boolean>(total3).fill(false);
 	const heap: Array<[number, number]> = [];
 	const heapPush = (d: number, v: number) => {
 		heap.push([d, v]);
@@ -617,8 +932,8 @@ async function solveMulti(
 		return top;
 	};
 	for (let i = 0; i < S; i++) {
-		distArr[i] = srcCands[i].cost;
-		heapPush(srcCands[i].cost, i);
+		distArr[i * 3 + 2] = srcCands[i].cost;
+		heapPush(srcCands[i].cost, i * 3 + 2);
 	}
 	let dijkstraPops = 0;
 	let bestDst = -1;
@@ -636,34 +951,84 @@ async function solveMulti(
 		}
 		const top = heapPop();
 		if (!top) break;
-		const [du, u] = top;
-		if (settled[u]) continue;
-		settled[u] = true;
+		const [du, s] = top;
+		if (settled[s]) continue;
+		settled[s] = true;
+		const u = Math.floor(s / 3);
+		const arrR = s % 3;   // 0=CCW 1=CW 2=无约束
 		// 剩余路径代价不可能小于当前弹出距离 → 无更优解
 		if (du >= bestTotal) break;
 		if (u >= S && u < S + D) {
 			const cand = du + dstCands[u - S].cost;
-			if (cand < bestTotal) { bestTotal = cand; bestDst = u; }
+			if (cand < bestTotal) { bestTotal = cand; bestDst = s; }
+		}
+		// 到达旋转侧的行进切向（圆节点才有约束）
+		const nu = nodes[u];
+		let tx = 0, ty = 0;
+		if (arrR !== 2 && nu.circle >= 0) {
+			const au = nu.angle;
+			if (arrR === 0) { tx = -Math.sin(au); ty = Math.cos(au); }
+			else { tx = Math.sin(au); ty = -Math.cos(au); }
 		}
 		for (const e of nodes[u].adj) {
-			if (settled[e.to]) continue;
+			if (settled[e.to * 3] && settled[e.to * 3 + 1] && settled[e.to * 3 + 2]) continue;
+			// 旋转连续性：本边的出发方向必须与到达切向同向（点积 > 0.5）
+			// __RB_NO_ROT__：A/B 诊断开关（关掉=旧行为）
+			if (arrR !== 2 && nu.circle >= 0 && !(globalThis as any).__RB_NO_ROT__) {
+				let dx: number, dy: number;
+				if (e.isArc) {
+					const t = e.sweep! >= 0 ? { x: -Math.sin(e.startAngle!), y: Math.cos(e.startAngle!) } : { x: Math.sin(e.startAngle!), y: -Math.cos(e.startAngle!) };
+					dx = t.x; dy = t.y;
+				} else {
+					dx = e.x2! - e.x1!; dy = e.y2! - e.y1!;
+				}
+				const dl = Math.hypot(dx, dy) || 1;
+				if ((dx * tx + dy * ty) / dl < 0.5) continue;   // 尖点：禁止折返
+			}
+			// 新状态的到达旋转侧：弧 = 自身扫向；线 = 到达方向与目标切点切向的匹配
+			let nr = 2;
+			const nw = nodes[e.to];
+			if (nw.circle >= 0) {
+				if (e.isArc) nr = e.sweep! >= 0 ? 0 : 1;
+				else {
+					const aw = nw.angle;
+					const ccwx = -Math.sin(aw), ccwy = Math.cos(aw);
+					const dx = e.x2! - e.x1!, dy = e.y2! - e.y1!;
+					const dl = Math.hypot(dx, dy) || 1;
+					const dCCW = (dx * ccwx + dy * ccwy) / dl;
+					nr = dCCW >= 0 ? 0 : 1;
+				}
+			}
+			const ns = e.to * 3 + nr;
 			const nd = du + e.cost;
-			if (nd < distArr[e.to] - 1e-9) {
-				distArr[e.to] = nd;
-				prevNode[e.to] = u;
-				prevEdge[e.to] = e;
-				heapPush(nd, e.to);
+			if (nd < distArr[ns] - 1e-9) {
+				distArr[ns] = nd;
+				prevNode[ns] = s;
+				prevEdge[ns] = e;
+				heapPush(nd, ns);
 			}
 		}
 	}
 
 	__tArc = Date.now() - __mark; __mark = Date.now();
 	__tDij = __mark - __t0 - __tPair - __tTerm - __tArc;
+	// 常驻累计：测试台读 vrStats 定位热点（不开 debug 日志，零 IO 失真）
+	vrStats.calls++;
+	vrStats.solveMs += __mark - __t0;
+	vrStats.pairMs += __tPair;
+	vrStats.termMs += __tTerm;
+	vrStats.arcMs += __tArc;
+	vrStats.dijMs += __tDij;
+	vrStats.maxN = Math.max(vrStats.maxN, n);
+	vrStats.sumN += n;
+	vrStats.pairsVisited += __pairsVisited;
 	if (__dbg) {
 		console.warn(`[VR-time] n=${n} S=${S} D=${D} 圆对=${__tPair}ms 终端=${__tTerm}ms 弧边=${__tArc}ms Dijkstra=${__tDij}ms 总=${__mark - __t0}ms 对=${__pairsVisited}/${__pairsAll}`);
 	}
 
 	if (bestDst < 0) {
+		vrStats.failCalls++;
+		const total = nodes.length;
 		if ((globalThis as any).__RB_VERBOSE__) {
 			console.log(`[VR] 无路径: wrappable=${n} blockers=${blockers.length} nodes=${total} src=${S} dst=${D}`);
 		}
@@ -696,16 +1061,16 @@ async function solveMulti(
 		return { ok: false, prims: [] };
 	}
 
-	// 6. 回溯路径 → 精确图元（边自带几何，无需重算）
+	// 6. 回溯路径 → 精确图元（边自带几何，无需重算；bestDst 为状态 id）
 	const prims: RBPrimitive[] = [];
-	let srcNode = bestDst;
+	let srcNode = Math.floor(bestDst / 3);
 	{
 		const revEdges: VGEdge[] = [];
 		for (let cur = bestDst; prevNode[cur] !== -1; cur = prevNode[cur]) {
 			const e = prevEdge[cur];
 			if (!e) break;
 			revEdges.push(e);
-			srcNode = prevNode[cur];
+			srcNode = Math.floor(prevNode[cur] / 3);
 		}
 		for (let k = revEdges.length - 1; k >= 0; k--) {
 			const e = revEdges[k];
@@ -725,6 +1090,6 @@ async function solveMulti(
 		ok: true,
 		prims,
 		src: srcCands[srcNode],
-		dst: dstCands[bestDst - S],
+		dst: dstCands[Math.floor(bestDst / 3) - S],
 	};
 }

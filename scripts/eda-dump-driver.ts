@@ -1,3 +1,4 @@
+import { parsePolygonPath } from '../src/router/polygon-parse';
 /**
  * EDA 内运行的 dump 驱动（源码）：采集 PlanningEngine 的 PlanningInput。
  *
@@ -47,26 +48,7 @@ export async function ensurePcbTab(timeoutMs = 60000): Promise<void> {
 	}
 }
 
-function parsePath(polygon: any[]): Array<{ x: number; y: number }> {
-	if (!polygon || polygon.length < 3) return [];
-	if (polygon[0] === 'R' && polygon.length >= 5) {
-		const x = polygon[1], y = polygon[2], w = polygon[3], h = polygon[4];
-		return [
-			{ x, y: y - h }, { x: x + w, y: y - h },
-			{ x: x + w, y }, { x, y }, { x, y: y - h },
-		];
-	}
-	const pts: Array<{ x: number; y: number }> = [];
-	let i = 0;
-	while (i < polygon.length) {
-		if (typeof polygon[i] === 'number' && typeof polygon[i + 1] === 'number') {
-			pts.push({ x: polygon[i], y: polygon[i + 1] });
-			i += 2;
-		} else i++;
-	}
-	return pts;
-}
-
+const parsePath = parsePolygonPath;
 export interface DumpOptions {
 	ripupRounds?: number;
 	budgetMs?: number;
@@ -108,7 +90,7 @@ export async function dumpInput(opts: DumpOptions = {}) {
 			const netPads: any[] = [];
 			for (const prim of primitives) {
 				const p = prim as any;
-				if (p.type !== undefined && p.type !== 1) continue;
+				if (p.type !== undefined && p.type !== 1 && p.type !== 2) continue;
 				const x = p.center?.x ?? p.x ?? p.startX ?? 0;
 				const y = p.center?.y ?? p.y ?? p.startY ?? 0;
 				if (x === 0 && y === 0 && !p.center) continue;
@@ -189,6 +171,16 @@ export async function dumpInput(opts: DumpOptions = {}) {
 		const l = line as any;
 		const net: string = l.net ?? '';
 		const layer: number = l.layerId ?? l.layer ?? 1;
+		if (layer === 11) {
+			// 板框「独立 Line」画法：与 collectStaticObstacles 同口径
+			const lw = l.lineWidth ?? 10;
+			const r = lw / 2 + drc.trackToBoardMil + drc.traceWidthMil / 2;
+			obstacles.push(...buildPolylineObstacle(
+				[{ x: l.startX ?? 0, y: l.startY ?? 0 }, { x: l.endX ?? 0, y: l.endY ?? 0 }],
+				r, undefined, undefined, 'board', true,
+			));
+			continue;
+		}
 		if (layer !== 1 && layer !== 2 && layer !== 12) continue;
 		const lw = l.lineWidth ?? 10;
 		const r = lw / 2 + lineClear + drc.traceWidthMil / 2 + 2;
@@ -196,6 +188,38 @@ export async function dumpInput(opts: DumpOptions = {}) {
 			[{ x: l.startX ?? 0, y: l.startY ?? 0 }, { x: l.endX ?? 0, y: l.endY ?? 0 }],
 			r, net || undefined, layer, `line:${l.primitiveId ?? ''}`,
 		));
+	}
+	// 圆弧（板框圆角 + 圆弧走线）：与 collectStaticObstacles 同口径
+	const arcs = await eda.pcb_PrimitiveArc.getAll();
+	for (const arc of arcs ?? []) {
+		const o = arc as any;
+		const net: string = o.net ?? '';
+		const layer: number = o.layerId ?? o.layer ?? 1;
+		const lw = o.lineWidth ?? 10;
+		const sx = o.startX ?? 0, sy = o.startY ?? 0;
+		const ex = o.endX ?? 0, ey = o.endY ?? 0;
+		const sweep = (o.arcAngle ?? 0) * Math.PI / 180;
+		const L = Math.hypot(ex - sx, ey - sy);
+		if (!sweep || Math.abs(Math.sin(sweep / 2)) < 1e-6 || L < 1e-6) continue;
+		const R = L / (2 * Math.abs(Math.sin(sweep / 2)));
+		const sgn = sweep > 0 ? 1 : -1;
+		const h = sgn * R * Math.cos(sweep / 2);
+		const nx = -(ey - sy) / L, ny = (ex - sx) / L;
+		const cx = (sx + ex) / 2 + h * nx, cy = (sy + ey) / 2 + h * ny;
+		const a0 = Math.atan2(sy - cy, sx - cx);
+		const pts: Array<{ x: number; y: number }> = [];
+		const steps = Math.max(6, Math.ceil(Math.abs(sweep) / (Math.PI / 12)));
+		for (let k = 0; k <= steps; k++) {
+			const ang = a0 + (Math.abs(sweep) * k) / steps * sgn;
+			pts.push({ x: cx + R * Math.cos(ang), y: cy + R * Math.sin(ang) });
+		}
+		if (layer === 11) {
+			const r = lw / 2 + drc.trackToBoardMil + drc.traceWidthMil / 2;
+			obstacles.push(...buildPolylineObstacle(pts, r, undefined, undefined, 'board', true));
+		} else if (layer === 1 || layer === 2 || layer === 12) {
+			const r = lw / 2 + lineClear + drc.traceWidthMil / 2 + 2;
+			obstacles.push(...buildPolylineObstacle(pts, r, net || undefined, layer, `arc:${sx.toFixed(0)},${sy.toFixed(0)}`));
+		}
 	}
 	const fills = await eda.pcb_PrimitiveFill.getAll();
 	for (const fill of fills ?? []) {
@@ -210,6 +234,24 @@ export async function dumpInput(opts: DumpOptions = {}) {
 		if (pts.length >= 3) {
 			obstacles.push(...buildPolygonObstacle(pts, r, net || undefined, layer, `fill:${pts[0]?.x},${pts[0]?.y}`, true));
 		}
+	}
+
+	// 既有过孔（贯通各层铜环）：与 collectStaticObstacles 同口径
+	const viaPrims = await eda.pcb_PrimitiveVia.getAll();
+	const viaClear = Math.max(drc.trackToTrackMil, drc.trackToPadMil);
+	for (const v of viaPrims ?? []) {
+		const vp = v as any;
+		const vx = vp.x ?? vp.center?.x;
+		const vy = vp.y ?? vp.center?.y;
+		if (typeof vx !== 'number' || typeof vy !== 'number') continue;
+		const dia = Number(vp.diameter) || 24;
+		obstacles.push({
+			id: 'via' + obstacles.length, kind: 'circle', x: vx, y: vy,
+			r: dia / 2 + viaClear + drc.traceWidthMil / 2 + 0.1,
+			net: vp.net || undefined, layer: undefined,
+			group: 'via:' + (vp.net ?? '') + ':' + vx.toFixed(1) + ',' + vy.toFixed(1),
+			noPrune: true,
+		});
 	}
 
 	// 铜层数（停用内层过滤：layerStatus === 1）

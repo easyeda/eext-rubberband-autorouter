@@ -168,29 +168,46 @@ export function stubFeasible(
 	const ux = dx / len, uy = dy / len;
 	// 本焊盘铜皮沿出线方向的出射距离（超出它之后必须真正清障）
 	const exit = rayExitDistance(pad.outline, ux, uy) - 0.5;
+	// 射线 P(t) = pad + t·u 与圆 (c, r) 的相交 t 区间；无实质相交返回 null
+	const rayInterval = (cx: number, cy: number, r: number): [number, number] | null => {
+		const wx = cx - pad.x, wy = cy - pad.y;
+		const b = wx * ux + wy * uy;
+		const c2 = wx * wx + wy * wy - r * r;
+		let t0: number, t1: number;
+		if (c2 < 0) {
+			t0 = 0; t1 = b + Math.sqrt(Math.max(0, b * b - c2));   // 焊盘中心已在侵入圈内
+		} else {
+			const disc = b * b - c2;
+			if (disc < 0) return null;
+			const sq = Math.sqrt(disc);
+			t0 = b - sq; t1 = b + sq;
+		}
+		if (t1 < 0 || t0 > len) return null;
+		t0 = Math.max(0, t0);
+		t1 = Math.min(len, t1);
+		return t1 - t0 < 0.01 ? null : [t0, t1];
+	};
 	for (const o of obstacles) {
 		if (o.soft) continue;                // 辅助建图圆（弧外包络）不阻挡
 		if (o.net === net) continue;
 		if (o.forceBlock) continue;          // 本体禁行区（自己的焊盘）
 		const r = o.r - 0.02;
-		const wx = o.x - pad.x, wy = o.y - pad.y;
-		const b = wx * ux + wy * uy;
-		const c = wx * wx + wy * wy - r * r;
-		let t0: number, t1: number;
-		if (c < 0) {
-			t0 = 0; t1 = b + Math.sqrt(b * b - c);   // 焊盘中心已在侵入圈内
-		} else {
-			const disc = b * b - c;
-			if (disc < 0) continue;
-			const sq = Math.sqrt(disc);
-			t0 = b - sq; t1 = b + sq;
+		if (o.kind !== 'capsule') {
+			const iv = rayInterval(o.x, o.y, r);
+			if (iv && iv[1] > exit) return false;
+			continue;
 		}
-		if (t1 < 0 || t0 > len) continue;
-		t0 = Math.max(0, t0);
-		t1 = Math.min(len, t1);
-		if (t1 - t0 < 0.01) continue;
-		if (t1 <= exit) continue;            // 侵入段完全在自家铜皮内 → 可接受
-		return false;
+		// 胶囊（走线障碍）：沿轴采样成圆链逐个判定——旧实现只查锚点圆，
+		// 引出段从胶囊中段贴过完全漏检（实测 LCD 密排区 10 处 trk-trk）
+		const ox1 = o.x1 ?? o.x, oy1 = o.y1 ?? o.y;
+		const ox2 = o.x2 ?? ox1, oy2 = o.y2 ?? oy1;
+		const segLen = Math.hypot(ox2 - ox1, oy2 - oy1);
+		const steps = Math.min(64, Math.max(1, Math.ceil(segLen / Math.max(0.9 * r, 0.5))));
+		for (let s = 0; s <= steps; s++) {
+			const t = s / steps;
+			const iv = rayInterval(ox1 + (ox2 - ox1) * t, oy1 + (oy2 - oy1) * t, r);
+			if (iv && iv[1] > exit) return false;
+		}
 	}
 	return true;
 }

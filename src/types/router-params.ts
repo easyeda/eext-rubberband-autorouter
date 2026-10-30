@@ -44,6 +44,9 @@ export const DEFAULT_ROUTER_OPTIONS: RouterUiOptions = {
 	ripupRounds: 3,
 	powerNetsFirst: false,
 	budgetMs: 1800000,
+	// 实时预览：引擎（worker）只管输出结果，主线程写入调度器做「同网合并
+	// 差量写入 + 30ms 限速」，写画布不反压引擎。旧实现的 FIFO 队列不合并
+	// 不限速，EDA 写盘挤占 worker 算力，实测快扫 26s → 56s。
 	livePreview: true,
 	finalOptimize: true,
 	viaFallback: true,

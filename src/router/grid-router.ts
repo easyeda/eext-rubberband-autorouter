@@ -24,6 +24,10 @@ export interface GridRouteRequest {
 	/** 起点/终点焊盘（用于在自身铜皮内解除阻挡：出线豁免） */
 	srcPad?: { x: number; y: number; r: number };
 	dstPad?: { x: number; y: number; r: number };
+	/** 出线候选点（调用方已按真实焊盘轮廓验证过引出段）：迷宫从这些点
+	 * 起步，绕开被邻盘净距圈封死的焊盘中心。引出段图元由调用方拼接。 */
+	srcStubs?: Array<{ x: number; y: number }>;
+	dstStubs?: Array<{ x: number; y: number }>;
 	/** 障碍（半径已含线宽一半 + 间距）；soft 忽略 */
 	obstacles: RBObstacle[];
 	net: string;
@@ -226,6 +230,29 @@ export async function gridRoute(req: GridRouteRequest): Promise<GridRouteResult>
 	release(req.srcPad, req.layers);
 	release(req.dstPad, req.layers);
 
+	// 出线候选点松绑：候选点周围一格视为可通行（引出段已由调用方验证）
+	const releasePoint = (p: { x: number; y: number }): void => {
+		const r = cell;
+		for (let li = 0; li < nLayers; li++) {
+			const base = li * stride;
+			const i0 = Math.max(0, Math.floor((p.x - r - x0) / cell));
+			const i1 = Math.min(nx - 1, Math.ceil((p.x + r - x0) / cell));
+			const j0 = Math.max(0, Math.floor((p.y - r - y0) / cell));
+			const j1 = Math.min(ny - 1, Math.ceil((p.y + r - y0) / cell));
+			for (let i = i0; i <= i1; i++) {
+				const dx = x0 + i * cell - p.x;
+				for (let j = j0; j <= j1; j++) {
+					const dy = y0 + j * cell - p.y;
+					if (dx * dx + dy * dy <= r * r) blocked[base + j * nx + i] = 0;
+				}
+			}
+		}
+	};
+	const srcStubPts = req.srcStubs ?? [];
+	const dstStubPts = req.dstStubs ?? [];
+	for (const p of srcStubPts) releasePoint(p);
+	for (const p of dstStubPts) releasePoint(p);
+
 	const toCell = (p: { x: number; y: number }): { i: number; j: number } => ({
 		i: Math.max(0, Math.min(nx - 1, Math.round((p.x - x0) / cell))),
 		j: Math.max(0, Math.min(ny - 1, Math.round((p.y - y0) / cell))),
@@ -238,17 +265,55 @@ export async function gridRoute(req: GridRouteRequest): Promise<GridRouteResult>
 	const closed = new Uint8Array(total);
 	const heap = new MinHeap();
 	const viaCost = req.viaCostMil ?? 200;
+	const seedStubByCell = new Map<number, { x: number; y: number } | null>();
+	const goalStubByCell = new Map<number, { x: number; y: number }>();
 
 	const idxOf = (i: number, j: number, li: number) => li * stride + j * nx + i;
 	const hOf = (i: number, j: number) => Math.hypot(i - d.i, j - d.j) * cell;
 
-	// 起点：允许多层（TH 焊盘）——取所有层中未被挡的起点格
-	let started = 0;
+	// 起点：焊盘中心格（cost 0）+ 各出线候选点格（cost = 中心到候选点距离，
+	// 引出段长度计入路径代价）。多层（TH 焊盘）各层都可起步。
+	interface Seed { i: number; j: number; li: number; stub: { x: number; y: number } | null; cost: number }
+	const seeds: Seed[] = [];
+	const seedBest = new Map<number, Seed>();
+	const addSeed = (i: number, j: number, li: number, stub: { x: number; y: number } | null, cost: number): void => {
+		const id = idxOf(i, j, li);
+		if (blocked[id]) return;
+		const prev = seedBest.get(id);
+		if (prev && prev.cost <= cost) return;
+		seedBest.set(id, { i, j, li, stub, cost });
+	};
 	for (let li = 0; li < nLayers; li++) {
-		const id = idxOf(s.i, s.j, li);
-		if (blocked[id]) continue;
-		gScore[id] = 0;
-		heap.push(hOf(s.i, s.j), id);
+		addSeed(s.i, s.j, li, null, 0);
+	}
+	for (const p of srcStubPts) {
+		const c = toCell(p);
+		for (let li = 0; li < nLayers; li++) {
+			addSeed(c.i, c.j, li, p, Math.hypot(p.x - src.x, p.y - src.y));
+		}
+	}
+	// 终点：目标格 + 各 dst 候选点格（到点后接引入段）
+	const goalCost = new Map<number, number>();   // cellIdx → 引入段长
+	const isGoal = new Set<number>();
+	const addGoal = (i: number, j: number, stub: { x: number; y: number } | null): void => {
+		for (let li = 0; li < nLayers; li++) {
+			const id = idxOf(i, j, li);
+			isGoal.add(id);
+			goalCost.set(id, stub ? Math.hypot(stub.x - dst.x, stub.y - dst.y) : 0);
+			if (stub) goalStubByCell.set(id, stub);
+		}
+	};
+	addGoal(d.i, d.j, null);
+	for (const p of dstStubPts) {
+		const c = toCell(p);
+		addGoal(c.i, c.j, p);
+	}
+	let started = 0;
+	for (const sd of seedBest.values()) {
+		const id = idxOf(sd.i, sd.j, sd.li);
+		gScore[id] = sd.cost;
+		seedStubByCell.set(id, sd.stub);
+		heap.push(sd.cost + hOf(sd.i, sd.j), id);
 		started++;
 	}
 	if (!started) return { ...fail, cell };
@@ -268,8 +333,9 @@ export async function gridRoute(req: GridRouteRequest): Promise<GridRouteResult>
 		const j = Math.floor(rem / nx);
 		const i = rem - j * nx;
 		const g = gScore[cur];
-		if (i === d.i && j === d.j) {
-			if (g < bestCost) { bestCost = g; best = cur; }
+		if (isGoal.has(cur)) {
+			const total = g + (goalCost.get(cur) ?? 0);
+			if (total < bestCost) { bestCost = total; best = cur; }
 			// 目标格命中：八字邻接的最优性足够，直接收手
 			break;
 		}
@@ -309,15 +375,28 @@ export async function gridRoute(req: GridRouteRequest): Promise<GridRouteResult>
 	// ── 回溯 ──
 	const cells: Cell[] = [];
 	let cur = best;
+	let seedCell = -1;
 	while (cur !== -1) {
 		const li = Math.floor(cur / stride);
 		const rem = cur - li * stride;
 		const j = Math.floor(rem / nx);
 		const i = rem - j * nx;
 		cells.push({ x: x0 + i * cell, y: y0 + j * cell, layer: req.layers[li] });
+		seedCell = cur;
 		cur = cameFrom[cur];
 	}
 	cells.reverse();
+
+	// 出线候选点接入：路径首/尾若是候选点格，把端点吸附到候选点上——
+	// 引出段（焊盘中心→候选点）已由调用方按真实焊盘轮廓验证，最后拼接
+	const startStub = seedCell >= 0 ? (seedStubByCell.get(seedCell) ?? null) : null;
+	const goalStub = goalStubByCell.get(best) ?? null;
+	if (startStub) {
+		cells[0] = { x: startStub.x, y: startStub.y, layer: cells[0].layer };
+	}
+	if (goalStub && cells.length) {
+		cells[cells.length - 1] = { x: goalStub.x, y: goalStub.y, layer: cells[cells.length - 1].layer };
+	}
 
 	// ── 化简：去共线、合并层间跳变 ──
 	const pts: Cell[] = [];
@@ -341,11 +420,52 @@ export async function gridRoute(req: GridRouteRequest): Promise<GridRouteResult>
 	}
 	simplified.push(pts[pts.length - 1]);
 
+	// ── 视线拉直（string pull）──
+	// 8 连通 A* 的楼梯折线是接缝/锐角的头号来源。同层段内做「最长可视
+	// 跳跃」：只要直线段到障碍保持净距（r + 0.4），就一步跳过去。
+	// via 点（层切换处）保持不动，只拉直层内段。
+	const segClear = (ax: number, ay: number, bx: number, by: number, layer: number): boolean => {
+		for (const o of req.obstacles) {
+			if (o.soft) continue;
+			if (o.net && o.net === req.net) continue;
+			if (o.layer !== undefined && o.layer !== layer) continue;
+			// 阈值 = 障碍半径（已含线宽+间距）+ 0.4mil 余量
+			const rr = o.r + 0.4;
+			if (o.kind === 'circle') {
+				if (pointSegDist(o.x, o.y, ax, ay, bx, by) < rr) return false;
+				continue;
+			}
+			// 胶囊：沿轴采样（上限 96 点，长胶囊按等距覆盖）
+			const ox1 = o.x1 ?? o.x, oy1 = o.y1 ?? o.y;
+			const ox2 = o.x2 ?? ox1, oy2 = o.y2 ?? oy1;
+			const len = Math.hypot(ox2 - ox1, oy2 - oy1);
+			const steps = Math.min(96, Math.max(1, Math.ceil(len / (cell * 0.75))));
+			for (let s = 0; s <= steps; s++) {
+				const t = s / steps;
+				if (pointSegDist(ox1 + (ox2 - ox1) * t, oy1 + (oy2 - oy1) * t, ax, ay, bx, by) < rr) return false;
+			}
+		}
+		return true;
+	};
+	const pulled: Cell[] = [];
+	{
+		let i = 0;
+		while (i < simplified.length) {
+			pulled.push(simplified[i]);
+			let run = i + 1;
+			while (run < simplified.length && simplified[run].layer === simplified[i].layer) run++;
+			// [i, run) 同层：从段尾向回找最长可视跳跃
+			let j = run - 1;
+			while (j > i + 1 && !segClear(simplified[i].x, simplified[i].y, simplified[j].x, simplified[j].y, simplified[i].layer)) j--;
+			i = Math.max(j, i + 1);
+		}
+	}
+
 	// ── 生成图元与过孔 ──
 	const prims: GridPrim[] = [];
 	const vias: GridVia[] = [];
-	for (let k = 1; k < simplified.length; k++) {
-		const a = simplified[k - 1], b = simplified[k];
+	for (let k = 1; k < pulled.length; k++) {
+		const a = pulled[k - 1], b = pulled[k];
 		if (a.layer === b.layer) {
 			if (a.x !== b.x || a.y !== b.y) {
 				prims.push({ kind: 'line', layer: a.layer, x1: a.x, y1: a.y, x2: b.x, y2: b.y });
@@ -354,16 +474,67 @@ export async function gridRoute(req: GridRouteRequest): Promise<GridRouteResult>
 			vias.push({ x: a.x, y: a.y });
 		}
 	}
-	// 首尾并入端点焊盘中心（避免网格量化在焊盘外留断口）
-	if (simplified.length) {
-		const first = simplified[0];
-		if (Math.hypot(first.x - src.x, first.y - src.y) > cell) {
+	// 首尾并入端点：非候选点端做「连接线净距修剪」——从焊盘中心逐格前探
+	// 找可直连的格（邻盘净距圈压进本盘释放区时，格心合法 ≠ 线段合法），
+	// 找不到整条边放弃；候选点端由已验证的引出段接管，跳过本逻辑。
+	if (pulled.length) {
+		if (!startStub) {
+			const firstLayer = pulled[0].layer;
+			let startIdx = -1;
+			for (let k = 0; k < pulled.length; k++) {
+				if (pulled[k].layer !== firstLayer) break;
+				if (segClear(src.x, src.y, pulled[k].x, pulled[k].y, firstLayer)) { startIdx = k; break; }
+			}
+			if (startIdx < 0) return { ...fail, cell };
+			pulled.splice(0, startIdx);
+		}
+		if (!goalStub) {
+			const lastLayer = pulled[pulled.length - 1].layer;
+			let endIdx = -1;
+			for (let k = pulled.length - 1; k >= 0; k--) {
+				if (pulled[k].layer !== lastLayer) break;
+				if (segClear(dst.x, dst.y, pulled[k].x, pulled[k].y, lastLayer)) { endIdx = k; break; }
+			}
+			if (endIdx < 0) return { ...fail, cell };
+			pulled.splice(endIdx + 1);
+		}
+
+		// 重新生成图元/过孔（起止格被修剪过）
+		prims.length = 0;
+		vias.length = 0;
+		for (let k = 1; k < pulled.length; k++) {
+			const a = pulled[k - 1], b = pulled[k];
+			if (a.layer === b.layer) {
+				if (a.x !== b.x || a.y !== b.y) {
+					prims.push({ kind: 'line', layer: a.layer, x1: a.x, y1: a.y, x2: b.x, y2: b.y });
+				}
+			} else {
+				vias.push({ x: a.x, y: a.y });
+			}
+		}
+		const first = pulled[0];
+		if (!startStub && Math.hypot(first.x - src.x, first.y - src.y) > 0.5) {
 			prims.unshift({ kind: 'line', layer: first.layer, x1: src.x, y1: src.y, x2: first.x, y2: first.y });
 		}
-		const last = simplified[simplified.length - 1];
-		if (Math.hypot(last.x - dst.x, last.y - dst.y) > cell) {
+		const last = pulled[pulled.length - 1];
+		if (!goalStub && Math.hypot(last.x - dst.x, last.y - dst.y) > 0.5) {
 			prims.push({ kind: 'line', layer: last.layer, x1: last.x, y1: last.y, x2: dst.x, y2: dst.y });
 		}
+	}
+
+	// ── 终检：每段直线逐一过净距（含焊盘内段落——邻盘净距圈压进本盘
+	// 释放区时，格心合法 ≠ 线段合法）。任何一段不合法，整条边放弃。
+	// 出线候选点引出段不在此列（调用方已按真实焊盘轮廓验证）。
+	for (const p of prims) {
+		if (p.kind !== 'line') continue;
+		if (!segClear(p.x1!, p.y1!, p.x2!, p.y2!, p.layer)) return { ...fail, cell };
+	}
+	// 引出段最后拼接（免检：stubFeasible 用真实轮廓 + 区间判定验证过）
+	if (startStub) {
+		prims.unshift({ kind: 'line', layer: pulled[0]?.layer ?? req.layers[0], x1: src.x, y1: src.y, x2: startStub.x, y2: startStub.y });
+	}
+	if (goalStub) {
+		prims.push({ kind: 'line', layer: pulled[pulled.length - 1]?.layer ?? req.layers[0], x1: goalStub.x, y1: goalStub.y, x2: dst.x, y2: dst.y });
 	}
 
 	return { ok: prims.length > 0, prims, vias, cell };
