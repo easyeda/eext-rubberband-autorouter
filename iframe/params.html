@@ -452,7 +452,7 @@
 				<div class="row">
 					<div class="label">
 						<span>实时预览</span>
-						<small>每布完一个网络立即刷新画布</small>
+						<small>每网完成即刷新；关闭则最后写入（更快）</small>
 					</div>
 					<div class="control">
 						<label class="switch"><input type="checkbox" id="livePreview" checked><span></span></label>
@@ -481,8 +481,18 @@
 
 				<div class="row">
 					<div class="label">
+						<span>排除 GND 网络</span>
+						<small>默认开启：不布地网络，保留其既有走线</small>
+					</div>
+					<div class="control">
+						<label class="switch"><input type="checkbox" id="excludeGnd" checked><span></span></label>
+					</div>
+				</div>
+
+				<div class="row">
+					<div class="label">
 						<span>允许焊盘打孔</span>
-						<small>过孔可落在焊盘铜皮上；关闭时过孔只打在焊盘外，并避开相邻焊盘的 DRC 间距</small>
+						<small>过孔可直接落在焊盘上（默认关闭）</small>
 					</div>
 					<div class="control">
 						<label class="switch"><input type="checkbox" id="allowViaInPad"><span></span></label>
@@ -560,6 +570,7 @@
 			allowViaInPad: false,
 			routeLayers: [1, 2],
 			excludeNets: [],
+			excludeGnd: true,
 			netOrder: 'auto'
 		};
 		var defaults = Object.assign({}, DEFAULTS);
@@ -672,6 +683,7 @@
 				netRows.push({ name: n.name, kind: n.kind, el: row, input: input });
 			});
 			list.appendChild(frag);
+			applyExcludeGndState();
 		}
 
 		function applyLayerSelection(routeLayers) {
@@ -683,10 +695,28 @@
 		function applyNetSelection(excluded) {
 			var set = Object.create(null);
 			(excluded || []).forEach(function (name) { set[name] = true; });
+			var gnd = excludeGndOn();
 			netRows.forEach(function (r) {
-				r.input.checked = !set[r.name];
+				var isGnd = r.kind === 'ground';
+				r.input.checked = !set[r.name] && !(gnd && isGnd);
 			});
+			applyExcludeGndState();
 			updateNetCount();
+		}
+
+		function excludeGndOn() {
+			var box = $('excludeGnd');
+			return !!(box && box.checked);
+		}
+
+		/** 开关打开时「地网络」自动取消勾选（仍可手动勾选，勾选即自动关闭开关） */
+		function applyExcludeGndState() {
+			var gnd = excludeGndOn();
+			netRows.forEach(function (r) {
+				if (r.kind !== 'ground') return;
+				r.input.disabled = false;
+				if (gnd) r.input.checked = false;
+			});
 		}
 
 		function selectedNets() {
@@ -705,6 +735,11 @@
 
 		// ── 参数读写 ──────────────────────────────
 
+		/** 调试档位（1/2/3/5 分钟）仅在 ?budgetDebug=1 时出现在下拉框 */
+		function budgetDebugOn() {
+			return /(?:^|[?&])budgetDebug=1(?:&|$)/.test(location.search);
+		}
+
 		function applyOptions(o) {
 			setNumberPair('traceWidthMil', 'traceWidthMilNum', o.traceWidthMil);
 			setNumberPair('extraClearanceMil', 'extraClearanceMilNum', o.extraClearanceMil);
@@ -713,10 +748,17 @@
 			var budgetSec = Math.round((Number(o.budgetMs) || 0) / 1000);
 			// 「不限时」档位已取消：引擎内部本就封顶 60 分钟，旧配置里的 0
 			// 直接归到 60 分钟档（否则下拉框没有对应项会显示空白）
+			var BUDGETS = budgetDebugOn()
+				? [60, 120, 180, 300, 600, 1200, 1800, 3600]
+				: [600, 1200, 1800, 3600];
 			if (budgetSec === 0) budgetSec = 3600;
-			else if (budgetSec !== 600 && budgetSec !== 1200 && budgetSec !== 1800 && budgetSec !== 3600) {
+			else if (BUDGETS.indexOf(budgetSec) < 0) {
 				// 旧版本可能保存过 300/900 秒等值：归入最近的档位
-				budgetSec = budgetSec >= 2700 ? 3600 : budgetSec >= 1500 ? 1800 : budgetSec >= 900 ? 1200 : 600;
+				var best = BUDGETS[0];
+				for (var bi = 1; bi < BUDGETS.length; bi++) {
+					if (Math.abs(BUDGETS[bi] - budgetSec) < Math.abs(best - budgetSec)) best = BUDGETS[bi];
+				}
+				budgetSec = best;
 			}
 			$('budgetSec').value = String(budgetSec);
 			$('netOrder').value = o.netOrder || 'auto';
@@ -724,6 +766,7 @@
 			$('finalOptimize').checked = o.finalOptimize !== false;
 			$('viaFallback').checked = o.viaFallback !== false;
 			$('allowViaInPad').checked = o.allowViaInPad === true;
+			$('excludeGnd').checked = o.excludeGnd !== false;
 
 			if (netRows.length) {
 				applyNetSelection(o.excludeNets || []);
@@ -738,6 +781,9 @@
 		function collect() {
 			var layers = [1];
 			if ($('layerBottom').checked && !$('layerBottom').disabled) layers.push(2);
+			// 网络清单是最终依据：用户手动勾选地网络时，即使开关还开着也不再
+			// 强制排除（开关只负责「打开弹窗时默认不勾选 GND」）。
+			var gndChecked = netRows.some(function (r) { return r.kind === 'ground' && r.input.checked; });
 			return {
 				traceWidthMil: clamp($('traceWidthMilNum').value, 4, 40),
 				extraClearanceMil: clamp($('extraClearanceMilNum').value, 0, 20),
@@ -754,6 +800,7 @@
 				excludeNets: netRows.length
 					? netRows.filter(function (r) { return !r.input.checked; }).map(function (r) { return r.name; })
 					: [],
+				excludeGnd: $('excludeGnd').checked && !gndChecked,
 				netOrder: $('netOrder').value
 			};
 		}
@@ -803,6 +850,16 @@
 		});
 
 		$('layerBottom').addEventListener('change', updateLayerState);
+		$('excludeGnd').addEventListener('change', function () {
+			// 关闭「排除 GND」时把地网络恢复为选中（用户仍可在列表里单独取消）
+			if (!this.checked) {
+				netRows.forEach(function (r) {
+					if (r.kind === 'ground') { r.input.disabled = false; r.input.checked = true; }
+				});
+			}
+			applyExcludeGndState();
+			updateNetCount();
+		});
 		$('netSearch').addEventListener('input', function () {
 			var q = this.value.trim().toLowerCase();
 			netRows.forEach(function (r) {
@@ -811,7 +868,9 @@
 		});
 
 		$('selectAll').addEventListener('click', function () {
-			netRows.forEach(function (r) { r.input.checked = true; });
+			netRows.forEach(function (r) {
+				if (!(excludeGndOn() && r.kind === 'ground')) r.input.checked = true;
+			});
 			updateNetCount();
 		});
 		$('selectSignal').addEventListener('click', function () {
@@ -862,6 +921,17 @@
 				btn.querySelector('.txt').textContent = '开始布线';
 			}
 		});
+
+		// 调试档位：正常界面只保留 10/20/30/60 分钟；URL 带 ?budgetDebug=1
+		// 时额外开放 1/2/3/5 分钟（自动化 A/B / 快速试跑用）
+		(function () {
+			if (!budgetDebugOn()) return;
+			var sel = $('budgetSec');
+			var extra = [[60, '1 分钟（调试）'], [120, '2 分钟（调试）'], [180, '3 分钟（调试）'], [300, '5 分钟（调试）']];
+			for (var i = extra.length - 1; i >= 0; i--) {
+				sel.insertBefore(new Option(extra[i][1], String(extra[i][0])), sel.firstChild);
+			}
+		})();
 
 		// 握手：若主线程还没收到 ready，则重试几次
 		var tries = 0;

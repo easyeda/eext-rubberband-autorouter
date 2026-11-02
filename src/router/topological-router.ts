@@ -139,6 +139,9 @@ export class TopologicalRouter {
 		if (this.applyDraining) return;
 		this.applyDraining = true;
 		for (;;) {
+			// 停止后（worker terminate 与清队列之间的窗口里可能还有迟到消息入队）
+			// 彻底排空任务表并退出循环：停止 = 画布零写入
+			if (this.shouldCancel) { this.applyPending.clear(); break; }
 			const next = this.applyPending.entries().next();
 			if (next.done || !next.value) break;
 			const key = next.value[0];
@@ -614,6 +617,19 @@ export class TopologicalRouter {
 			if (padMap.size === 0) throw new Error('没有可布线的网络');
 
 			const excluded = new Set(options.excludeNets ?? []);
+			// 默认排除地网络（GND/VSS/AGND/DGND…）：地通常是铺铜/手工走线，
+			// 自动布线只会把它当围墙并和信号抢通道。排除后既不参与布线，
+			// 也不在 clearExistingTraces 里被清理（排除网的既有走线保持现状）。
+			if (options.excludeGnd !== false) {
+				const groundNames = [...padMap.keys()].filter(isGroundNetName);
+				const nonGround = padMap.size - groundNames.length;
+				if (groundNames.length && nonGround > 0) {
+					for (const n of groundNames) excluded.add(n);
+					this.onLog?.(`按设置排除地网络 ${groundNames.length} 个（${groundNames.slice(0, 6).join(', ')}${groundNames.length > 6 ? '…' : ''}）`, 'info');
+				} else if (groundNames.length) {
+					this.onLog?.('板内网络全部是地网络，已跳过「排除 GND」（否则没有可布网络）', 'warn');
+				}
+			}
 			const networks = Array.from(padMap.entries())
 				.filter(([name]) => !excluded.has(name))
 				.map(([name, pads]) => ({ name, pads }));
@@ -699,14 +715,18 @@ export class TopologicalRouter {
 			// 最终对账：完全失败的网不得残留图元；部分连通的网要保留已布走线
 			// （否则一条连接失败会把整网其它已布好的线段一并删掉）。
 			const partial = new Set(result.partial ?? []);
-			for (const name of result.failed) {
-				if (partial.has(name)) continue;
-				this.netGeom.delete(name);
-				if (options.livePreview === false) {
-					this.pendingPlanned.delete(name);
-					continue;
+			// 停止语义：不做任何画布删改（失败网残留的半截走线保留 —— 用户
+			// 要的是「保留画布内容」；下次布线会按 clearExistingTraces 自动清理）
+			if (!this.shouldCancel) {
+				for (const name of result.failed) {
+					if (partial.has(name)) continue;
+					this.netGeom.delete(name);
+					if (options.livePreview === false) {
+						this.pendingPlanned.delete(name);
+						continue;
+					}
+					await this.deleteNet(name);
 				}
-				await this.deleteNet(name);
 			}
 
 			// 收尾对账：EDA 的批量删除偶发不生效，运行中途被替换掉的尝试走线
@@ -753,8 +773,14 @@ export class TopologicalRouter {
 
 			// 无论是否实时预览，都必须等画布写入队列排空再报完成 ——
 			// 否则进度条已 100%、按钮可点，画布却还在逐网重绘（用户可见的
-			// 「拆线重试」假象，2026-10-24 实测）
-			await this.flushPending();
+			// 「拆线重试」假象，2026-10-24 实测）。停止路径相反：丢弃全部排队
+			// 几何立即返回（几十 ms），画布停留在停止瞬间的样子。
+			if (this.shouldCancel) {
+				this.pendingPlanned.clear();
+				this.applyPending.clear();
+			} else {
+				await this.flushPending();
+			}
 
 			// 兜底核对：画布必须与引擎终态完全一致。实测 EDA 的按 ID 删除
 			// 偶发漏删、重复写入会留下同坐标幽灵过孔（引擎侧已去重，画布仍在，
@@ -812,6 +838,8 @@ export class TopologicalRouter {
 				if (settled) return;
 				settled = true;
 				this.forceFinish = null;
+				// 停止路径不等写入队列排空（用户语义：几十 ms 内结束，画布保留现状）
+				if (this.shouldCancel) { fn(); return; }
 				// 等实时写入队列清空再收尾
 				this.applyIdle().then(fn, fn);
 			};
@@ -1295,20 +1323,23 @@ export class TopologicalRouter {
 	cancel(): void {
 		if (!this.isRouting) return;
 		this.shouldCancel = true;
-		this.onLog?.('正在停止布线...', 'warn');
-		this.engine?.cancel();
+		// 停止语义（用户拍板）：点击停止 = 立刻杀掉 worker（几十 ms）、画布保留
+		// 已写入内容、此后不再有任何写入。旧实现依赖引擎在 checkCancelled
+		// 检查点协同退出 —— GND 单网求解/驱逐循环可达分钟级，期间画布还在被
+		// 实时节拍继续刷，表现为「点了停止还要等很久且线还在长」。
+		this.onLog?.('布线已停止', 'warn');
+		this.engine?.cancel();   // 无 Worker 的主线程回退仍走协同取消
 		if (this.worker) {
-			try { this.worker.postMessage({ type: 'cancel' }); } catch { /* ignore */ }
-			// Worker 若在长同步段中未能响应，超时后强制结束并保留已写入结果
-			if (!this.cancelTimer) {
-				this.cancelTimer = setTimeout(() => {
-					this.cancelTimer = null;
-					try { this.worker?.terminate(); } catch { /* ignore */ }
-					this.worker = null;
-					this.forceFinish?.();
-				}, 15000);
-			}
+			try { this.worker.terminate(); } catch { /* ignore */ }
+			this.worker = null;
 		}
+		if (this.cancelTimer) {
+			clearTimeout(this.cancelTimer);
+			this.cancelTimer = null;
+		}
+		this.stopLiveTimer();          // 停 5s 节拍并丢弃排队几何：之后画布零写入
+		this.applyPending.clear();     // 未执行的写入任务全部作废
+		this.forceFinish?.();          // 立即兑现规划 Promise（不等写入队列排空）
 	}
 
 	isActive(): boolean { return this.isRouting; }

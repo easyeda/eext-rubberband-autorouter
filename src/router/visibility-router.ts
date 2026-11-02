@@ -117,50 +117,153 @@ function chainTolFor(k: RBObstacle, t: RBObstacle | undefined): number {
  * 用扁平数组 + 戳记法避免每查询分配 Set / Map 哈希。
  */
 class CircleGrid {
+	// 稠密局部网格：桶坐标以所有圆的包围盒为原点重新编号。
+	// 旧实现用 (gx+2048)*4096+(gy+2048) 的稀疏键，buckets.length 恒为
+	// ~8.4M，每个求解器都要 new Int32Array(8.4M)（~33MB）——case12 这种
+	// 大板 200+ 次求解时是纯 GC/清零开销。稠密网格的格子数只有
+	// (板宽/100)×(板高/100)（~25×22），分配和查表都便宜一个数量级。
 	private buckets: number[][] = [];
 	private stamp: Int32Array;
 	private curStamp = 0;
 	private circles: RBObstacle[];
-	private key(gx: number, gy: number): number { return (gx + 2048) * 4096 + (gy + 2048); }
+	private minGx = 0;
+	private minGy = 0;
+	private w = 1;
+	private h = 1;
+	/** 异常大坐标范围时退回旧的稀疏桶（避免 w*h 爆内存） */
+	private legacy = false;
+
+	private key(gx: number, gy: number): number {
+		const lx = gx - this.minGx, ly = gy - this.minGy;
+		if (this.legacy) return (gx + 2048) * 4096 + (gy + 2048);
+		if (lx < 0 || ly < 0 || lx >= this.w || ly >= this.h) return -1;
+		return ly * this.w + lx;
+	}
+
+	/** 访问一个格子（去重）；cb 返回 true 时终止 */
+	private visit(key: number, stampId: number, cb: (idx: number) => boolean | void): boolean {
+		if (key < 0) return false;
+		if (this.legacy) {
+			// 稀疏退回路径用 Set 去重（极少触发）
+			const seen = (this as any).__seen as Set<number>;
+			if (seen.has(key)) return false;
+			seen.add(key);
+		} else {
+			if (this.stamp[key] === stampId) return false;
+			this.stamp[key] = stampId;
+		}
+		const arr = this.buckets[key];
+		if (arr) for (let k = 0; k < arr.length; k++) if (cb(arr[k]) === true) return true;
+		return false;
+	}
 
 	constructor(circles: RBObstacle[]) {
 		this.circles = circles;
+		if (!circles.length) { this.stamp = new Int32Array(0); return; }
+		// 圆的 bbox 覆盖范围（插入半径上限 400mil，防异常数据撑爆）
+		const ranges: Array<[number, number, number, number]> = new Array(circles.length);
+		let minGx = Infinity, maxGx = -Infinity, minGy = Infinity, maxGy = -Infinity;
 		for (let i = 0; i < circles.length; i++) {
 			const c = circles[i];
-			const key = this.key(Math.floor(c.x / GRID_CELL), Math.floor(c.y / GRID_CELL));
-			let arr = this.buckets[key];
-			if (!arr) { arr = []; this.buckets[key] = arr; }
-			arr.push(i);
+			const r = Math.min(Math.max(c.r, 0), 400);
+			const i0 = Math.floor((c.x - r) / GRID_CELL), i1 = Math.floor((c.x + r) / GRID_CELL);
+			const j0 = Math.floor((c.y - r) / GRID_CELL), j1 = Math.floor((c.y + r) / GRID_CELL);
+			ranges[i] = [i0, i1, j0, j1];
+			if (i0 < minGx) minGx = i0;
+			if (i1 > maxGx) maxGx = i1;
+			if (j0 < minGy) minGy = j0;
+			if (j1 > maxGy) maxGy = j1;
 		}
-		this.stamp = new Int32Array(this.buckets.length);
-	}
-
-	/** 遍历线段附近（距离 < 半径可达）的所有圆下标（可能重复） */
-	nearSegment(x1: number, y1: number, x2: number, y2: number, cb: (idx: number) => boolean | void): void {
-		const stampId = ++this.curStamp;
-		const d = Math.hypot(x2 - x1, y2 - y1);
-		const steps = Math.max(1, Math.ceil(d / (GRID_CELL * 0.8)));
-		for (let s = 0; s <= steps; s++) {
-			const t = s / steps;
-			const px = x1 + (x2 - x1) * t, py = y1 + (y2 - y1) * t;
-			const gx = Math.floor(px / GRID_CELL), gy = Math.floor(py / GRID_CELL);
-			for (let dx = -1; dx <= 1; dx++) for (let dy = -1; dy <= 1; dy++) {
-				const key = this.key(gx + dx, gy + dy);
-				if (this.stamp[key] === stampId) continue;
-				this.stamp[key] = stampId;
-				const arr = this.buckets[key];
-				if (arr) for (let k = 0; k < arr.length; k++) if (cb(arr[k]) === true) return;
+		this.minGx = minGx;
+		this.minGy = minGy;
+		this.w = maxGx - minGx + 1;
+		this.h = maxGy - minGy + 1;
+		const total = this.w * this.h;
+		if (total > 2_000_000) {
+			// 兜底：坐标跨度异常（通常是脏数据里的离群点），保持旧行为
+			this.legacy = true;
+			this.buckets = [];
+			for (let i = 0; i < circles.length; i++) {
+				const c = circles[i];
+				const k = (Math.floor(c.x / GRID_CELL) + 2048) * 4096 + (Math.floor(c.y / GRID_CELL) + 2048);
+				let arr = this.buckets[k];
+				if (!arr) { arr = []; this.buckets[k] = arr; }
+				arr.push(i);
+			}
+			this.stamp = new Int32Array(0);
+			return;
+		}
+		this.buckets = new Array(total);
+		// 多格插入：把圆放进它 bbox 覆盖的每个格子。这样射线只查经过的
+		// 格子，不需要每个采样点再查 3×3 邻域（旧实现 9 倍桶查找量）。
+		for (let i = 0; i < circles.length; i++) {
+			const [i0, i1, j0, j1] = ranges[i];
+			for (let gx = i0; gx <= i1; gx++) {
+				const lx = gx - minGx;
+				for (let gy = j0; gy <= j1; gy++) {
+					const key = lx + (gy - minGy) * this.w;
+					let arr = this.buckets[key];
+					if (!arr) { arr = []; this.buckets[key] = arr; }
+					arr.push(i);
+				}
 			}
 		}
+		this.stamp = new Int32Array(total);
 	}
 
-	/** 遍历点附近的所有圆下标 */
-	nearPoint(px: number, py: number, cb: (idx: number) => void): void {
-		const gx = Math.floor(px / GRID_CELL), gy = Math.floor(py / GRID_CELL);
-		for (let dx = -1; dx <= 1; dx++) for (let dy = -1; dy <= 1; dy++) {
-			const arr = this.buckets[this.key(gx + dx, gy + dy)];
-			if (arr) for (let k = 0; k < arr.length; k++) cb(arr[k]);
+	/** 遍历线段经过的格子里的圆（多格插入 + 去重，不会重复） */
+	nearSegment(x1: number, y1: number, x2: number, y2: number, cb: (idx: number) => boolean | void): void {
+		const stampId = ++this.curStamp;
+		if (this.legacy) {
+			// 旧稀疏路径：按采样点查 3×3
+			const seen = new Set<number>();
+			(this as any).__seen = seen;
+			const d = Math.hypot(x2 - x1, y2 - y1);
+			const steps = Math.max(1, Math.ceil(d / (GRID_CELL * 0.8)));
+			for (let s = 0; s <= steps; s++) {
+				const t = s / steps;
+				const px = x1 + (x2 - x1) * t, py = y1 + (y2 - y1) * t;
+				const gx = Math.floor(px / GRID_CELL), gy = Math.floor(py / GRID_CELL);
+				for (let dx = -1; dx <= 1; dx++) for (let dy = -1; dy <= 1; dy++) {
+					if (this.visit(this.key(gx + dx, gy + dy), stampId, cb)) return;
+				}
+			}
+			(this as any).__seen = null;
+			return;
 		}
+		// 网格 DDA（Amanatides-Woo）：只走线段真正穿过的格子
+		let gx = Math.floor(x1 / GRID_CELL), gy = Math.floor(y1 / GRID_CELL);
+		const gxEnd = Math.floor(x2 / GRID_CELL), gyEnd = Math.floor(y2 / GRID_CELL);
+		const dx = x2 - x1, dy = y2 - y1;
+		const stepX = dx > 0 ? 1 : dx < 0 ? -1 : 0;
+		const stepY = dy > 0 ? 1 : dy < 0 ? -1 : 0;
+		let tMaxX = stepX === 0 ? Infinity : ((stepX > 0 ? (gx + 1) * GRID_CELL : gx * GRID_CELL) - x1) / dx;
+		let tMaxY = stepY === 0 ? Infinity : ((stepY > 0 ? (gy + 1) * GRID_CELL : gy * GRID_CELL) - y1) / dy;
+		const tDeltaX = stepX === 0 ? Infinity : Math.abs(GRID_CELL / dx);
+		const tDeltaY = stepY === 0 ? Infinity : Math.abs(GRID_CELL / dy);
+		if (this.visit(this.key(gx, gy), stampId, cb)) return;
+		let guard = 0;
+		while ((gx !== gxEnd || gy !== gyEnd) && guard++ < 20000) {
+			if (tMaxX < tMaxY) {
+				gx += stepX; tMaxX += tDeltaX;
+			} else if (tMaxY < tMaxX) {
+				gy += stepY; tMaxY += tDeltaY;
+			} else {
+				// 正好穿过格点：两个方向依次走，避免漏格
+				gx += stepX; tMaxX += tDeltaX;
+				if (this.visit(this.key(gx, gy), stampId, cb)) return;
+				gy += stepY; tMaxY += tDeltaY;
+			}
+			if (this.visit(this.key(gx, gy), stampId, cb)) return;
+		}
+	}
+
+	/** 遍历点所在格子里的圆（多格插入保证覆盖） */
+	nearPoint(px: number, py: number, cb: (idx: number) => void): void {
+		const key = this.key(Math.floor(px / GRID_CELL), Math.floor(py / GRID_CELL));
+		if (key < 0) return;
+		const arr = this.buckets[key];
+		if (arr) for (let k = 0; k < arr.length; k++) cb(arr[k]);
 	}
 }
 
@@ -286,7 +389,7 @@ function coarseTube(
 	src: { x: number; y: number }, dst: { x: number; y: number },
 ): Array<{ x: number; y: number }> | null {
 	if (all.length < 8) return null;
-	const CELL = 16;
+	const CELL = Number((globalThis as any).__RB_TUBE_CELL__) || 16;
 	const span = Math.hypot(dst.x - src.x, dst.y - src.y);
 	if (span < 1) return null;
 	const margin = Math.min(span * 0.4 + 150, 600);
@@ -801,7 +904,7 @@ async function solveMulti(
 			}
 			if (cancelled()) { timedOut = true; break; }
 		}
-		const reach = ci.r + __maxR + 800;
+		const reach = ci.r + __maxR + (Number((globalThis as any).__RB_VR_REACH__) || 800);
 		for (let oj = oi + 1; oj < n; oj++) {
 			const j = __xOrder[oj];
 			if (circles[j].x - ci.x > reach) break;
@@ -815,13 +918,38 @@ async function solveMulti(
 				if (cancelled()) { timedOut = true; break; }
 			}
 			const cj = circles[j];
+			// y 预筛：x 序扫描里 |Δy| 超界的圆对占大半，切线 4 组组合 + segOK
+			// 网格遍历全浪费。只 continue 不改变扫描顺序 → 输出逐位一致（无
+			// tie-break 混沌回归），实测建图占求解 85~90%，这刀纯赚。
+			const dy = cj.y - ci.y;
+			if (dy > reach || dy < -reach) continue;
 			if (net && cj.net === net && !cj.forceBlock) continue;
 			const d = dist(ci.x, ci.y, cj.x, cj.y);
-			for (const [l1, l2] of [[true, true], [true, false], [false, true], [false, false]] as const) {
+			// 切线解算内联（与 getTangents 逐位一致）：单位向量 vx/vy 对每
+			// 圆对只算一次（原来 4 组组合各做一次 hypot+除法）；d≈0 时
+			// cVal=±Infinity 被 |cVal|>1 提前拦下，与 getTangents 的 d<1e-9
+			// 分支在此处不可达，行为等价。
+			const vx = (cj.x - ci.x) / d;
+			const vy = dy / d;
+			// 四种内外切线组合（外切 l1===l2 / 内切相异）手工展开为位循环，
+			// 避免每对分配 [[..],[..]] 数组（建图热路径 GC 大头之一）
+			for (let lv = 0; lv < 4; lv++) {
+				const l1 = lv < 2;
+				const l2 = (lv & 1) === 0;
+				// 内公切线（l1!==l2）在绕障布线里极少成为有效边，却同样要过
+				// 4 组 segOK；实验开关用于量化它的成本/收益。
+				if ((globalThis as any).__RB_SKIP_INNER__ && l1 !== l2) continue;
 				const adjR2 = cj.r * (l1 === l2 ? 1 : -1);
 				const cVal = (ci.r - adjR2) / d;
 				if (Math.abs(cVal) > 1) continue; // 该类型切线不存在
-				const [tx1, ty1, tx2, ty2] = getTangents(ci.x, ci.y, ci.r, l1, cj.x, cj.y, cj.r, l2);
+				let hs = Math.sqrt(1 - cVal * cVal);
+				if (l1) hs = -hs; // getTangents: h = sqrt(1-c²)·(l1 ? -1 : 1)
+				const nx = vx * cVal - hs * vy;
+				const ny = vy * cVal + hs * vx;
+				const tx1 = ci.x + ci.r * nx;
+				const ty1 = ci.y + ci.r * ny;
+				const tx2 = cj.x + adjR2 * nx;
+				const ty2 = cj.y + adjR2 * ny;
 				if (!segOK(tx1, ty1, tx2, ty2, i, j)) continue;
 				const len = Math.hypot(tx2 - tx1, ty2 - ty1);
 				if (len < 1e-6) continue;

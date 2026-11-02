@@ -22,12 +22,22 @@ export interface GridRouteRequest {
 	src: { x: number; y: number };
 	dst: { x: number; y: number };
 	/** 起点/终点焊盘（用于在自身铜皮内解除阻挡：出线豁免） */
-	srcPad?: { x: number; y: number; r: number };
-	dstPad?: { x: number; y: number; r: number };
+	srcPad?: { x: number; y: number; r: number; viaKeepoutR?: number };
+	dstPad?: { x: number; y: number; r: number; viaKeepoutR?: number };
+	/** 焊盘铜皮覆盖圆（绝对坐标，半径已含少量余量）：长焊盘必须按整条
+	 * 铜皮解禁，只用焊盘中心的小圆会把起点困在邻盘净距圈的「口袋」里
+	 *（case12 0.5mm 排：起点四周全是邻盘间距圈，A* 只能弹出 8 个格子）。 */
+	srcReleases?: Array<{ x: number; y: number; r: number }>;
+	dstReleases?: Array<{ x: number; y: number; r: number }>;
 	/** 出线候选点（调用方已按真实焊盘轮廓验证过引出段）：迷宫从这些点
 	 * 起步，绕开被邻盘净距圈封死的焊盘中心。引出段图元由调用方拼接。 */
 	srcStubs?: Array<{ x: number; y: number }>;
 	dstStubs?: Array<{ x: number; y: number }>;
+	/** 起点/终点焊盘允许起步的层（顶层 SMD 只能 [1]，TH/多层 [1,2]）。
+	 * 缺省 = 全部层（旧行为）。⚠ 绝不能对顶层 SMD 缺省：A* 会直接从
+	 * 顶层焊盘中心起步走底层，产出一条没有过孔的底层走线（EDA 判定断网）。 */
+	srcPadLayers?: number[];
+	dstPadLayers?: number[];
 	/** 障碍（半径已含线宽一半 + 间距）；soft 忽略 */
 	obstacles: RBObstacle[];
 	net: string;
@@ -39,6 +49,14 @@ export interface GridRouteRequest {
 	viaCostMil?: number;
 	/** 网格单元上限（每层），默认 400k */
 	maxCells?: number;
+	/** 过孔相对走线额外占用的半径（mil）：过孔铜环 + 焊盘间距比走线宽。
+	 * 层间跳变只允许落在「对障碍多留这么多」的格点，避免 A* 在过孔放不下
+	 * 的窄缝里换层 → 整条路径因 viaPadClear 被否决。0 = 不额外约束。 */
+	viaExtraMil?: number;
+	/** 焊盘类障碍的过孔额外净空（焊盘障碍本身已含 pad 间距，口径不同） */
+	viaExtraPadMil?: number;
+	/** 是否允许过孔落在焊盘上（默认 false：同网焊盘也要挡层间跳变） */
+	viaInPad?: boolean;
 	budgetMs?: number;
 	isCancelled?: () => boolean;
 }
@@ -57,6 +75,8 @@ export interface GridRouteResult {
 	vias: GridVia[];
 	/** 实际使用的单元尺寸（调试） */
 	cell: number;
+	/** 失败原因（调试） */
+	debug?: string;
 }
 
 interface Cell {
@@ -155,24 +175,53 @@ export async function gridRoute(req: GridRouteRequest): Promise<GridRouteResult>
 	// 半单元外扩：保证相邻自由格中心之间的线段不切进障碍圆
 	const inflate = cell * 0.5;
 	const blocked = new Uint8Array(total);
+	// 过孔落点网格：比走线多要求 viaExtraMil 的净空。只有层间跳变的格点
+	// 需要它（见 A* 的 via 边），普通走线不看。
+	const viaExtra = Math.max(0, req.viaExtraMil ?? 0);
+	const viaBlocked = viaExtra > 0 ? new Uint8Array(total) : null;
 	const layerIndex = new Map<number, number>();
 	req.layers.forEach((l, i) => layerIndex.set(l, i));
 
-	const markCircle = (lx: number, ly: number, r: number, li: number): void => {
+	const markCircle = (lx: number, ly: number, r: number, li: number, extraOverride?: number, viaOnly = false): void => {
 		const rr = r + inflate;
 		const i0 = Math.max(0, Math.floor((lx - rr - x0) / cell));
 		const i1 = Math.min(nx - 1, Math.ceil((lx + rr - x0) / cell));
 		const j0 = Math.max(0, Math.floor((ly - rr - y0) / cell));
 		const j1 = Math.min(ny - 1, Math.ceil((ly + rr - y0) / cell));
 		const base = li * stride;
-		const rr2 = rr * rr;
-		for (let i = i0; i <= i1; i++) {
-			const px = x0 + i * cell;
-			const dx = px - lx, dx2 = dx * dx;
-			for (let j = j0; j <= j1; j++) {
-				const py = y0 + j * cell;
-				const dy = py - ly;
-				if (dx2 + dy * dy <= rr2) blocked[base + j * nx + i] = 1;
+		if (!viaOnly) {
+			const rr2 = rr * rr;
+			for (let i = i0; i <= i1; i++) {
+				const px = x0 + i * cell;
+				const dx = px - lx, dx2 = dx * dx;
+				for (let j = j0; j <= j1; j++) {
+					const py = y0 + j * cell;
+					const dy = py - ly;
+					if (dx2 + dy * dy <= rr2) blocked[base + j * nx + i] = 1;
+				}
+			}
+		}
+		if (viaBlocked) {
+			const ex = extraOverride ?? viaExtra;
+			if (ex <= 0) return;
+			// 注意：这里**不加** inflate。半单元外扩是为「相邻格心之间的线段」
+			// 留的余量，而过孔是格心上的点；用e.r+ex 才是与 viaPadClear /
+			// viaObstacleClear 同口径的净距，否则 0.5mm 排外的合法槽位会被
+			// 多判 4~6mil 而全灭（实测网格抢救完成数从 20+ 掉到个位数）。
+			const vr = r + ex;
+			const vr2 = vr * vr;
+			const vi0 = Math.max(0, Math.floor((lx - vr - x0) / cell));
+			const vi1 = Math.min(nx - 1, Math.ceil((lx + vr - x0) / cell));
+			const vj0 = Math.max(0, Math.floor((ly - vr - y0) / cell));
+			const vj1 = Math.min(ny - 1, Math.ceil((ly + vr - y0) / cell));
+			for (let i = vi0; i <= vi1; i++) {
+				const px = x0 + i * cell;
+				const dx = px - lx, dx2 = dx * dx;
+				for (let j = vj0; j <= vj1; j++) {
+					const py = y0 + j * cell;
+					const dy = py - ly;
+					if (dx2 + dy * dy <= vr2) viaBlocked[base + j * nx + i] = 1;
+				}
 			}
 		}
 	};
@@ -180,7 +229,12 @@ export async function gridRoute(req: GridRouteRequest): Promise<GridRouteResult>
 	let marked = 0;
 	for (const o of req.obstacles) {
 		if (o.soft) continue;
-		if (o.net && o.net === req.net) continue;
+		const sameNet = !!(o.net && o.net === req.net);
+		// 同网走线不挡路；同网焊盘在 via-in-pad 关闭时必须挡「层间跳变」
+		//（过孔不能落在自家焊盘铜皮上，否则 viaPadClear 判死整条边）。
+		const sameNetPad = sameNet && !!o.group?.startsWith('pad:');
+		if (sameNet && !(sameNetPad && req.viaInPad !== true)) continue;
+		const viaOnly = sameNetPad;
 		const lis: number[] = [];
 		if (o.layer === undefined) lis.push(...req.layers.map((_, i) => i));
 		else {
@@ -189,15 +243,16 @@ export async function gridRoute(req: GridRouteRequest): Promise<GridRouteResult>
 		}
 		if (!lis.length) continue;
 		for (const li of lis) {
+			const ex = o.group?.startsWith('pad:') ? req.viaExtraPadMil : undefined;
 			if (o.kind === 'circle') {
-				markCircle(o.x, o.y, o.r, li);
+				markCircle(o.x, o.y, o.r, li, ex, viaOnly);
 			} else {
 				// 胶囊：沿线采样成圆
 				const len = Math.hypot(o.x2! - o.x, o.y2! - o.y);
 				const steps = Math.max(1, Math.ceil(len / (cell * 0.75)));
 				for (let s = 0; s <= steps; s++) {
 					const t = s / steps;
-					markCircle(o.x + (o.x2! - o.x) * t, o.y + (o.y2! - o.y) * t, o.r, li);
+					markCircle(o.x + (o.x2! - o.x) * t, o.y + (o.y2! - o.y) * t, o.r, li, ex, viaOnly);
 				}
 			}
 		}
@@ -207,33 +262,65 @@ export async function gridRoute(req: GridRouteRequest): Promise<GridRouteResult>
 	// ── 端点松绑：起点/终点焊盘自身铜皮内一律视为可通行 ──
 	// 这是网格兜底相对可视图的关键优势：邻盘净距圈覆盖焊盘中心时，
 	// 可视图从中心出发无切点可用，网格仍能从焊盘内部任意格起步。
-	const release = (pad: { x: number; y: number; r: number } | undefined, layerIds: number[]): void => {
-		if (!pad) return;
-		const r = pad.r + cell;
+	const releaseDisc = (px: number, py: number, rad: number, layerIds: number[]): void => {
 		for (const layerId of layerIds) {
 			const li = layerIndex.get(layerId);
 			if (li === undefined) continue;
 			const base = li * stride;
-			const i0 = Math.max(0, Math.floor((pad.x - r - x0) / cell));
-			const i1 = Math.min(nx - 1, Math.ceil((pad.x + r - x0) / cell));
-			const j0 = Math.max(0, Math.floor((pad.y - r - y0) / cell));
-			const j1 = Math.min(ny - 1, Math.ceil((pad.y + r - y0) / cell));
+			const i0 = Math.max(0, Math.floor((px - rad - x0) / cell));
+			const i1 = Math.min(nx - 1, Math.ceil((px + rad - x0) / cell));
+			const j0 = Math.max(0, Math.floor((py - rad - y0) / cell));
+			const j1 = Math.min(ny - 1, Math.ceil((py + rad - y0) / cell));
 			for (let i = i0; i <= i1; i++) {
-				const dx = x0 + i * cell - pad.x;
+				const dx = x0 + i * cell - px;
 				for (let j = j0; j <= j1; j++) {
-					const dy = y0 + j * cell - pad.y;
-					if (dx * dx + dy * dy <= r * r) blocked[base + j * nx + i] = 0;
+					const dy = y0 + j * cell - py;
+					if (dx * dx + dy * dy <= rad * rad) blocked[base + j * nx + i] = 0;
 				}
 			}
 		}
 	};
-	release(req.srcPad, req.layers);
-	release(req.dstPad, req.layers);
+	const release = (pad: { x: number; y: number; r: number; viaKeepoutR?: number } | undefined, layerIds: number[], hasShapeReleases = false): void => {
+		if (!pad) return;
+		// 有焊盘形状解禁圆时不再用 bodyRadius+cell 的大圆：长条盘会多解禁
+		// 侧向 ~8mil，A* 会走合法铜皮外的斜线，最后被 segClear 判死。
+		if (!hasShapeReleases) releaseDisc(pad.x, pad.y, pad.r + cell, layerIds);
+		// 焊盘禁孔圈：via-in-pad 关闭时，层间跳变不能落在焊盘铜皮附近
+		//（A* 默认会在起点格直接换层 → 过孔压在本焊盘上，viaPadClear 判死整条边）
+		if (viaBlocked && pad.viaKeepoutR && pad.viaKeepoutR > 0) {
+			const vk = pad.viaKeepoutR;
+			for (let li = 0; li < nLayers; li++) {
+				const base = li * stride;
+				const i0 = Math.max(0, Math.floor((pad.x - vk - x0) / cell));
+				const i1 = Math.min(nx - 1, Math.ceil((pad.x + vk - x0) / cell));
+				const j0 = Math.max(0, Math.floor((pad.y - vk - y0) / cell));
+				const j1 = Math.min(ny - 1, Math.ceil((pad.y + vk - y0) / cell));
+				for (let i = i0; i <= i1; i++) {
+					const dx = x0 + i * cell - pad.x;
+					for (let j = j0; j <= j1; j++) {
+						const dy = y0 + j * cell - pad.y;
+						if (dx * dx + dy * dy <= vk * vk) viaBlocked[base + j * nx + i] = 1;
+					}
+				}
+			}
+		}
+	};
+	const srcLayers = (req.srcPadLayers?.length ? req.srcPadLayers : req.layers)
+		.filter(l => layerIndex.has(l));
+	const dstLayers = (req.dstPadLayers?.length ? req.dstPadLayers : req.layers)
+		.filter(l => layerIndex.has(l));
+	release(req.srcPad, srcLayers, (req.srcReleases?.length ?? 0) > 0);
+	release(req.dstPad, dstLayers, (req.dstReleases?.length ?? 0) > 0);
+	// 长焊盘按整条铜皮解禁（否则起点被困在邻盘间距圈的口袋里）
+	for (const p of req.srcReleases ?? []) releaseDisc(p.x, p.y, p.r, srcLayers);
+	for (const p of req.dstReleases ?? []) releaseDisc(p.x, p.y, p.r, dstLayers);
 
 	// 出线候选点松绑：候选点周围一格视为可通行（引出段已由调用方验证）
-	const releasePoint = (p: { x: number; y: number }): void => {
+	const releasePoint = (p: { x: number; y: number }, layerIds: number[]): void => {
 		const r = cell;
-		for (let li = 0; li < nLayers; li++) {
+		for (const layerId of layerIds) {
+			const li = layerIndex.get(layerId);
+			if (li === undefined) continue;
 			const base = li * stride;
 			const i0 = Math.max(0, Math.floor((p.x - r - x0) / cell));
 			const i1 = Math.min(nx - 1, Math.ceil((p.x + r - x0) / cell));
@@ -250,8 +337,8 @@ export async function gridRoute(req: GridRouteRequest): Promise<GridRouteResult>
 	};
 	const srcStubPts = req.srcStubs ?? [];
 	const dstStubPts = req.dstStubs ?? [];
-	for (const p of srcStubPts) releasePoint(p);
-	for (const p of dstStubPts) releasePoint(p);
+	for (const p of srcStubPts) releasePoint(p, srcLayers);
+	for (const p of dstStubPts) releasePoint(p, dstLayers);
 
 	const toCell = (p: { x: number; y: number }): { i: number; j: number } => ({
 		i: Math.max(0, Math.min(nx - 1, Math.round((p.x - x0) / cell))),
@@ -283,12 +370,14 @@ export async function gridRoute(req: GridRouteRequest): Promise<GridRouteResult>
 		if (prev && prev.cost <= cost) return;
 		seedBest.set(id, { i, j, li, stub, cost });
 	};
-	for (let li = 0; li < nLayers; li++) {
+	for (const layerId of srcLayers) {
+		const li = layerIndex.get(layerId)!;
 		addSeed(s.i, s.j, li, null, 0);
 	}
 	for (const p of srcStubPts) {
 		const c = toCell(p);
-		for (let li = 0; li < nLayers; li++) {
+		for (const layerId of srcLayers) {
+			const li = layerIndex.get(layerId)!;
 			addSeed(c.i, c.j, li, p, Math.hypot(p.x - src.x, p.y - src.y));
 		}
 	}
@@ -296,7 +385,8 @@ export async function gridRoute(req: GridRouteRequest): Promise<GridRouteResult>
 	const goalCost = new Map<number, number>();   // cellIdx → 引入段长
 	const isGoal = new Set<number>();
 	const addGoal = (i: number, j: number, stub: { x: number; y: number } | null): void => {
-		for (let li = 0; li < nLayers; li++) {
+		for (const layerId of dstLayers) {
+			const li = layerIndex.get(layerId)!;
 			const id = idxOf(i, j, li);
 			isGoal.add(id);
 			goalCost.set(id, stub ? Math.hypot(stub.x - dst.x, stub.y - dst.y) : 0);
@@ -316,7 +406,10 @@ export async function gridRoute(req: GridRouteRequest): Promise<GridRouteResult>
 		heap.push(sd.cost + hOf(sd.i, sd.j), id);
 		started++;
 	}
-	if (!started) return { ...fail, cell };
+	if (!started) {
+		const sId = idxOf(s.i, s.j, 0), dId = idxOf(d.i, d.j, 0);
+		return { ...fail, cell, debug: `no-seeds startBlocked=${blocked[sId]} goalBlocked=${blocked[dId]} srcLayers=${srcLayers} dstLayers=${dstLayers}` };
+	}
 
 	let best = -1;
 	let bestCost = Infinity;
@@ -362,6 +455,8 @@ export async function gridRoute(req: GridRouteRequest): Promise<GridRouteResult>
 			if (l2 === li) continue;
 			const nid = idxOf(i, j, l2);
 			if (blocked[nid] || closed[nid]) continue;
+			// 过孔比走线粗：两侧层都必须在「过孔净距」网格上为空
+			if (viaBlocked && (viaBlocked[nid] || viaBlocked[here])) continue;
 			const ng = g + viaCost;
 			if (ng < gScore[nid] - 1e-9) {
 				gScore[nid] = ng;
@@ -370,7 +465,10 @@ export async function gridRoute(req: GridRouteRequest): Promise<GridRouteResult>
 			}
 		}
 	}
-	if (best < 0) return { ...fail, cell };
+	if (best < 0) {
+		const sId = idxOf(s.i, s.j, 0), dId = idxOf(d.i, d.j, 0);
+		return { ...fail, cell, debug: `no-path nx=${nx} ny=${ny} pops=${pops} startBlocked=${blocked[sId]} goalBlocked=${blocked[dId]}` };
+	}
 
 	// ── 回溯 ──
 	const cells: Cell[] = [];
@@ -485,7 +583,7 @@ export async function gridRoute(req: GridRouteRequest): Promise<GridRouteResult>
 				if (pulled[k].layer !== firstLayer) break;
 				if (segClear(src.x, src.y, pulled[k].x, pulled[k].y, firstLayer)) { startIdx = k; break; }
 			}
-			if (startIdx < 0) return { ...fail, cell };
+			if (startIdx < 0) return { ...fail, cell, debug: 'start-unreachable(segClear from pad)' };
 			pulled.splice(0, startIdx);
 		}
 		if (!goalStub) {
@@ -495,7 +593,7 @@ export async function gridRoute(req: GridRouteRequest): Promise<GridRouteResult>
 				if (pulled[k].layer !== lastLayer) break;
 				if (segClear(dst.x, dst.y, pulled[k].x, pulled[k].y, lastLayer)) { endIdx = k; break; }
 			}
-			if (endIdx < 0) return { ...fail, cell };
+			if (endIdx < 0) return { ...fail, cell, debug: 'end-unreachable(segClear to pad)' };
 			pulled.splice(endIdx + 1);
 		}
 
@@ -527,7 +625,7 @@ export async function gridRoute(req: GridRouteRequest): Promise<GridRouteResult>
 	// 出线候选点引出段不在此列（调用方已按真实焊盘轮廓验证）。
 	for (const p of prims) {
 		if (p.kind !== 'line') continue;
-		if (!segClear(p.x1!, p.y1!, p.x2!, p.y2!, p.layer)) return { ...fail, cell };
+		if (!segClear(p.x1!, p.y1!, p.x2!, p.y2!, p.layer)) return { ...fail, cell, debug: 'validate-line' };
 	}
 	// 引出段最后拼接（免检：stubFeasible 用真实轮廓 + 区间判定验证过）
 	if (startStub) {
