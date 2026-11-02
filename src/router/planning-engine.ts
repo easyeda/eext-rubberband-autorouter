@@ -978,8 +978,9 @@ export class PlanningEngine {
 		if (!(globalThis as any).__RB_NO_NEG__ && !this.checkCancelled() &&
 			networks.some(n => !this.routedOrder.includes(n.name))) {
 			const pfOn = !!(globalThis as any).__RB_PF__;
+			const pfReserve = pfOn ? (Number((globalThis as any).__RB_PF_RESERVE__) || 75_000) : 30_000;
 			const negDeadline = Number.isFinite(deadline)
-				? deadline - (pfOn ? 75_000 : 30_000)
+				? deadline - pfReserve
 				: Date.now() + 10 * 60_000;
 			if (Date.now() < negDeadline) await this.negotiatePhase(networks, negDeadline);
 			__phase('拥挤协商');
