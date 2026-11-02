@@ -530,8 +530,12 @@ export class PlanningEngine {
 		// 空转（case12 实测 120s 预算下耗尽整个主阶段而布通数不变）；30 分钟
 		// 预算时更是能空转 20 分钟。阈值随预算缩放，最多 90s。
 		const stagnationMs = Number.isFinite(mainDeadline)
-			? Math.min(45_000, Math.max(20_000, budgetMs * 0.1))
+			? Math.min(60_000, Math.max(20_000, budgetMs * 0.22))
 			: 45_000;
+		// __RB_STAG_MS__：实验旋钮。密板收尾期失败动作 2~5s/个，27s 窗口只够
+		// 6~10 次尝试就放弃整轮 —— 放宽让评分撕毁/借道多试几轮。
+		const stagOverride = Number((globalThis as any).__RB_STAG_MS__);
+		const stagMs = Number.isFinite(stagOverride) && stagOverride > 0 ? stagOverride : stagnationMs;
 		let lastRoutedCount = this.routedOrder.length;
 		let lastNewNetAt = Date.now();
 		for (let pass = 0; pass < ripupRounds && pendingNets.length; pass++) {
@@ -574,8 +578,8 @@ export class PlanningEngine {
 					lastRoutedCount = this.routedOrder.length;
 					lastNewNetAt = Date.now();   // 有新布通就重置停滞计时
 				}
-				if (Date.now() - lastNewNetAt > stagnationMs) {
-					this.log(`连续 ${Math.round(stagnationMs / 1000)}s 没有新布通网络，提前结束撕毁重布（剩余 ${pendingNets.length - pi} 个网转交网格抢救/兜底）`, 'warn');
+				if (Date.now() - lastNewNetAt > stagMs) {
+					this.log(`连续 ${Math.round(stagMs / 1000)}s 没有新布通网络，提前结束撕毁重布（剩余 ${pendingNets.length - pi} 个网转交网格抢救/兜底）`, 'warn');
 					for (let k = pi; k < pendingNets.length; k++) next.push(pendingNets[k]);
 					break;
 				}
@@ -587,6 +591,45 @@ export class PlanningEngine {
 					break;
 				}
 				const ends = [net.pads[0], net.pads[net.pads.length - 1]];
+				// ── 撕毁对象选择 ──
+				// ① 首选「独走最优路径」挡路者：本网忽略其它网走线时的最短路
+				//    （soloRoute 只避静态障碍+焊盘）上压着的已布/残段网，才是
+				//    真正的最小阻挡集 —— 扇出/封口评分都在猜，这里直接看路。
+				//    按重布代价升序（焊盘少的好重排）取前 K。
+				// ② 没有独走路径（几何被焊盘挡死）才退回评分制（封口+2/扇出+3/
+				//    走廊+1）—— 那时挡路者不在独走路径上，只能按邻近度猜。
+				// 单网实测 case12 全部 40 个失败网 <3s 可解（solo-scan），差的全
+				// 是占用 —— 撕对对象比多撕更重要。
+				let rip: string[] = [];
+				if ((globalThis as any).__RB_SOLO_RIP__ && net.pads.length <= 6) {
+					const solo = await this.soloRoute(net);
+					if (solo && solo.prims.length) {
+						const hits = new Map<string, number>();
+						for (const p of solo.prims) {
+							const layer = (p as RenderedPrim).layer;
+							const pts = this.primPoints([{ ...p, layer } as unknown as RenderedPrim], 6);
+							for (const o of this.dynamicObstacles) {
+								if (o.soft || !o.net || o.net === net.name) continue;
+								const g = o.group ?? '';
+								if (!g.startsWith('trk:') && !g.startsWith('via:')) continue;
+								if (!this.netRendered.has(o.net)) continue;
+								if (o.layer !== undefined && layer !== undefined && o.layer !== layer) continue;
+								for (const pt of pts) {
+									if (Math.hypot(o.x - pt.x, o.y - pt.y) < o.r) {
+										hits.set(o.net, (hits.get(o.net) ?? 0) + 1);
+										break;
+									}
+								}
+							}
+						}
+						rip = [...hits.entries()]
+							.map(([n, h]) => ({ n, h, pads: networks.find(x => x.name === n)?.pads.length ?? 99 }))
+							.sort((a, b) => (a.pads - b.pads) || (b.h - a.h) || (a.n < b.n ? -1 : 1))
+							.slice(0, Number((globalThis as any).__RB_RIP_TOP__) || 3)
+							.map(e => e.n);
+					}
+				}
+				if (!rip.length) {
 				// 挡路网评分制（旧逻辑取「最近布的 3 个端点封口网」纯属运气）：
 				//   端点封口 +2 / 焊盘排扇出带 +3 / MST 走廊 +1，取最高分前 3。
 				// 只统计「可移动」障碍（trk:/via:）——焊盘是静态的，撕了网它家的
@@ -622,9 +665,11 @@ export class PlanningEngine {
 					}
 					if (w > 0) score.set(o.net, w);
 				}
-				const rip = [...score.entries()].sort((a, b) => b[1] - a[1] || (a[0] < b[0] ? -1 : 1))
+				const scored = [...score.entries()].sort((a, b) => b[1] - a[1] || (a[0] < b[0] ? -1 : 1))
 					.slice(0, Number((globalThis as any).__RB_RIP_TOP__) || 3)
 					.map(([n]) => n);
+				rip = scored;
+				}
 				if (!rip.length) {
 					// 快扫遗留：未被封口的网补一次完整链尝试（快扫只试直连，
 					// 这些网还没享受过边界候选退避/换层链）；仍失败才顺延
@@ -639,6 +684,15 @@ export class PlanningEngine {
 					}
 					next.push(net);
 					continue;
+				}
+				// 借道优先：只拆挡路网走廊上的一段、断口原地重连。比整网撕毁
+				// 便宜一个量级（整网重排经常无处可去 → 整场回滚）；失败再整撕。
+				if ((globalThis as any).__RB_BYPASS__ && Date.now() < mainDeadline - 10_000) {
+					let bypassed = false;
+					for (const b of rip.slice(0, 4)) {
+						if (await this.tryBypassReroute(net, b, networks)) { bypassed = true; break; }
+					}
+					if (bypassed) continue;
 				}
 				this.log(`第 ${pass + 1} 轮：网络 ${net.name} 撕毁 ${rip.join(', ')} 重试`, 'warn');
 				// 快照被撕网络的原走线：本动作绝不净损失已布网络——
@@ -1195,6 +1249,21 @@ export class PlanningEngine {
 		const rowCount = mode === 'auto' || mode === 'river'
 			? this.prioritizeRowInteriorPads(keyed)
 			: 0;
+
+		// __RB_ROW_FIRST__=1：密排焊盘排（连接器/IC 引脚排，间距 ≤47mil）的网络
+		// 提到本层最前 —— 对齐内置布线器的 escape-first：整排先垂直出线占住
+		// 车道，后布网从旁边绕，而不是先布网横穿扇出带、让排网全程靠撕毁救。
+		// 稳定排序只动信号层（0/1）内部顺序，电源/地的层级约束不变。
+		if ((globalThis as any).__RB_ROW_FIRST__ && (mode === 'auto' || mode === 'river')) {
+			const isRowNet = (k: (typeof keyed)[number]): boolean => {
+				if (k.tier >= 2) return false;
+				return k.net.pads.some(p => {
+					const r = this.rowInfo.get(p.id);
+					return !!r && r.gap <= 47;
+				});
+			};
+			keyed.sort((a, b) => (a.tier - b.tier) || ((isRowNet(b) ? 0 : 1) - (isRowNet(a) ? 0 : 1)));
+		}
 
 		if (mode === 'auto') {
 			const count = (t: number) => keyed.filter(k => k.tier === t).length;
@@ -3011,6 +3080,189 @@ export class PlanningEngine {
 			});
 		this.log(`网络 ${netName}: ${src.id}→${dst.id} 由网格兜底布通（${prims.length} 段${vias.length ? `，${vias.length} 过孔` : ''}）`, 'info');
 		return { prims, vias };
+	}
+
+	/**
+	 * 「借道」重排：挡路网只拆**本网独走路径上的那一段**，本网走过去后把
+	 * 挡路网的断口在原地重新接上。
+	 *
+	 * 整网重排在密板上经常无处可去（长网要整体搬家，搬不动 → 整场回滚，
+	 * 这是占满局部最小值的典型形态）；而断口重连只是「两个切口之间的局部
+	 * 布线」，成功率高一个量级。安全约束与其它拆网动作一致：挡路网拆段后
+	 * 接不回就整体回滚，绝不净损失已布铜皮；重连段过提交互检（含焊盘）。
+	 */
+	private async tryBypassReroute(
+		net: { name: string; pads: EnginePad[] },
+		blockerName: string,
+		networks: Array<{ name: string; pads: EnginePad[] }>,
+	): Promise<boolean> {
+		const __bd = !!(globalThis as any).__RB_BYPASS_DEBUG__;
+		const giveup = (why: string): boolean => {
+			if (__bd) this.log(`[bypass] ${net.name}←${blockerName} 放弃: ${why}`, 'info');
+			return false;
+		};
+		if (this.checkCancelled() || Date.now() > this.planDeadline) return giveup('截止');
+		const blocker = networks.find(n => n.name === blockerName);
+		if (!blocker || blocker.pads.length > 12) return giveup(`无网/焊盘多 ${blocker?.pads.length ?? '?'}`);
+		const prims = this.netRendered.get(blockerName) ?? [];
+		if (!prims.length) return giveup('挡路网无铜皮');
+
+		// 本网独走路径（只避静态障碍+焊盘，不考虑其它网走线）
+		const solo = await this.soloRoute(net);
+		if (!solo || !solo.prims.length) return giveup('无独走路径');
+		const soloPts = this.primPoints(solo.prims as unknown as RenderedPrim[], 5);
+		const sep = this.drc.traceWidthMil + this.drc.trackToTrackMil;   // 平行走线中心线最小距
+
+		// 挡路网压在独走路径上的图元。只借直线段：弧的切线衔接、跨层的
+		// 过孔段（重连要换层）都留给整网撕毁处理。
+		const blocked = prims.filter(p => {
+			if (p.kind === 'arc') return false;
+			const pts = this.primPoints([p], 4);
+			for (const pt of pts) {
+				for (const sp of soloPts) {
+					if (Math.hypot(pt.x - sp.x, pt.y - sp.y) < sep) return true;
+				}
+			}
+			return false;
+		});
+		if (!blocked.length) return giveup('挡路网不在独走路径上');
+		const layers = new Set(blocked.map(p => p.layer));
+		if (layers.size !== 1) {
+			if ((globalThis as any).__RB_BYPASS_DEBUG__) this.log(`[bypass] ${net.name}←${blockerName} 跨层段 ${layers.size} 层，放弃`, 'info');
+			return false;
+		}
+		const layer = [...layers][0];
+
+		// 快照：挡路网全量 + 本网（可能带残段）
+		const savedBlocker = {
+			prims: [...prims],
+			vias: this.plannedVias.filter(v => v.net === blockerName),
+			doneEdges: new Set(this.routedEdges.get(blockerName) ?? []),
+			order: this.routedOrder.includes(blockerName),
+		};
+		const savedSelf = {
+			prims: [...(this.netRendered.get(net.name) ?? [])],
+			vias: this.plannedVias.filter(v => v.net === net.name),
+			doneEdges: new Set(this.routedEdges.get(net.name) ?? []),
+		};
+		const savedOrder = [...this.routedOrder];
+
+		// 拆挡路网的走线障碍（过孔障碍保留——过孔不拆），重登保留段
+		const blockedSet = new Set(blocked);
+		const kept = prims.filter(p => !blockedSet.has(p));
+		this.dynamicObstacles = this.dynamicObstacles.filter(o => !(o.net === blockerName && o.group?.startsWith('trk:')));
+		if (kept.length) this.addRenderedToObstacles(mergePrims(kept));
+		this.netRendered.set(blockerName, kept);
+
+		// 本网在腾空的走廊上布线（残段续补，部分连通也算进展）
+		const ok = await this.routeNetEdges(net, 'full', this.netSoft(this.planDeadline));
+
+		// 切口 = 被拆段中与保留段相接、落在焊盘中心、或落在自身过孔上的端点
+		//（过孔不动，是合法重连锚点；切口 1 的形态 = 段一端在过孔上）。
+		// 切口按最近邻配对逐对重连；奇数个说明拆段边界有歧义，退回整网撕毁。
+		const padKeys = new Set(blocker.pads.map(p => `${p.x.toFixed(1)},${p.y.toFixed(1)}`));
+		const viaKeys = new Set(this.plannedVias.filter(v => v.net === blockerName).map(v => `${v.x.toFixed(1)},${v.y.toFixed(1)}`));
+		const sharedWithKept = (px: number, py: number): boolean => {
+			for (const q of kept) {
+				if (Math.hypot((q.x1 ?? 0) - px, (q.y1 ?? 0) - py) < 0.6) return true;
+				if (Math.hypot((q.x2 ?? 0) - px, (q.y2 ?? 0) - py) < 0.6) return true;
+			}
+			return false;
+		};
+		const freeEnds: Array<{ x: number; y: number }> = [];
+		const seenEnd = new Set<string>();
+		for (const p of blocked) {
+			for (const [ex, ey] of [[p.x1 ?? 0, p.y1 ?? 0], [p.x2 ?? 0, p.y2 ?? 0]] as const) {
+				const key = `${ex.toFixed(1)},${ey.toFixed(1)}`;
+				if (seenEnd.has(key)) continue;
+				seenEnd.add(key);
+				// 连续拆段的端点：与保留链相接、或落在焊盘/自身过孔上，
+				// 都是合法重连锚点（U 形拆段的两端接在保留臂上 —— 同样是切口）
+				if (sharedWithKept(ex, ey) || padKeys.has(key) || viaKeys.has(key)) freeEnds.push({ x: ex, y: ey });
+			}
+		}
+		let repaired = false;
+		let reconnect: RenderedPrim[] = [];
+		if (freeEnds.length >= 2 && freeEnds.length % 2 === 0 && freeEnds.length <= 6) {
+			// 最近邻配对（同一连续拆段的两端互相配回）
+			const pts = [...freeEnds];
+			const pairs: Array<[{ x: number; y: number }, { x: number; y: number }]> = [];
+			while (pts.length) {
+				const a = pts.shift()!;
+				let bi = 0, bd2 = Infinity;
+				for (let i = 0; i < pts.length; i++) {
+					const d = Math.hypot(pts[i].x - a.x, pts[i].y - a.y);
+					if (d < bd2) { bd2 = d; bi = i; }
+				}
+				pairs.push([a, pts.splice(bi, 1)[0]]);
+			}
+			const obs = this.layerObstacles(blockerName, layer, true);
+			let allOk = true;
+			for (const [A, B] of pairs) {
+				const r = await routeConnection(
+					{ x: A.x, y: A.y }, { x: B.x, y: B.y },
+					obs, blockerName, [150, 500], 2500,
+					() => this.checkCancelled(),
+				);
+				if (!r.ok || !r.prims.length) {
+					allOk = false;
+					if (__bd) this.log(`[bypass] ${net.name}←${blockerName} 切口(${A.x.toFixed(0)},${A.y.toFixed(0)})→(${B.x.toFixed(0)},${B.y.toFixed(0)}) L${layer} 重连失败`, 'info');
+					break;
+				}
+				reconnect.push(...r.prims.map(pr => pr.kind === 'line'
+					? { kind: 'line' as const, net: blockerName, layer, x1: pr.x1, y1: pr.y1, x2: pr.x2, y2: pr.y2 }
+					: { kind: 'arc' as const, net: blockerName, layer, cx: pr.cx, cy: pr.cy, r: pr.r, startAngle: pr.startAngle, sweep: pr.sweep }));
+			}
+			if (allOk && this.primsClearOfDynamic(reconnect, blockerName)) repaired = true;
+			else if (allOk && __bd) this.log(`[bypass] ${net.name}←${blockerName} 重连段未过互检（${reconnect.length} 段）`, 'info');
+		} else if (__bd) {
+			this.log(`[bypass] ${net.name}←${blockerName} 切口数 ${freeEnds.length}（blocked=${blocked.length}）`, 'info');
+		}
+
+		if (ok && repaired) {
+			const merged = this.smoothCorners(mergePrims([...kept, ...reconnect]), blockerName);
+			this.netRendered.set(blockerName, merged);
+			this.addRenderedToObstacles(merged);
+			this.markAllEdgesDone(blocker);
+			if (!savedBlocker.order && !this.routedOrder.includes(blockerName)) this.routedOrder.push(blockerName);
+			if (!this.netIsConnected(blockerName, merged, this.plannedVias.filter(v => v.net === blockerName))) {
+				// 防御：重连理应闭合，断开说明构造有洞 —— 按失败回滚
+				repaired = false;
+			}
+		}
+		if (ok && repaired) {
+			this.log(`借道：${net.name} 从 ${blockerName} 的走廊通过，断口已重连`, 'success');
+			this.callbacks.onNetUpdate?.(blockerName, mergePrims(this.netRendered.get(blockerName) ?? []), this.plannedVias.filter(v => v.net === blockerName), true, this.padProgress(blocker));
+			return true;
+		}
+
+		// 回滚：本网新图元撤掉、挡路网整网恢复
+		this.ripupNetInternal(net.name, true);
+		if (savedSelf.prims.length) {
+			this.netRendered.set(net.name, [...savedSelf.prims]);
+			this.addRenderedToObstacles(mergePrims(savedSelf.prims));
+		}
+		this.routedEdges.set(net.name, new Set(savedSelf.doneEdges));
+		this.plannedVias = this.plannedVias.filter(v => v.net !== net.name).concat(savedSelf.vias);
+		this.ripupNetInternal(blockerName, true);
+		if (savedBlocker.prims.length) {
+			this.netRendered.set(blockerName, [...savedBlocker.prims]);
+			this.addRenderedToObstacles(mergePrims(savedBlocker.prims));
+		}
+		this.routedEdges.set(blockerName, new Set(savedBlocker.doneEdges));
+		this.plannedVias = this.plannedVias.filter(v => v.net !== blockerName).concat(savedBlocker.vias);
+		for (const v of this.plannedVias) {
+			if (v.net !== blockerName) continue;
+			this.dynamicObstacles.push({
+				id: `via${this.obstacleIdCounter++}`, kind: 'circle', x: v.x, y: v.y,
+				r: v.dia / 2 + Math.max(this.drc.trackToTrackMil, this.drc.trackToPadMil) + this.drc.traceWidthMil / 2 + VIA_WALL_EXTRA,
+				net: v.net, layer: undefined, group: `via:${v.net}:${v.x},${v.y}`, noPrune: true,
+			});
+		}
+		this.routedOrder = savedOrder;
+		this.callbacks.onNetUpdate?.(blockerName, mergePrims(savedBlocker.prims), savedBlocker.vias, savedBlocker.prims.length > 0, this.padProgress(blocker));
+		this.callbacks.onNetUpdate?.(net.name, mergePrims(savedSelf.prims), savedSelf.vias, savedSelf.prims.length > 0, this.padProgress(net));
+		return false;
 	}
 
 	/**

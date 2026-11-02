@@ -1,6 +1,6 @@
 {
   "name": "rubberband-autorouter",
-  "version": "0.0.121",
+  "version": "0.0.122",
   "description": "基于拓扑橡皮筋算法的PCB自动布线工具，使用本地JavaScript算法完成布线",
   "main": "dist/index.js",
   "scripts": {
