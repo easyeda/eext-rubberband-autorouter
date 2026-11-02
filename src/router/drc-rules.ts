@@ -20,6 +20,10 @@ export interface DRCRules {
 	trackToPadMil: number;
 	/** Track↔Fill/Zone 间距 */
 	trackToFillMil: number;
+	/** Hole↔Hole 钻孔边距（Other Spacing/otherClearance.hole2Hole，
+	 * JLC 标准 0.3mm≈11.8mil）。过孔-过孔/过孔-焊盘孔的孔壁最小间距，
+	 * EDA 的 Hole to Hole DRC 按此判定（同网过孔对也查！）。 */
+	holeToHoleMil: number;
 }
 
 // DRC 回退默认值
@@ -34,6 +38,7 @@ export const FALLBACK_DRC_RULES: DRCRules = {
 	trackToBoardMil: 12,
 	trackToPadMil: FALLBACK_CLEARANCE_MIL,
 	trackToFillMil: FALLBACK_CLEARANCE_MIL,
+	holeToHoleMil: 12,   // JLC 标准钻孔边距 0.3mm ≈ 11.8mil，取整 12
 };
 
 export type DRCLog = (message: string, level: string) => void;
@@ -108,6 +113,19 @@ export async function fetchDRCRules(onLog?: DRCLog): Promise<DRCRules> {
 			trackUnit = trackRules[defaultKey]?.unit;
 		}
 
+		// 读取 Hole↔Hole 钻孔边距（Other Spacing/otherClearance.form.hole2Hole，
+		// 单位 mm；JLC 默认 0.29972mm≈11.8mil）。EDA 的 Hole to Hole DRC 按
+		// 「孔壁到孔壁」判定，同网过孔对同样检查（case12 E2E 实测同网双过孔
+		// d=0/11.02mil 违规 3 处）。
+		let holeToHoleMm = 0.3;
+		{
+			const other = cfg?.Spacing?.['Other Spacing'];
+			const ocKey = other ? (Object.keys(other).find(k => other[k]?.isSetDefault) ?? Object.keys(other)[0]) : undefined;
+			const oc = ocKey ? other[ocKey] : undefined;
+			const v = oc?.form?.hole2Hole;
+			if (typeof v === 'number' && v > 0) holeToHoleMm = v;
+		}
+
 		const rules: DRCRules = {
 			traceWidthMil: ruleValueToMil(traceWidthMm, trackUnit),
 			clearanceMil: Math.max(
@@ -119,6 +137,7 @@ export async function fetchDRCRules(onLog?: DRCLog): Promise<DRCRules> {
 			trackToBoardMil: ruleValueToMil(trackToBoardMm, spacingUnit),
 			trackToPadMil: ruleValueToMil(trackToPadMm, spacingUnit),
 			trackToFillMil: ruleValueToMil(trackToFillMm, spacingUnit),
+			holeToHoleMil: ruleValueToMil(holeToHoleMm, 'mm'),
 		};
 
 		onLog?.(

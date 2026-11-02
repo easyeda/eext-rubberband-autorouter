@@ -391,6 +391,36 @@ function normalizeEllipseUnits(shape: any[]): any[] {
 }
 
 /**
+ * SLOT 孔焊盘的保守铜皮覆盖（按孔轴对齐的半 extent）。
+ *
+ * case12 USB 外壳焊盘实测：pad ["OVAL",2.2,39.4] + hole ["SLOT",19.685,51.181]
+ * + rotation 90。常规解读（OVAL 尺寸=全 extent、按 pad rotation 旋转）把铜皮画成
+ * 2.2×39.4mil 的细条且转到 x 轴上——但 D+ 底层走线距盘心 38.65mil 处被 EDA 判
+ * d=0 触碰：真实铜皮沿孔长轴（holeRotation=0 → 全局 y）延伸 ±39.4mil，即该记录
+ * 的 OVAL 第二维是**半长**。编码无文档可依，这里按孔轴做保守覆盖：
+ *   半extent = max(pad 维（OVAL 按半extent、其它按全extent折半）, 孔半extent + 2.2mil 环宽)
+ * 宁可多盖：外壳盘附近少布一根线，好过 TH Pad to Track d=0（过盖范围受邻盘
+ * 间距天然限制，实测不与相邻 0.5mm 排焊盘冲突）。非 SLOT 孔返回 null（维持原逻辑）。
+ */
+export function slotCoverHalfExtents(pad: { pad: any[]; hole?: any[] | null; holeRotation?: number }): { hx: number; hy: number; rotDeg: number } | null {
+	const hole = pad.hole;
+	if (!Array.isArray(hole) || String(hole[0] ?? '').toUpperCase() !== 'SLOT') return null;
+	const hw = Number(hole[1]) || 0, hh = Number(hole[2]) || 0;
+	if (!(hw > 0) || !(hh > 0)) return null;
+	const shape = Array.isArray(pad.pad) ? pad.pad : [];
+	const name = String(shape[0] ?? '').toUpperCase();
+	const d1 = Number(shape[1]) || 0, d2 = Number(shape[2]) || 0;
+	const p1 = name === 'OVAL' ? d1 : d1 / 2;
+	const p2 = name === 'OVAL' ? d2 : d2 / 2;
+	const RING = 2.2;
+	return {
+		hx: Math.max(p1, hw / 2 + RING),
+		hy: Math.max(p2, hh / 2 + RING),
+		rotDeg: Number(pad.holeRotation) || 0,
+	};
+}
+
+/**
  * 焊盘物理轮廓 → 圆群（未膨胀），unit: mil。
  *
  * 长焊盘（OVAL/RECT 胶囊）用「两端帽圆 + 密集侧向填充圆」表示：
@@ -400,7 +430,7 @@ function normalizeEllipseUnits(shape: any[]): any[] {
  * 所有圆都按 rotation 旋转（EDA 角度约定：逆时针为正）。
  */
 export function padShapeToCircles(
-	pad: { pad: any[]; hole?: any[] | null; rotation?: number },
+	pad: { pad: any[]; hole?: any[] | null; rotation?: number; holeRotation?: number },
 ): Array<{ x: number; y: number; r: number; blockerOnly?: boolean }> {
 	const rawShape = Array.isArray(pad.pad) ? pad.pad : [];
 	// POLYGON（绝对坐标顶点）先归一化成 RECT：顶点已含旋转，pad.rotation 不再叠加
@@ -433,6 +463,22 @@ export function padShapeToCircles(
 	// 通孔焊盘的铜皮外形仍按 pad 形状建模：孔只影响钻孔，不应缩小铜皮障碍。
 	// （旧逻辑把带孔焊盘一律当圆，RECT 角部会漏出 ~1mil，造成贴边 DRC）
 	const hole = pad.hole;
+	// SLOT 孔焊盘：按孔轴对齐的保守覆盖（编码歧义，见 slotCoverHalfExtents 注释）
+	const slot = slotCoverHalfExtents(pad);
+	if (slot) {
+		const out = capsuleOutline(slot.hx * 2, slot.hy * 2);
+		const srot = (slot.rotDeg * Math.PI) / 180;
+		const cs = Math.cos(srot), sn = Math.sin(srot);
+		return out.map(c => {
+			const o: { x: number; y: number; r: number; blockerOnly?: boolean } = {
+				x: c.x * cs - c.y * sn,
+				y: c.x * sn + c.y * cs,
+				r: c.r,
+			};
+			if (c.blockerOnly) o.blockerOnly = true;
+			return o;
+		});
+	}
 	// !(w > 0) 同时拦住 0 / NaN（NaN 与任何比较均为 false，=== 0 拦不住）
 	if (!(w > 0) || !(h > 0)) {
 		const r = Array.isArray(hole) && hole.length >= 2 ? Math.max(0, hole[1] ?? 0) / 2 : 0;
@@ -487,10 +533,21 @@ export function padShapeToCircles(
  * 45° 方向会少走出去 ~30%，过孔铜环仍会压进焊盘。
  */
 export function padShapeDistance(
-	pad: { pad: any[]; hole?: any[] | null; rotation?: number },
+	pad: { pad: any[]; hole?: any[] | null; rotation?: number; holeRotation?: number },
 	dx: number, dy: number,
 ): number {
 	const rawShape = Array.isArray(pad.pad) ? pad.pad : [];
+	// SLOT 孔焊盘：与 padShapeToCircles 同一保守覆盖（矩形距离，角部略偏严=安全方向）
+	const slot = slotCoverHalfExtents(pad);
+	if (slot) {
+		const srot = (slot.rotDeg * Math.PI) / 180;
+		const cs = Math.cos(srot), sn = Math.sin(srot);
+		const lx = dx * cs + dy * sn;
+		const ly = -dx * sn + dy * cs;
+		const qx = Math.abs(lx) - slot.hx, qy = Math.abs(ly) - slot.hy;
+		if (qx <= 0 && qy <= 0) return Math.max(qx, qy);
+		return Math.hypot(Math.max(qx, 0), Math.max(qy, 0));
+	}
 	// POLYGON（绝对坐标顶点）先归一化成 RECT：顶点已含旋转，pad.rotation 不再叠加
 	// ELLIPSE 先做单位归一化（第一维毫米陷阱）
 	let shape = normalizeEllipseUnits(rawShape);

@@ -615,6 +615,7 @@ export class TopologicalRouter {
 							pad: p.pad,
 							hole: Array.isArray(p.hole) ? p.hole : null,
 							rotation: p.rotation ?? 0,
+							holeRotation: p.holeRotation ?? 0,
 						});
 					}
 				}

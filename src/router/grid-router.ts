@@ -57,6 +57,11 @@ export interface GridRouteRequest {
 	viaExtraPadMil?: number;
 	/** 是否允许过孔落在焊盘上（默认 false：同网焊盘也要挡层间跳变） */
 	viaInPad?: boolean;
+	/** 协商拥挤：可穿越但计罚分的障碍（异网已布铜皮）。不进占据图，
+	 * 按网累加到罚分图；A* 求「穿越代价最小」的路径，调用方据此决定撕谁。 */
+	penaltyObstacles?: RBObstacle[];
+	/** 每网单格罚分（mil 当量），缺省 60 */
+	penaltyOf?: (net: string) => number;
 	budgetMs?: number;
 	isCancelled?: () => boolean;
 }
@@ -77,6 +82,8 @@ export interface GridRouteResult {
 	cell: number;
 	/** 失败原因（调试） */
 	debug?: string;
+	/** 最终路径穿越的罚分障碍所属网络（协商拥挤：调用方撕掉它们才能提交） */
+	crossed?: string[];
 }
 
 interface Cell {
@@ -257,6 +264,62 @@ export async function gridRoute(req: GridRouteRequest): Promise<GridRouteResult>
 			}
 		}
 		if (++marked > 20000) break;   // 障碍过多保护：兜底求解不值得无限光栅化
+	}
+
+	// ── 罚分图（协商拥挤）──
+	// 异网已布铜皮不进占据图，按「每网每格计一次」累加罚分：A* 可以穿过，
+	// 但要付代价 —— 求的是「撕掉谁最便宜」，而不是「能不能过」。
+	const penObs = req.penaltyObstacles ?? [];
+	const penalty = penObs.length ? new Float32Array(total) : null;
+	if (penalty) {
+		const stamp = new Int32Array(total);   // 同网多圆重叠只计一次
+		const netIds = new Map<string, number>();
+		const penOf = req.penaltyOf ?? (() => 60);
+		const markPen = (lx: number, ly: number, r: number, li: number, id: number, val: number): void => {
+			const rr = r + inflate;
+			const i0 = Math.max(0, Math.floor((lx - rr - x0) / cell));
+			const i1 = Math.min(nx - 1, Math.ceil((lx + rr - x0) / cell));
+			const j0 = Math.max(0, Math.floor((ly - rr - y0) / cell));
+			const j1 = Math.min(ny - 1, Math.ceil((ly + rr - y0) / cell));
+			if (i0 > i1 || j0 > j1) return;
+			const base = li * stride;
+			const rr2 = rr * rr;
+			for (let i = i0; i <= i1; i++) {
+				const dx = x0 + i * cell - lx, dx2 = dx * dx;
+				for (let j = j0; j <= j1; j++) {
+					const dy = y0 + j * cell - ly;
+					if (dx2 + dy * dy > rr2) continue;
+					const k = base + j * nx + i;
+					if (stamp[k] === id) continue;
+					stamp[k] = id;
+					penalty[k] += val;
+				}
+			}
+		};
+		for (const o of penObs) {
+			if (o.soft || !o.net || o.net === req.net) continue;
+			let id = netIds.get(o.net);
+			if (id === undefined) { id = netIds.size + 1; netIds.set(o.net, id); }
+			const val = penOf(o.net);
+			const lis: number[] = [];
+			if (o.layer === undefined) lis.push(...req.layers.map((_, i) => i));
+			else {
+				const li = layerIndex.get(o.layer);
+				if (li !== undefined) lis.push(li);
+			}
+			for (const li of lis) {
+				if (o.kind === 'circle') {
+					markPen(o.x, o.y, o.r, li, id, val);
+				} else {
+					const len = Math.hypot(o.x2! - o.x, o.y2! - o.y);
+					const steps = Math.max(1, Math.ceil(len / (cell * 0.75)));
+					for (let s = 0; s <= steps; s++) {
+						const t = s / steps;
+						markPen(o.x + (o.x2! - o.x) * t, o.y + (o.y2! - o.y) * t, o.r, li, id, val);
+					}
+				}
+			}
+		}
 	}
 
 	// ── 端点松绑：起点/终点焊盘自身铜皮内一律视为可通行 ──
@@ -442,7 +505,7 @@ export async function gridRoute(req: GridRouteRequest): Promise<GridRouteResult>
 			if (dx !== 0 && dy !== 0) {
 				if (blocked[idxOf(i + dx, j, li)] || blocked[idxOf(i, j + dy, li)]) continue;
 			}
-			const ng = g + w * cell;
+			const ng = g + w * cell + (penalty ? penalty[nid] : 0);
 			if (ng < gScore[nid] - 1e-9) {
 				gScore[nid] = ng;
 				cameFrom[nid] = cur;
@@ -457,7 +520,7 @@ export async function gridRoute(req: GridRouteRequest): Promise<GridRouteResult>
 			if (blocked[nid] || closed[nid]) continue;
 			// 过孔比走线粗：两侧层都必须在「过孔净距」网格上为空
 			if (viaBlocked && (viaBlocked[nid] || viaBlocked[here])) continue;
-			const ng = g + viaCost;
+			const ng = g + viaCost + (penalty ? penalty[nid] : 0);
 			if (ng < gScore[nid] - 1e-9) {
 				gScore[nid] = ng;
 				cameFrom[nid] = here;
@@ -635,7 +698,31 @@ export async function gridRoute(req: GridRouteRequest): Promise<GridRouteResult>
 		prims.push({ kind: 'line', layer: pulled[pulled.length - 1]?.layer ?? req.layers[0], x1: goalStub.x, y1: goalStub.y, x2: dst.x, y2: dst.y });
 	}
 
-	return { ok: prims.length > 0, prims, vias, cell };
+	// 协商拥挤：按**最终图元**统计穿越的罚分网（端点修剪/拉直后才是要提交的路径）
+	let crossed: string[] | undefined;
+	if (penObs.length) {
+		const cs = new Set<string>();
+		for (const p of prims) {
+			if (p.kind !== 'line') continue;
+			const ax = p.x1!, ay = p.y1!, bx = p.x2!, by = p.y2!;
+			const minx = Math.min(ax, bx), maxx = Math.max(ax, bx);
+			const miny = Math.min(ay, by), maxy = Math.max(ay, by);
+			for (const o of penObs) {
+				if (o.soft || !o.net || o.net === req.net || cs.has(o.net)) continue;
+				if (o.layer !== undefined && o.layer !== p.layer) continue;
+				if (o.x + o.r < minx || o.x - o.r > maxx || o.y + o.r < miny || o.y - o.r > maxy) continue;
+				if (o.kind === 'circle' && pointSegDist(o.x, o.y, ax, ay, bx, by) < o.r) cs.add(o.net);
+			}
+		}
+		for (const v of vias) {
+			for (const o of penObs) {
+				if (o.soft || !o.net || o.net === req.net || cs.has(o.net)) continue;
+				if (o.kind === 'circle' && Math.hypot(o.x - v.x, o.y - v.y) < o.r + viaExtra) cs.add(o.net);
+			}
+		}
+		crossed = [...cs];
+	}
+	return { ok: prims.length > 0, prims, vias, cell, crossed };
 }
 
 /**
