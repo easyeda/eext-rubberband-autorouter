@@ -3651,11 +3651,10 @@ export class PlanningEngine {
 		const penaltyOf = (n: string): number => {
 			const routed = this.routedOrder.includes(n);
 			// 已布通网拆了要重布（代价随焊盘数涨）；残段网本来就是失败网，便宜
+			//（h² 平方放大在 PF 里证伪：墙网走廊几何强制，梯度无效 —— 这里
+			// 保持线性，回归验证过的 v0.0.125 形状）
 			const base = routed ? 70 + 12 * (padCount.get(n) ?? 4) : 25;
-			// 历史平方放大（真实 PathFinder 的 h² 项）：线性 hist 的梯度不足以
-			// 在容量受限区逼出「每网独占车道」的分配 —— 12 轮零转正的教训
-			const h = hist.get(n) ?? 0;
-			return base * (1 + h) * (1 + h * 0.5);
+			return base * (1 + (hist.get(n) ?? 0));
 		};
 		const layers = this.hasBottomLayer ? [1, 2] : [1];
 		const gridCell = Number((globalThis as any).__RB_GRID_CELL__) || 4;
