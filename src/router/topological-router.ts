@@ -201,9 +201,20 @@ export class TopologicalRouter {
 		const allPads: EnginePad[] = [];
 
 		for (const netName of allNets) {
-			try {
-				const primitives = await eda.pcb_Net.getAllPrimitivesByNet(netName);
-				if (!primitives || primitives.length === 0) continue;
+			// 瞬时失败重试一次：getAllPrimitivesByNet 在文档忙时可能返回空/抛错，
+			// 静默 continue 会让整个网的焊盘对路由器隐形 —— 走线/过孔直接压上
+			// 去（case12 E2E 实测 D- 底层线压 GND 通孔焊盘 USB2_14，minDistance=0，
+			// 离线永不复现 = 只有 E2E 实时采集才会踩中）。
+			let primitives: any[] | null = null;
+			for (let attempt = 0; attempt < 2; attempt++) {
+				try { primitives = await eda.pcb_Net.getAllPrimitivesByNet(netName); } catch { primitives = null; }
+				if (primitives && primitives.length) break;
+				if (attempt === 0) await new Promise(r => setTimeout(r, 120));
+			}
+			if (!primitives || primitives.length === 0) {
+				this.onLog?.(`网络 ${netName} 焊盘枚举为空（API 瞬时失败？重试后仍空）——该网焊盘对本轮隐形`, 'warn');
+				continue;
+			}
 
 				const netPads: EnginePad[] = [];
 				for (const prim of primitives) {
@@ -275,9 +286,6 @@ export class TopologicalRouter {
 				}
 
 				if (netPads.length >= 1) padMap.set(netName, netPads);
-			} catch (err) {
-				console.warn(`[TopologicalRouter] 获取网络 ${netName} 失败:`, err);
-			}
 		}
 
 		// 无网络焊盘（NC 脚、安装孔、屏蔽框脚、半孔工艺脚……）不是可布线对象，

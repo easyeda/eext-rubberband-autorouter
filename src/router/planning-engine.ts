@@ -587,15 +587,44 @@ export class PlanningEngine {
 					break;
 				}
 				const ends = [net.pads[0], net.pads[net.pads.length - 1]];
-				const seals = new Set<string>();
-				for (const o of this.dynamicObstacles) {
-					if (o.soft) continue;
-					if (o.net && o.net !== net.name &&
-						ends.some(e => Math.hypot(o.x - e.x, o.y - e.y) < o.r + 70)) {
-						seals.add(o.net);
-					}
+				// 挡路网评分制（旧逻辑取「最近布的 3 个端点封口网」纯属运气）：
+				//   端点封口 +2 / 焊盘排扇出带 +3 / MST 走廊 +1，取最高分前 3。
+				// 只统计「可移动」障碍（trk:/via:）——焊盘是静态的，撕了网它家的
+				// 焊盘还在，白撕一场。部分走线网（未布通但有残段）同样参选：
+				// case12 实测 SD_CLK 的扇出带被邻排 SD_CMD/SD_DATA0 的部分走线
+				// 占 24%、DVP_D3_1 被 AUDIO_I2S_MCLK 100% 横穿 —— 全是残段阻挡。
+				const corridor = this.drc.trackToTrackMil + this.drc.traceWidthMil + 20;
+				const fanHw = this.drc.traceWidthMil / 2;
+				const fans: Array<{ ax: number; ay: number; bx: number; by: number }> = [];
+				for (const e of ends) {
+					const row = this.rowInfo.get(e.id);
+					if (!row) continue;
+					const L = row.gap * 1.5 + 40 + (e.bodyRadius || e.radius);
+					const nx = -row.dy, ny = row.dx;
+					fans.push({ ax: e.x, ay: e.y, bx: e.x + nx * L, by: e.y + ny * L });
+					fans.push({ ax: e.x, ay: e.y, bx: e.x - nx * L, by: e.y - ny * L });
 				}
-				const rip = this.routedOrder.filter(n => seals.has(n)).slice(-3);
+				const mst = this.computeMST(net.pads);
+				const score = new Map<string, number>();
+				for (const o of this.dynamicObstacles) {
+					if (o.soft || !o.net || o.net === net.name) continue;
+					const g = o.group ?? '';
+					if (!g.startsWith('trk:') && !g.startsWith('via:')) continue;
+					if (!this.netRendered.has(o.net)) continue;   // 已被更早动作清掉的残留
+					let w = 0;
+					if (ends.some(e => Math.hypot(o.x - e.x, o.y - e.y) < o.r + 70)) w += 2;
+					for (const f of fans) {
+						if (pointSegDist(o.x, o.y, f.ax, f.ay, f.bx, f.by) < o.r + fanHw) { w += 3; break; }
+					}
+					for (const [ia, ib] of mst) {
+						const pa = net.pads[ia], pb = net.pads[ib];
+						if (pointSegDist(o.x, o.y, pa.x, pa.y, pb.x, pb.y) < o.r + corridor) { w += 1; break; }
+					}
+					if (w > 0) score.set(o.net, w);
+				}
+				const rip = [...score.entries()].sort((a, b) => b[1] - a[1] || (a[0] < b[0] ? -1 : 1))
+					.slice(0, Number((globalThis as any).__RB_RIP_TOP__) || 3)
+					.map(([n]) => n);
 				if (!rip.length) {
 					// 快扫遗留：未被封口的网补一次完整链尝试（快扫只试直连，
 					// 这些网还没享受过边界候选退避/换层链）；仍失败才顺延
@@ -616,11 +645,14 @@ export class PlanningEngine {
 				// 任一被撕网重布失败即整体回滚到动作前的已知好状态
 				//（被撕网的新走线可能与回滚网冲突，必须一并撤销）。
 				const savedOrder = [...this.routedOrder];
-				const saved = new Map<string, { prims: RenderedPrim[]; vias: PlannedVia[] }>();
+				const saved = new Map<string, { prims: RenderedPrim[]; vias: PlannedVia[]; doneEdges: Set<string> }>();
 				for (const n of rip) {
 					saved.set(n, {
 						prims: [...(this.netRendered.get(n) ?? [])],
 						vias: this.plannedVias.filter(v => v.net === n),
+						// 部分走线网也在撕毁之列：按快照恢复已完成的边集合，
+						// 不能 markAllEdgesDone（会把残段误标成整网布通）
+						doneEdges: new Set(this.routedEdges.get(n) ?? []),
 					});
 				}
 				for (const n of rip) this.ripupNet(n);
@@ -640,7 +672,13 @@ export class PlanningEngine {
 				}
 				if (sealFailed) {
 					// 有被撕网重布失败：两焊盘墙先试底层兜底（失败网的新走线往往已
-					// 封死它原来的顶层通道）；全部救回则接受当前局面，否则整体回滚
+					// 封死它原来的顶层通道）；「完整布通网」全部救回才接受，否则回滚。
+					// 例外：**动作前就是部分走线网**的救不回不触发回滚 —— 它本来
+					// 就是失败网，残段让位给目标网换整组推进，自身转交后续轮次在
+					// 新格局里重试（case12 密排板的关键解锁：SD/DVP 排的邻网残段
+					// 救回率低，一刀切回滚让撕毁动作整场白做）。
+					// F407 的教训不受影响：那里误判的是「完整网被拆成半成品算救回」，
+					// 这里仍然只有 routedOrder 里真正布通（重布或两焊盘兜底）才算。
 					let unrecoverable = false;
 					for (let i = rip.length - 1; i >= 0; i--) {
 						const n = rip[i];
@@ -648,6 +686,8 @@ export class PlanningEngine {
 						//（实测 F407 隔离板四个 3-pad 墙全以 1/2 残留被误判「已救回」而接受，
 						// 布通率 8 → 7）。只有 routedOrder 里真正布通（重布或两焊盘兜底）才算。
 						if (this.routedOrder.includes(n)) continue;
+						// 动作前就是部分走线网：不算「不可恢复」，接受本次推进
+						if (!savedOrder.includes(n)) continue;
 						// 恢复兜底同样受 softMain 约束：超时按「不可恢复」走整体回滚
 						if (Date.now() > softMain) { unrecoverable = true; break; }
 						const wn = networks.find(nn => nn.name === n)!;
@@ -678,8 +718,7 @@ export class PlanningEngine {
 						this.addRenderedToObstacles(mergePrims(sv.prims));
 					}
 					this.plannedVias = this.plannedVias.filter(v => v.net !== n).concat(sv.vias);
-					const nn = networks.find(x => x.name === n);
-					if (nn) this.markAllEdgesDone(nn);
+					this.routedEdges.set(n, new Set(sv.doneEdges));
 					const idx = savedOrder.indexOf(n);
 					if (idx >= 0) this.routedOrder.splice(Math.min(idx, this.routedOrder.length), 0, n);
 				}
@@ -1963,6 +2002,7 @@ export class PlanningEngine {
 			}
 
 			if (!rendered) {
+				if ((globalThis as any).__RB_BLOCKERS__) this.logEdgeBlockers(src, dst, net.name);
 				this.log(`网络 ${net.name}: ${src.id}(${src.x.toFixed(0)},${src.y.toFixed(0)}) → ${dst.id}(${dst.x.toFixed(0)},${dst.y.toFixed(0)}) 未找到路径`, 'warn');
 				continue;   // 其余连接继续布，已布部分不回滚
 			}
@@ -2320,6 +2360,34 @@ export class PlanningEngine {
 					return false;
 				}
 			}
+			// 焊盘/钻孔净距（精确形状）：dynamicObstacles 只含画布铜皮与板框，
+			// padObstacles 按网惰性构建、不在其中 —— 不补这道，任何障碍口径
+			// 有缺口的路径都能把走线压到焊盘上（case12 实测 D- 底层线压
+			// GND 通孔焊盘 USB2_14，minDistance=0）。
+			const nPts = Math.max(1, Math.ceil(segLen / 4));
+			for (let s = 0; s <= nPts; s++) {
+				const t = s / nPts;
+				const px = ax + (bx - ax) * t, py = ay + (by - ay) * t;
+				for (const pd of this.nearPads(px, py)) {
+					if (pd.net === netName) continue;
+					// 层语义：SMD 只挡本层，TH/多层（12）挡两层
+					if (pd.layer !== 12 && pd.layer !== layer) continue;
+					const need = this.drc.trackToPadMil + this.drc.traceWidthMil / 2 + 0.2;
+					if (this.padCopperDistance(pd, px, py) < need) {
+						this.log(`互检违规: ${netName} L${layer}(${ax.toFixed(0)},${ay.toFixed(0)})→(${bx.toFixed(0)},${by.toFixed(0)}) 撞焊盘 ${pd.net}@(${pd.x.toFixed(0)},${pd.y.toFixed(0)})`, 'warn');
+						return false;
+					}
+					const cachedHole = Number(this.padShapes[`${pd.x.toFixed(2)},${pd.y.toFixed(2)}`]?.hole?.[1]) || 0;
+					const holeD = (pd.holeDiameter ?? 0) || cachedHole;
+					if (holeD > 0) {
+						const needH = holeD / 2 + Math.max(this.drc.trackToPadMil, 6) + this.drc.traceWidthMil / 2 + 0.2;
+						if (Math.hypot(pd.x - px, pd.y - py) < needH) {
+							this.log(`互检违规: ${netName} L${layer} 撞钻孔 ${pd.net}@(${pd.x.toFixed(0)},${pd.y.toFixed(0)})`, 'warn');
+							return false;
+						}
+					}
+				}
+			}
 		}
 		return true;
 	}
@@ -2650,6 +2718,23 @@ export class PlanningEngine {
 	 * 做法：用与放置同口径的模型复算「过孔 ↔ 异网走线/过孔」，违规的过孔连同
 	 * 衔接段一起拆除；若该网因此不连通则退回部分布通（宁可少布，不出违规）。
 	 */
+	/**
+	 * 线段平移后的复检：是否仍与所有异网非软障碍保持 o.r 清距。
+	 * 与提交时的建模口径一致（障碍 r 已含对方半宽+间距+0.1 余量）；
+	 * 焊盘障碍的圆近似偏保守，复检误拒只会让微移退回拆除（安全方向）。
+	 */
+	private lineStillClear(x1: number, y1: number, x2: number, y2: number, layer: number | undefined, netName: string): boolean {
+		const minX = Math.min(x1, x2), maxX = Math.max(x1, x2);
+		const minY = Math.min(y1, y2), maxY = Math.max(y1, y2);
+		for (const o of this.dynamicObstacles) {
+			if (o.soft || !o.net || o.net === netName) continue;
+			if (o.layer !== undefined && layer !== undefined && o.layer !== layer) continue;
+			if (o.x + o.r < minX || o.x - o.r > maxX || o.y + o.r < minY || o.y - o.r > maxY) continue;
+			if (pointSegDist(o.x, o.y, x1, y1, x2, y2) < o.r) return false;
+		}
+		return true;
+	}
+
 	private repairViaClearance(final = false): void {
 		if (!this.plannedVias.length) return;
 		// 过孔去重（同网同坐标重复登记会让画布/统计出现幽灵过孔）
@@ -2727,10 +2812,24 @@ export class PlanningEngine {
 					const oldX = v.x, oldY = v.y;
 					const incident = prims.filter(p => this.primEndsNear(p, oldX, oldY, 1.0));
 					if (incident.some(p => p.kind !== 'line')) continue;
+					// 平移复检：端点挪动会横扫出新走廊，提交时的合法余量只有
+					// 0.1mil（障碍 r 的 +0.1），1.8mil 的微移足以吃穿它变成
+					// DRC 违规（case12 实测 TH Pad/Hole to Track 各 1 条）。
+					// 挪完先复检，被挪线段扫进任何异网障碍就回退换方向。
 					for (const p of incident) {
 						if (p.kind !== 'line') continue;
 						if (Math.hypot((p.x1 ?? 0) - oldX, (p.y1 ?? 0) - oldY) < 1.0) { p.x1 = nx; p.y1 = ny; }
 						else if (Math.hypot((p.x2 ?? 0) - oldX, (p.y2 ?? 0) - oldY) < 1.0) { p.x2 = nx; p.y2 = ny; }
+					}
+					const swept = incident.filter((p): p is RenderedPrim & { kind: 'line' } => p.kind === 'line')
+						.filter(p => !this.lineStillClear(p.x1 ?? 0, p.y1 ?? 0, p.x2 ?? 0, p.y2 ?? 0, p.layer, v.net));
+					if (swept.length) {
+						for (const p of incident) {
+							if (p.kind !== 'line') continue;
+							if (Math.hypot((p.x1 ?? 0) - nx, (p.y1 ?? 0) - ny) < 1.0) { p.x1 = oldX; p.y1 = oldY; }
+							else if (Math.hypot((p.x2 ?? 0) - nx, (p.y2 ?? 0) - ny) < 1.0) { p.x2 = oldX; p.y2 = oldY; }
+						}
+						continue;
 					}
 					this.log(`终检: 过孔 ${v.net}(${oldX.toFixed(1)},${oldY.toFixed(1)}) 距 ${bad}，微移至 (${nx.toFixed(1)},${ny.toFixed(1)})`, 'info');
 					v.x = nx; v.y = ny;
@@ -3176,6 +3275,47 @@ export class PlanningEngine {
 			return prims;
 		}
 		return null;
+	}
+
+	/**
+	 * 失败边诊断（__RB_BLOCKERS__=1 时启用）：本边两端扇出带与全走廊上
+	 * 分别被哪些已布网络占据（按采样点命中率排序）。用于设计挡路网撕毁
+	 * 策略——数据先行，不猜。
+	 */
+	private logEdgeBlockers(src: EnginePad, dst: EnginePad, netName: string): void {
+		const segBlocked = (ax: number, ay: number, bx: number, by: number): { perNet: Map<string, number>; steps: number } => {
+			const len = Math.hypot(bx - ax, by - ay);
+			const steps = Math.max(2, Math.ceil(len / 6));
+			const perNet = new Map<string, number>();
+			for (let s = 0; s <= steps; s++) {
+				const px = ax + (bx - ax) * (s / steps), py = ay + (by - ay) * (s / steps);
+				for (const o of this.dynamicObstacles) {
+					if (o.soft || !o.net || o.net === netName) continue;
+					const g = o.group ?? '';
+					if (!g.startsWith('trk:') && !g.startsWith('via:')) continue;
+					if (Math.hypot(o.x - px, o.y - py) < o.r) perNet.set(o.net, (perNet.get(o.net) ?? 0) + 1);
+				}
+			}
+			return { perNet, steps };
+		};
+		const fmt = (r: { perNet: Map<string, number>; steps: number }): string => {
+			const total = r.steps + 1;
+			return [...r.perNet.entries()].sort((a, b) => b[1] - a[1]).slice(0, 3)
+				.map(([n, c]) => `${n}:${Math.round((100 * c) / total)}%`).join(',') || 'clear';
+		};
+		const parts: string[] = [];
+		for (const [tag, pad] of [['src', src], ['dst', dst]] as const) {
+			const row = this.rowInfo.get(pad.id);
+			if (!row) continue;
+			const L = row.gap * 1.5 + 40;
+			const nx = -row.dy, ny = row.dx;
+			for (const s of [1, -1] as const) {
+				const r = segBlocked(pad.x, pad.y, pad.x + nx * s * L, pad.y + ny * s * L);
+				parts.push(`${tag}-fan${s > 0 ? '+' : '-'}@${Math.round(L)}=${fmt(r)}`);
+			}
+		}
+		parts.push(`corridor=${fmt(segBlocked(src.x, src.y, dst.x, dst.y))}`);
+		this.log(`[blockers] ${netName} ${src.id}→${dst.id} ${parts.join(' ')}`, 'info');
 	}
 
 	/** 首段出线方向是否贴着排向滑出（|dot| > 0.5·|dir|）—— 会封死同排侧边焊盘的垂直出口 */
