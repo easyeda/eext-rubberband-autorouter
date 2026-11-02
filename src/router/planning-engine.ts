@@ -304,6 +304,8 @@ export class PlanningEngine {
 	private obstacleIdCounter = 0;
 	/** 焊盘障碍缓存（键 = 排除网络名；焊盘在规划期间不变） */
 	private padObstacleCache = new Map<string, RBObstacle[]>();
+	/** padHalfExtent 记忆化（按 allPads 下标；焊盘静态，整轮有效） */
+	private padExtentCache = new Map<number, number>();
 	/** 并排焊盘行信息（键 = 焊盘 id）：排向单位向量 + 中位间距 + 排内深度（0 端点 → 1 中心） */
 	private rowInfo = new Map<string, { dx: number; dy: number; gap: number; depth: number }>();
 	/** 全盘焊盘空间网格（加速过孔落点的近邻净距查询） */
@@ -409,6 +411,7 @@ export class PlanningEngine {
 			}
 		}
 		this.padObstacleCache.clear();
+		this.padExtentCache.clear();
 		this.rowInfo.clear();
 		this.callbacks = callbacks;
 		this.planOptions = input.options ?? {};
@@ -1679,6 +1682,19 @@ export class PlanningEngine {
 		return half;
 	}
 
+	/** padHalfExtent 的记忆化版本：viaPadClear 每候选点 × 每焊盘都要调用，
+	 * 形状查找/开方成本不可忽略（焊盘静态，整轮缓存有效） */
+	private padExtentOf(p: EnginePad): number {
+		const key = p.index ?? -1;
+		if (key >= 0) {
+			const hit = this.padExtentCache.get(key);
+			if (hit !== undefined) return hit;
+		}
+		const e = this.padHalfExtent(p);
+		if (key >= 0) this.padExtentCache.set(key, e);
+		return e;
+	}
+
 	/**
 	 * 焊盘可落线层：TH（layer 12 / padType th）双层；SMD 只能自己的层。
 	 * 网格求解必须按它限制起点/终点的层，否则顶层 SMD 会直接生成没有
@@ -1747,19 +1763,26 @@ export class PlanningEngine {
 		// 外接圆预筛：外接圆之外的焊盘铜皮不可能违反净距，直接跳过 ——
 		// 落点网格/射线扫描每个候选点都要过一遍邻近焊盘，形状求距
 		//（旋转/多边形）才是大头，预筛能把绝大多数焊盘挡在求距之外。
+		// ⚠ 必须全量扫 allPads，不能用 nearPads 3×3 网格邻域：长焊盘
+		//（case9 LCD/LED 陶瓷灯丝盘 16.5×65.7mil）在网格索引里有盲区，
+		// 提交放过、终检 badAt（全量扫）再拆 —— case9 单轮 81 次焊盘类
+		// 微移/拆除、5 个网被清空全靠救援轮兜底。预筛在外，成本可控
+		//（hypot+比较 ~10ns/盘，形状求距只发生在预筛通过的少数盘上）。
 		//（焊盘全集先经 64mil 空间网格收窄到 3×3 邻域，全量扫描 O(盘数)
 		// × 数千候选点在密集板上纯烧时间）
 		const need0 = viaR + drc.trackToPadMil + 1;
-		for (const p of this.nearPads(x, y)) {
+		for (const p of this.allPads) {
 			// 过孔是贯穿孔：只关心顶层/底层/通孔焊盘
 			if (p.layer !== 1 && p.layer !== 2 && p.layer !== 12 && p.padType !== 'th') continue;
 			const sameNet = p.net === netName;
 			if (sameNet && this.allowViaInPad) continue;
-			// ⚠ 预筛维持宽松外接（p.radius）不要改成真实形状：三连 A/B 实测放置收紧
-			// 后 case9 从 55 掉到 45/47 —— 被提前掐掉的候选链会让整张板的世界演化
-			// 变差；「先放置、违规交给终检（repairViaClearance）拆除并重新入队」的
-			// 两阶段机制通过率更高（同网焊盘终检本就跳过，异网也有轮间补救机会）。
-			const maxExtent = Math.max(p.radius, p.bodyRadius ?? 0);
+			// ⚠ 预筛外接半径必须用真实形状的对角半extent（padHalfExtent），
+			// 不能用 p.radius（=max(w,h)/2，RECT 角部方向低估 ~6mil）：
+			// case9 实测 LED 排 RECT 59.1×39.4 焊盘，过孔落在角部方向
+			// 距铜皮 17.94mil（EDA 要求 17.98，差 0.04），预筛按 29.55 算
+			// 50.92-29.55=21.37>18.98 直接跳过精确检查 → 提交漏检、终检再拆。
+			// 预筛只许偏松（多进精确检查），绝不许偏紧。
+			const maxExtent = Math.max(this.padExtentOf(p), p.radius, p.bodyRadius ?? 0);
 			if (Math.hypot(p.x - x, p.y - y) - maxExtent > need0) continue;
 			const d = this.padCopperDistance(p, x, y);
 			const need = sameNet
@@ -2068,8 +2091,13 @@ export class PlanningEngine {
 				// 另一层焊盘靠过孔连接。该过孔位于焊盘内，仅在允许焊盘打孔时使用
 				// （默认路径已在上面的 crossLayerSmd 分支改为焊盘外过孔）。
 				if (rendered && srcLayer !== dstLayer) {
-					const dia = Math.max(20, drc.traceWidthMil * 2);
-					const hole = Math.max(10, drc.traceWidthMil);
+					// 与全引擎统一的标准过孔几何（max(24, 2×线宽) / max(12, 线宽)）：
+					// 旧值 dia=max(20,·)/hole=max(10,·) 产出 20mil 异类过孔 ——
+					// ① hole=10mil=0.254mm 低于板厂最小钻孔 0.3mm；
+					// ② 终检按统一 viaR=12 判它，把 EDA 合法的 dia-20 过孔
+					//（17.46/17.94mil 距焊盘）当违规微移/拆除（case9 单轮 84 次）。
+					const dia = Math.max(24, drc.traceWidthMil * 2);
+					const hole = Math.max(12, drc.traceWidthMil);
 					// 焊盘内过孔同样要避开隔壁异网焊盘；避不开就放弃这条连接
 					//（精确口径与终检一致：采样圆障碍有缝，见 viaExactBad 注释）
 					if (!this.viaPadClear(dst.x, dst.y, dia / 2, net.name) ||
@@ -2853,13 +2881,17 @@ export class PlanningEngine {
 		// —— 长焊盘（连接器/天线）中心离得远但边缘很近，索引会漏判
 		//（实测 LED7/LCD5 焊盘 vs LED8/LCD6 过孔，缺口仅 0.3mil）。
 		const badAt = (v: PlannedVia, x: number, y: number): string | null => {
-			const exact = this.viaExactBad(x, y, v.net, viaR, v.hole || 12, v);
+			// 按该过孔的实际直径判（异类直径过孔用统一 viaR=12 会过严：
+			// dia-20 过孔距焊盘 17.94mil 对 EDA 合法（10+5.98=15.98），
+			// 按 12 判成违规 → 微移/拆除合法过孔，case9 单轮 84 次）
+			const vR = (v.dia || 24) / 2;
+			const exact = this.viaExactBad(x, y, v.net, vR, v.hole || 12, v);
 			if (exact) return exact;
 			for (const pd of this.allPads) {
 				if (pd.net === v.net) continue;
 				if (pd.layer !== 1 && pd.layer !== 2 && pd.layer !== 12 && pd.padType !== 'th') continue;
 				const d = this.padCopperDistance(pd, x, y);
-				if (d < viaR + this.drc.trackToPadMil + 0.4) return `${pd.net} 焊盘 ${d.toFixed(2)}mil`;
+				if (d < vR + this.drc.trackToPadMil + 0.4) return `${pd.net} 焊盘 ${d.toFixed(2)}mil`;
 			}
 			return null;
 		};
