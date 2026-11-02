@@ -286,6 +286,16 @@ export class TopologicalRouter {
 				}
 
 				if (netPads.length >= 1) padMap.set(netName, netPads);
+				// 采集期诊断：定位「按网枚举确定性丢 pad」（case9 P02 的
+				// e189e13 每次 E2E 都丢 —— MST 退化为 pad1-pad3 直连）
+				if ((globalThis as any).__RB_PAD_DEBUG__ && /^P0[012]$/.test(netName)) {
+					const types: Record<string, number> = {};
+					for (const prim of primitives) {
+						const t = String((prim as any).type ?? (prim as any).pcbItemPrimitiveType ?? '?');
+						types[t] = (types[t] ?? 0) + 1;
+					}
+					this.onLog?.(`[pad-debug] ${netName}: 原语 ${primitives.length}，type 分布 ${JSON.stringify(types)}，收 pad ${netPads.length}（@${netPads.map(p => `${p.x.toFixed(1)},${p.y.toFixed(1)}`).join(' ')}）`, 'info');
+				}
 		}
 
 		// 无网络焊盘（NC 脚、安装孔、屏蔽框脚、半孔工艺脚……）不是可布线对象，
@@ -297,43 +307,85 @@ export class TopologicalRouter {
 		try {
 			const seenNetless = new Set(allPads.map(p => `${p.x.toFixed(2)},${p.y.toFixed(2)}`));
 			const padPrims = await eda.pcb_PrimitivePad.getAll();
+			// 按网络枚举收集到的焊盘位置集（用于补漏比对）
+			const seenNetted = new Set(allPads.filter(p => p.net).map(p => `${p.x.toFixed(2)},${p.y.toFixed(2)}`));
 			let netlessAdded = 0;
+			let nettedPatched = 0;
 			for (const sp of padPrims) {
 				const p = sp as any;
 				const net: string = p.net ?? p.netName ?? '';
-				if (net) continue;   // 有网络的焊盘已在上面按网络枚举收集
 				const x: number = p.x ?? p.center?.x ?? 0;
 				const y: number = p.y ?? p.center?.y ?? 0;
 				if (!x && !y) continue;
 				const key = `${x.toFixed(2)},${y.toFixed(2)}`;
-				if (seenNetless.has(key)) continue;
-				seenNetless.add(key);
-				const padShape = Array.isArray(p.pad) ? p.pad : [];
-				let wMil = padShape.length >= 3 ? (padShape[1] ?? 0) : 0;
-				let hMil = padShape.length >= 3 ? (padShape[2] ?? 0) : 0;
-				const hole = p.hole;
-				const holeMil = Array.isArray(hole) && hole.length >= 2 ? (hole[1] ?? 0) : 0;
-				if (wMil === 0 && hMil === 0) { wMil = 32; hMil = 34; }
-				const rawLayer: number = p.layerId ?? p.layer ?? 1;
-				// TH 判定只认 layer 12：层 1/2 SMD 带封装库干扰小孔（如 LQFP 的
-				// hole=8.5mil 假孔）不是通孔，误判会把它挤出 SMD 出线候选名单
-				let padType: 'th' | 'smd' | 'via' = 'smd';
-				if (rawLayer === 12) padType = 'th';
-				else if (p.isVia || p.type === 'via') padType = 'via';
-				let layer: number = rawLayer;
-				if (padType === 'smd' && (rawLayer === 12 || rawLayer > 2)) layer = 1;
-				allPads.push({
-					x, y, net: '', id: p.globalIndex || p.uuid || `netless_${allPads.length}`,
-					layer, padType, holeDiameter: holeMil,
-					radius: Math.max(wMil / 2, hMil / 2, holeMil / 2),
-					bodyRadius: Math.max(Math.min(wMil, hMil) / 2, holeMil / 2),
+				if (!net) {
+					if (seenNetless.has(key)) continue;
+					seenNetless.add(key);
+					const padShape = Array.isArray(p.pad) ? p.pad : [];
+					let wMil = padShape.length >= 3 ? (padShape[1] ?? 0) : 0;
+					let hMil = padShape.length >= 3 ? (padShape[2] ?? 0) : 0;
+					const hole = p.hole;
+					const holeMil = Array.isArray(hole) && hole.length >= 2 ? (hole[1] ?? 0) : 0;
+					if (wMil === 0 && hMil === 0) { wMil = 32; hMil = 34; }
+					const rawLayer: number = p.layerId ?? p.layer ?? 1;
+					// TH 判定只认 layer 12：层 1/2 SMD 带封装库干扰小孔（如 LQFP 的
+					// hole=8.5mil 假孔）不是通孔，误判会把它挤出 SMD 出线候选名单
+					let padType: 'th' | 'smd' | 'via' = 'smd';
+					if (rawLayer === 12) padType = 'th';
+					else if (p.isVia || p.type === 'via') padType = 'via';
+					let layer: number = rawLayer;
+					if (padType === 'smd' && (rawLayer === 12 || rawLayer > 2)) layer = 1;
+					allPads.push({
+						x, y, net: '', id: p.globalIndex || p.uuid || `netless_${allPads.length}`,
+						layer, padType, holeDiameter: holeMil,
+						radius: Math.max(wMil / 2, hMil / 2, holeMil / 2),
+						bodyRadius: Math.max(Math.min(wMil, hMil) / 2, holeMil / 2),
+						rotation: p.rotation ?? 0,
+						index: allPads.length,
+					});
+					netlessAdded++;
+					continue;
+				}
+				// **有网焊盘补漏**：getAllPrimitivesByNet 在文档忙时会瞬时返回**部分**
+				// 列表（只重试空列表拦不住）—— 漏掉的焊盘对路由器隐形，MST 按
+				// 少一个 pad 的拓扑布线，画布上 pad 悬空（EDA 判 Connection Error，
+				// case9 P02 的 e189e13 实测）。全局枚举是原子快照，用它对账补齐。
+				if (seenNetted.has(key)) continue;
+				seenNetted.add(key);
+				const padShape2 = Array.isArray(p.pad) ? p.pad : [];
+				let w2 = padShape2.length >= 3 ? (padShape2[1] ?? 0) : 0;
+				let h2 = padShape2.length >= 3 ? (padShape2[2] ?? 0) : 0;
+				const hole2 = p.hole;
+				const holeMil2 = Array.isArray(hole2) && hole2.length >= 2 ? (hole2[1] ?? 0) : 0;
+				if (w2 === 0 && h2 === 0) { w2 = 32; h2 = 34; }
+				const rawLayer2: number = p.layerId ?? p.layer ?? 1;
+				let padType2: 'th' | 'smd' | 'via' = 'smd';
+				if (holeMil2 > 0 || rawLayer2 === 12) padType2 = 'th';
+				else if (p.isVia || p.type === 'via') padType2 = 'via';
+				let layer2: number = rawLayer2;
+				if (padType2 === 'smd' && (rawLayer2 === 12 || rawLayer2 > 2)) layer2 = 1;
+				const info: EnginePad = {
+					x, y, net, id: p.globalIndex || p.uuid || `${net}_patch_${allPads.length}`,
+					layer: layer2, padType: padType2, holeDiameter: holeMil2,
+					radius: Math.max(w2 / 2, h2 / 2, holeMil2 / 2),
+					bodyRadius: Math.max(Math.min(w2, h2) / 2, holeMil2 / 2),
 					rotation: p.rotation ?? 0,
 					index: allPads.length,
-				});
-				netlessAdded++;
+				};
+				allPads.push(info);
+				const arr = padMap.get(net) ?? [];
+				arr.push(info);
+				padMap.set(net, arr);
+				nettedPatched++;
+				if ((globalThis as any).__RB_PAD_DEBUG__) {
+					this.onLog?.(`[pad-debug] 补漏 ${net} @(${x.toFixed(2)},${y.toFixed(2)}) type=${p.type} primType=${p.pcbItemPrimitiveType} pad=${JSON.stringify(p.pad ?? null)}`, 'info');
+				}
 			}
 			if (netlessAdded) {
 				this.onLog?.(`补充 ${netlessAdded} 个无网络焊盘作为障碍（NC 脚/安装孔等，DRC 照查间距）`, 'info');
+			}
+			if (nettedPatched) {
+				this.onLog?.(`焊盘补漏：${nettedPatched} 个有网焊盘被按网络枚举瞬时漏收，已从全局枚举补齐`, 'warn');
 			}
 		} catch (err) {
 			console.warn('[TopologicalRouter] 无网络焊盘收集失败:', err);
@@ -744,7 +796,12 @@ export class TopologicalRouter {
 			// 历史（pendingPlanned）：引擎结尾还有终局修复（拆除违规过孔等），
 			// 消息历史停在修复之前，画布会残留已被引擎丢弃的图元（实测过孔
 			// 间距违规在画布上复现、引擎侧却已清除）。
-			if (options.livePreview !== false && !this.shouldCancel) {
+			// **预览关闭（NOPREVIEW）同样必须走对账**：该模式只有 flushPending
+			// 这一次裸写（deleteNet 无 ID 记录不删任何东西，逐图元 create 偶发
+			// 失败只 console.warn），没有任何核对 —— 实测 VDD3V3 画布只剩 8 条线
+			// + 9 过孔（引擎终态 96 prims），7 个孤立过孔被 EDA 判 Connection
+			// Error。引擎终态权威，两种模式同一对账路径。
+			if (!this.shouldCancel) {
 				this.finalizing = true;   // 定稿：之后的迟到消息不再写画布
 				const finalPrims = new Map<string, RenderedPrim[]>();
 				const finalVias = new Map<string, PlannedVia[]>();
@@ -794,8 +851,8 @@ export class TopologicalRouter {
 			// 兜底核对：画布必须与引擎终态完全一致。实测 EDA 的按 ID 删除
 			// 偶发漏删、重复写入会留下同坐标幽灵过孔（引擎侧已去重，画布仍在，
 			// EDA DRC 照样报 Track to Via）。这里按终态扫描一次，删掉多余的，
-			// 数量不符的整网重写。
-			if (options.livePreview !== false && !this.shouldCancel) {
+			// 数量不符的整网重写。预览关闭同样核对（见上方收尾对账注释）。
+			if (!this.shouldCancel) {
 				await this.reconcileCanvas(result);
 			}
 
@@ -807,6 +864,8 @@ export class TopologicalRouter {
 			}
 
 			const stats = this.snapshotStats();
+			// 诊断出口：E2E/测试台审计引擎终态用（逐网 prims/vias）
+			(this as unknown as { lastResult?: PlanningResult }).lastResult = result;
 			this.onProgress?.({
 				stage: this.shouldCancel ? '已停止' : '完成',
 				percentage: 100,
@@ -1101,7 +1160,11 @@ export class TopologicalRouter {
 					this.onLog?.(`画布核对：删除 ${del.length} 个多余过孔`, 'info');
 				}
 			} catch { /* ignore */ }
-			// 2) 走线/圆弧数量核对：不符的整网重写
+			// 2) 走线/圆弧数量核对：不符的整网重写。
+			// 期望数必须按 **mergePrims 之后** 的数量（与 writeNet 的写入口径
+			// 一致）：原始数量含共线/重叠段，合并后变少 —— 拿原始数当期望
+			// 会把「合并变少」误判成丢图元（每轮白白整网重写 3 遍），反而把
+			// 真正的静默丢失淹没在噪声里（实测 VDD3V3 丢 88 段没被发现）。
 			try {
 				const lines = (await eda.pcb_PrimitiveLine.getAll()) ?? [];
 				const arcs = (await eda.pcb_PrimitiveArc.getAll()) ?? [];
@@ -1111,7 +1174,7 @@ export class TopologicalRouter {
 				const rewrite: string[] = [];
 				for (const name of managed) {
 					if (rewritten.has(name)) continue;
-					const expect = (primsOf.get(name) ?? []).length;
+					const expect = mergePrims(primsOf.get(name) ?? []).length;
 					const actual = count.get(name) ?? 0;
 					if (actual !== expect) rewrite.push(name);
 				}
@@ -1202,11 +1265,23 @@ export class TopologicalRouter {
 		const prims = mergePrims(primsRaw);
 		const rec: PrimIdRecord = { lines: [], arcs: [], vias: [] };
 		this.netPrimIds.set(name, rec);
+		let missed = 0;
+		// EDA 的 create 偶发静默失败（返回 null 不抛错）：立即重试一次，
+		// 仍失败计入 missed —— 终态审计与 reconcileCanvas 靠它发现丢图元
+		const retryCreate = async (fn: () => Promise<unknown>): Promise<unknown> => {
+			let r = await fn();
+			if (!r) {
+				missed++;
+				await new Promise(res => setTimeout(res, 20));
+				r = await fn();
+			}
+			return r;
+		};
 
 		// 先建过孔再建走线：EDA 不会把已存在的走线自动连接到后创建的过孔
 		for (const via of vias) {
 			try {
-				const created = await eda.pcb_PrimitiveVia.create(via.net, via.x, via.y, via.hole, via.dia);
+				const created = await retryCreate(() => eda.pcb_PrimitiveVia.create(via.net, via.x, via.y, via.hole, via.dia));
 				const id = primitiveIdOf(created);
 				if (created) rec.vias.push(id || created);
 			} catch (err) {
@@ -1227,7 +1302,7 @@ export class TopologicalRouter {
 					if (lastEnd && Math.hypot(sx - lastEnd.x, sy - lastEnd.y) < 0.5) {
 						sx = lastEnd.x; sy = lastEnd.y;
 					}
-					const created = await eda.pcb_PrimitiveLine.create(name, pr.layer, sx, sy, ex, ey, drcWidth, false);
+					const created = await retryCreate(() => eda.pcb_PrimitiveLine.create(name, pr.layer, sx, sy, ex, ey, drcWidth, false));
 					const ce = created as any;
 					lastEnd = (ce && typeof ce.endX === 'number') ? { x: ce.endX, y: ce.endY } : { x: ex, y: ey };
 					const id = primitiveIdOf(created);
@@ -1244,7 +1319,7 @@ export class TopologicalRouter {
 						if (lastEnd && Math.hypot(sx - lastEnd.x, sy - lastEnd.y) < 0.5) {
 							sx = lastEnd.x; sy = lastEnd.y;
 						}
-						const createdL = await eda.pcb_PrimitiveLine.create(name, pr.layer, sx, sy, ex0, ey0, drcWidth, false);
+						const createdL = await retryCreate(() => eda.pcb_PrimitiveLine.create(name, pr.layer, sx, sy, ex0, ey0, drcWidth, false));
 						const ceL = createdL as any;
 						lastEnd = (ceL && typeof ceL.endX === 'number') ? { x: ceL.endX, y: ceL.endY } : { x: ex0, y: ey0 };
 						const idL = primitiveIdOf(createdL);
@@ -1257,7 +1332,7 @@ export class TopologicalRouter {
 						if (lastEnd && Math.hypot(sx - lastEnd.x, sy - lastEnd.y) < 0.5) {
 							sx = lastEnd.x; sy = lastEnd.y;
 						}
-						const created = await eda.pcb_PrimitiveArc.create(name, pr.layer, sx, sy, ex, ey, deg, drcWidth);
+						const created = await retryCreate(() => eda.pcb_PrimitiveArc.create(name, pr.layer, sx, sy, ex, ey, deg, drcWidth));
 						const ce = created as any;
 						lastEnd = (ce && typeof ce.endX === 'number') ? { x: ce.endX, y: ce.endY } : { x: ex, y: ey };
 						const id = primitiveIdOf(created);
@@ -1276,6 +1351,7 @@ export class TopologicalRouter {
 		this.netGeom.set(name, { segments: written, vias: rec.vias.length });
 		this.netWrittenSig.set(name, this.netSig(prims, vias));
 		if (rec.lines.length || rec.arcs.length || rec.vias.length) this.touchedNets.add(name);
+		if (missed) this.onLog?.(`写入 ${name}: ${missed} 个图元创建失败（重试后仍缺，交画布核对重写）`, 'warn');
 		this.emitStats();
 	}
 
