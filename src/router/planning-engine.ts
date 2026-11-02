@@ -977,9 +977,22 @@ export class PlanningEngine {
 		// —— 协商赚到的网还要过终检微移/拆除，贴太紧会在尾部被拆回去。
 		if (!(globalThis as any).__RB_NO_NEG__ && !this.checkCancelled() &&
 			networks.some(n => !this.routedOrder.includes(n.name))) {
-			const negDeadline = Number.isFinite(deadline) ? deadline - 30_000 : Date.now() + 10 * 60_000;
+			const pfOn = !!(globalThis as any).__RB_PF__;
+			const negDeadline = Number.isFinite(deadline)
+				? deadline - (pfOn ? 75_000 : 30_000)
+				: Date.now() + 10 * 60_000;
 			if (Date.now() < negDeadline) await this.negotiatePhase(networks, negDeadline);
 			__phase('拥挤协商');
+		}
+		// PathFinder 终局（__RB_PF__=1）：失败网软提交意向路径（跨网重叠在
+		// 阶段内合法存在，历史罚分跨迭代逼惯犯让位），阶段末统一清判转正/
+		// 重布/拆除。与协商「每动作全或无」接受互补 —— 重叠不再要求一次让
+		// 6 个网同时挪窝。清判在终检/尾部之前完成（重叠态不过终检口径）。
+		if ((globalThis as any).__RB_PF__ && !this.checkCancelled() &&
+			networks.some(n => !this.routedOrder.includes(n.name)) && Date.now() < deadline - 25_000) {
+			this.pfTentative.clear();
+			await this.pathfinderPhase(networks, deadline - 25_000);
+			__phase('PathFinder');
 		}
 		// 实验：主连通阶段被限流后，把一部分尾部时间明确分配给最终优化
 		// （重布已布网络，只有更短且不新增过孔才采纳）。否则 optDeadline
@@ -2490,8 +2503,8 @@ export class PlanningEngine {
 	 * 迷宫/兜底链），只要记账链路有任何时序漏洞，这里当场拦下。
 	 * 违规时返回 false（调用方丢弃该边）。
 	 */
-	private primsClearOfDynamic(prims: RenderedPrim[], netName: string): boolean {
-		const obs = this.dynamicObstacles;
+	private primsClearOfDynamic(prims: RenderedPrim[], netName: string, obsOverride?: RBObstacle[]): boolean {
+		const obs = obsOverride ?? this.dynamicObstacles;
 		// 把图元统一拆成采样段（直线原样；圆弧 ≤15°/步采样），逐段检查
 		const segs: Array<[number, number, number, number, number]> = [];   // [ax,ay,bx,by,layer]
 		for (const p of prims) {
@@ -2613,6 +2626,13 @@ export class PlanningEngine {
 			return true;
 		};
 		const out: RenderedPrim[] = [];
+		// 受保护转角：焊盘/过孔中心不圆角化。fanoutFillet 不知道焊盘存在，
+		// 圆角弧会把 pad 所在的角点从铜皮上切掉（弧与腿的切点间不再覆盖
+		// pad 中心）—— pad 悬空的又一来源（P02 的 B 焊盘嫌疑路径）。
+		const prot = new Set<string>();
+		const kOf = (x: number, y: number) => `${Math.round(x * 2)}|${Math.round(y * 2)}`;
+		for (const v of this.plannedVias) if (v.net === netName) prot.add(kOf(v.x, v.y));
+		for (const pd of this.allPads) if (pd.net === netName) prot.add(kOf(pd.x, pd.y));
 		for (let i = 0; i < prims.length; i++) {
 			const cur = prims[i];
 			const nxt = prims[i + 1];
@@ -2625,6 +2645,7 @@ export class PlanningEngine {
 				out.push(cur);
 				continue;
 			}
+			if (prot.has(kOf(cur.x2!, cur.y2!))) { out.push(cur); continue; }
 			const f = fanoutFillet(
 				{ x1: cur.x1!, y1: cur.y1!, x2: cur.x2!, y2: cur.y2! },
 				{ x1: nxt.x1!, y1: nxt.y1!, x2: nxt.x2!, y2: nxt.y2! },
@@ -3533,10 +3554,11 @@ export class PlanningEngine {
 
 	/**
 	 * 单边独走路径的让路集合：可视图在「只有静态障碍+焊盘」的世界里求本边
-	 * 最短路（与 soloRoute 同口径，但只算这一条边），返回路径压到的异网
-	 * 走线/过孔所属网络。无独走路径返回 null。
+	 * 最短路（与 soloRoute 同口径，但只算这一条边），返回路径图元、过孔与
+	 * 压到的异网名单。无独走路径返回 null。
+	 * PathFinder 的意向路由复用同一世界口径（异网铜皮可压，清判再结算）。
 	 */
-	private async soloEdgeCrossing(src: EnginePad, dst: EnginePad, netName: string, soft: RBObstacle[]): Promise<string[] | null> {
+	private async soloEdgeCrossing(src: EnginePad, dst: EnginePad, netName: string, soft: RBObstacle[]): Promise<{ prims: RenderedPrim[]; vias: PlannedVia[]; crossed: string[] } | null> {
 		const layer = getRoutingLayer(src, dst);
 		const attempt = async (ly: number) => {
 			const obs = this.layerObstacles(netName, ly, false);
@@ -3545,6 +3567,7 @@ export class PlanningEngine {
 		};
 		let prims = await attempt(layer);
 		if (!prims && layer === 1 && this.hasBottomLayer && bottomCapable(src) && bottomCapable(dst)) prims = await attempt(2);
+		let vias: PlannedVia[] = [];
 		// 单层都不通 → 过孔换层独走（case9 LCD 排：单网布通靠的正是这条链）。
 		// 临时把异网走线/过孔移出动态障碍，让 viaEdgeCandidate 看到「洁净世界」，
 		// 求完立即恢复（同步段内完成，不跨 await 外泄状态以外的副作用）。
@@ -3561,6 +3584,7 @@ export class PlanningEngine {
 				const vc = await this.viaEdgeCandidate(src, dst, netName);
 				if (vc) {
 					prims = vc.prims;
+					vias = vc.vias;
 					// 过孔本身也要占位：落点压到的异网铜皮同样需要让路
 					for (const v of vc.vias) {
 						prims = [...prims, { kind: 'line', net: netName, layer: 1, x1: v.x, y1: v.y, x2: v.x, y2: v.y } as RenderedPrim,
@@ -3574,7 +3598,12 @@ export class PlanningEngine {
 		}
 		if (!prims) return null;
 		const out = new Set<string>();
-		for (const p of prims) {
+		const probe: RenderedPrim[] = [...prims];
+		for (const v of vias) {
+			probe.push({ kind: 'line', net: netName, layer: 1, x1: v.x, y1: v.y, x2: v.x, y2: v.y } as RenderedPrim);
+			probe.push({ kind: 'line', net: netName, layer: 2, x1: v.x, y1: v.y, x2: v.x, y2: v.y } as RenderedPrim);
+		}
+		for (const p of probe) {
 			const pts = this.primPoints([p], 5);
 			for (const o of soft) {
 				if (!o.net || o.net === netName || out.has(o.net)) continue;
@@ -3585,7 +3614,7 @@ export class PlanningEngine {
 				}
 			}
 		}
-		return [...out];
+		return { prims, vias, crossed: [...out] };
 	}
 
 	/**
@@ -3656,7 +3685,7 @@ export class PlanningEngine {
 					if (__nd) this.log(`[neg] ${net.name} ${src.id}→${dst.id} 网格与独走都无路（${res.debug ?? ''}）`, 'info');
 					return null;
 				}
-				for (const c of solo) crossed.add(c);
+				for (const c of solo.crossed) crossed.add(c);
 				continue;
 			}
 			for (const c of res.crossed ?? []) crossed.add(c);
@@ -3742,6 +3771,270 @@ export class PlanningEngine {
 		for (const c of rip) hist.set(c, (hist.get(c) ?? 0) + 1);
 		if (__nd) this.log(`[neg] ${net.name} 让路 [${rip.join(', ')}] 无净增益（${before}→${after}），回滚`, 'info');
 		return 0;
+	}
+
+	// ── PathFinder 终局（__RB_PF__=1）────────────────────
+	// 与协商「全或无」接受的本质差异：失败网先**软提交**意向路径（重叠在
+	// 阶段内合法存在），每个重叠独立解决，阶段末统一清判。实测前提：
+	// case9/12 的失败网单独都能布通，卡点纯是「谁占走廊」的联合收敛。
+
+	private pfTentative = new Set<string>();
+
+	/**
+	 * 软提交缺失边：硬障碍只剩静态+焊盘（异网铜皮全软化计罚分），过孔
+	 * 只查焊盘净距与同网孔距（绝对 DRC），跨网重叠交给阶段末清判。
+	 * 提交即入账 netRendered/plannedVias/动态障碍 —— 后续意向路径看得见
+	 * 先行的重叠态，历史罚分逼惯犯走廊让位。
+	 */
+	private async pfTentativeRoute(
+		net: { name: string; pads: EnginePad[] },
+		hist: Map<string, number>,
+		deadline: number,
+	): Promise<boolean> {
+		const edges = this.computeMST(net.pads);
+		const done = this.routedEdges.get(net.name) ?? new Set<string>();
+		const edgeKey = (si: number, di: number) => `${net.pads[si].id}->${net.pads[di].id}`;
+		const missing = edges.filter(([si, di]) => !done.has(edgeKey(si, di)));
+		if (!missing.length) return true;
+		const gridCell = Number((globalThis as any).__RB_GRID_CELL__) || 4;
+		const layers = this.hasBottomLayer ? [1, 2] : [1];
+		const penaltyOf = (n: string): number => (40 + 8 * (this.allPads.filter(p => p.net === n).length)) * (1 + (hist.get(n) ?? 0));
+		let anyCommitted = false;
+		for (const [si, di] of missing) {
+			if (this.checkCancelled() || Date.now() > deadline) break;
+			const src = net.pads[si], dst = net.pads[di];
+			const t0 = Date.now();
+			const res = await gridRoute({
+				src: { x: src.x, y: src.y },
+				dst: { x: dst.x, y: dst.y },
+				srcPad: { x: src.x, y: src.y, r: src.bodyRadius || src.radius, viaKeepoutR: this.padViaKeepout(src) },
+				dstPad: { x: dst.x, y: dst.y, r: dst.bodyRadius || dst.radius, viaKeepoutR: this.padViaKeepout(dst) },
+				srcReleases: this.padReleases(src, gridCell),
+				dstReleases: this.padReleases(dst, gridCell),
+				srcPadLayers: this.padLayers(src),
+				dstPadLayers: this.padLayers(dst),
+				obstacles: [...this.staticObstacles, ...this.padObstacles(this.allPads, net.name)],
+				penaltyObstacles: this.dynamicObstacles,
+				penaltyOf,
+				net: net.name,
+				layers,
+				cell: gridCell,
+				viaCostMil: Math.max(150, this.drc.traceWidthMil * 22),
+				...this.gridViaExtras(),
+				viaInPad: this.allowViaInPad,
+				budgetMs: Math.min(2500, Math.max(600, deadline - Date.now())),
+				isCancelled: () => this.checkCancelled(),
+			});
+			this.gridBudgetMs -= Date.now() - t0;
+			if (!res.ok || !res.prims.length) {
+				// 网格无解的边（LCD 排：洁净板网格无解、可视图独走可解）——
+				// 意向路由回退独走路径（同「洁净世界」口径，跨网重叠清判结算）
+				const soft = this.dynamicObstacles;
+				const solo = await this.soloEdgeCrossing(src, dst, net.name, soft);
+				if (!solo) continue;
+				const rds = this.netRendered.get(net.name) ?? [];
+				rds.push(...solo.prims);
+				this.netRendered.set(net.name, rds);
+				this.addRenderedToObstacles(solo.prims);
+				this.plannedVias.push(...solo.vias);
+				for (const v of solo.vias) {
+					this.dynamicObstacles.push({
+						id: `via${this.obstacleIdCounter++}`, kind: 'circle', x: v.x, y: v.y,
+						r: v.dia / 2 + Math.max(this.drc.trackToTrackMil, this.drc.trackToPadMil) + this.drc.traceWidthMil / 2 + VIA_WALL_EXTRA,
+						net: net.name, layer: undefined, group: `via:${net.name}:${v.x},${v.y}`, noPrune: true,
+					});
+				}
+				done.add(edgeKey(si, di));
+				anyCommitted = true;
+				for (const c of solo.crossed) hist.set(c, (hist.get(c) ?? 0) + 0.5);
+				continue;
+			}
+			// 软提交：跨网重叠放行；焊盘净距与同网孔距仍是绝对口径
+			const viaDia = Math.max(24, this.drc.traceWidthMil * 2);
+			const viaHole = Math.max(12, this.drc.traceWidthMil);
+			const needVV = viaHole + (this.drc.holeToHoleMil ?? 12) + 0.2;
+			const newVias: PlannedVia[] = [];
+			let viaOk = true;
+			for (const v of res.vias) {
+				if (!this.viaPadClear(v.x, v.y, viaDia / 2, net.name)) { viaOk = false; break; }
+				for (const w of [...this.plannedVias.filter(x => x.net === net.name), ...newVias]) {
+					if (Math.hypot(w.x - v.x, w.y - v.y) < needVV) { viaOk = false; break; }
+				}
+				if (!viaOk) break;
+				newVias.push({ net: net.name, x: v.x, y: v.y, dia: viaDia, hole: viaHole });
+			}
+			if (!viaOk) continue;
+			const prims: RenderedPrim[] = res.prims.map(p => p.kind === 'line'
+				? { kind: 'line' as const, net: net.name, layer: p.layer, x1: p.x1, y1: p.y1, x2: p.x2, y2: p.y2 }
+				: { kind: 'arc' as const, net: net.name, layer: p.layer, cx: p.cx, cy: p.cy, r: p.r, startAngle: p.startAngle, sweep: p.sweep });
+			const rds = this.netRendered.get(net.name) ?? [];
+			rds.push(...prims);
+			this.netRendered.set(net.name, rds);
+			this.addRenderedToObstacles(prims);
+			this.plannedVias.push(...newVias);
+			for (const v of newVias) {
+				this.dynamicObstacles.push({
+					id: `via${this.obstacleIdCounter++}`, kind: 'circle', x: v.x, y: v.y,
+					r: v.dia / 2 + Math.max(this.drc.trackToTrackMil, this.drc.trackToPadMil) + this.drc.traceWidthMil / 2 + VIA_WALL_EXTRA,
+					net: net.name, layer: undefined, group: `via:${net.name}:${v.x},${v.y}`, noPrune: true,
+				});
+			}
+			done.add(edgeKey(si, di));
+			anyCommitted = true;
+			// 历史罚分：被本路径压到的网（含过孔落点）下轮更想绕开
+			for (const c of res.crossed ?? []) hist.set(c, (hist.get(c) ?? 0) + 0.5);
+		}
+		this.routedEdges.set(net.name, done);
+		this.pfTentative.add(net.name);
+		return anyCommitted;
+	}
+
+	/** 跨网铜皮搭接检测（清判用）：本网任一图元与**已合法世界**的铜皮重叠即为脏 */
+	private pfOverlapsOther(name: string, legalNets: Set<string>): boolean {
+		const w = this.drc.traceWidthMil;
+		const mine = this.netRendered.get(name) ?? [];
+		const myVias = this.plannedVias.filter(v => v.net === name);
+		for (const other of legalNets) {
+			if (other === name) continue;
+			const op = this.netRendered.get(other) ?? [];
+			if (!op.length) continue;
+			const ov = this.plannedVias.filter(v => v.net === other);
+			for (const p of mine) {
+				if (p.kind !== 'line') continue;
+				const pminx = Math.min(p.x1!, p.x2!) - w, pmaxx = Math.max(p.x1!, p.x2!) + w;
+				const pminy = Math.min(p.y1!, p.y2!) - w, pmaxy = Math.max(p.y1!, p.y2!) + w;
+				const midX = (p.x1! + p.x2!) / 2, midY = (p.y1! + p.y2!) / 2;
+				for (const q of op) {
+					if (q.kind !== 'line' || q.layer !== p.layer) continue;
+					if (pmaxx < Math.min(q.x1!, q.x2!) || pminx > Math.max(q.x1!, q.x2!)) continue;
+					if (pmaxy < Math.min(q.y1!, q.y2!) || pminy > Math.max(q.y1!, q.y2!)) continue;
+					if (pointSegDist(midX, midY, q.x1!, q.y1!, q.x2!, q.y2!) <= w) return true;
+					if (pointSegDist(p.x1!, p.y1!, q.x1!, q.y1!, q.x2!, q.y2!) <= w) return true;
+					if (pointSegDist(p.x2!, p.y2!, q.x1!, q.y1!, q.x2!, q.y2!) <= w) return true;
+				}
+				for (const v of ov) {
+					if (v.x < pminx || v.x > pmaxx || v.y < pminy || v.y > pmaxy) continue;
+					if (Math.hypot(v.x - midX, v.y - midY) <= (v.dia || 24) / 2 + w / 2) return true;
+					if (Math.hypot(v.x - p.x1!, v.y - p.y1!) <= (v.dia || 24) / 2 + w / 2) return true;
+					if (Math.hypot(v.x - p.x2!, v.y - p.y2!) <= (v.dia || 24) / 2 + w / 2) return true;
+				}
+			}
+			for (const v of myVias) {
+				for (const q of op) {
+					if (q.kind !== 'line') continue;
+					if (pointSegDist(v.x, v.y, q.x1!, q.y1!, q.x2!, q.y2!) <= (v.dia || 24) / 2 + w / 2) return true;
+				}
+			}
+		}
+		return false;
+	}
+
+	/**
+	 * PathFinder 相位：软提交意向 → 迭代（历史罚分驱动换位）→ 清判。
+	 * 清判按提交顺序贪心：与「已合法世界」无重叠的意向网转正；重叠网用
+	 * 标准严格口径重布一次，仍不行则拆除（回到失败网，残段语义）。
+	 */
+	private async pathfinderPhase(networks: Array<{ name: string; pads: EnginePad[] }>, deadline: number): Promise<void> {
+		const iters = Number((globalThis as any).__RB_PF_ITERS__) || 6;
+		const hist = new Map<string, number>();
+		this.gridBudgetMs = Math.max(this.gridBudgetMs, 45_000);
+		for (let it = 0; it < iters; it++) {
+			if (this.checkCancelled() || Date.now() > deadline) break;
+			const pending = networks.filter(n => !this.routedOrder.includes(n.name) && !this.pfTentative.has(n.name))
+				.sort((a, b) => this.netPendingEdges(a) - this.netPendingEdges(b) || (a.name < b.name ? -1 : 1));
+			let committed = 0;
+			for (const net of pending) {
+				if (this.checkCancelled() || Date.now() > deadline) break;
+				if (await this.pfTentativeRoute(net, hist, deadline)) committed++;
+			}
+			// 重迭代：已意向但与合法世界重叠的网，撕掉自己的意向路径重找
+			//（历史罚分已随每轮压越累乘 —— PathFinder 的收敛动力就在这，
+			// 只提交一轮就清判等于把重叠态全判死刑，实测 6 提交只活 1）
+			let rerouted = 0;
+			const legal = new Set<string>(this.routedOrder);
+			for (const name of [...this.pfTentative]) {
+				if (this.checkCancelled() || Date.now() > deadline) break;
+				const net = networks.find(n => n.name === name);
+				if (!net) continue;
+				const complete = (this.computeMST(net.pads)).every(([si, di]) =>
+					(this.routedEdges.get(name) ?? new Set()).has(`${net.pads[si].id}->${net.pads[di].id}`));
+				if (!complete) continue;
+				if (!this.pfOverlapsOther(name, legal)) continue;
+				this.ripupNetInternal(name, true);
+				if (await this.pfTentativeRoute(net, hist, deadline)) rerouted++;
+			}
+			this.log(`PathFinder 第 ${it + 1} 轮：新提交 ${committed}，重叠重找 ${rerouted}（tentative ${this.pfTentative.size}）`, 'info');
+			// 让位重布：被意向路径压得最狠的合法网尝试搬家（严格口径，失败
+			// 即恢复快照 —— 合法网绝不净损失）。搬走后走廊腾出，下一轮意向
+			// 重找就能干净通过 —— 这是收敛的最后一股力：只让失败网自己换道，
+			// 占走廊的合法网永远不动，墙就永远在。
+			const contested = [...hist.entries()].filter(([n, h]) => h > 0 && this.routedOrder.includes(n))
+				.sort((a, b) => b[1] - a[1]).slice(0, 3);
+			for (const [nm] of contested) {
+				if (this.checkCancelled() || Date.now() > deadline - 5_000) break;
+				const net = networks.find(n => n.name === nm);
+				if (!net) continue;
+				const snap = this.snapshotNets([nm]);
+				const savedOrder = [...this.routedOrder];
+				this.ripupNetInternal(nm, true);
+				if (await this.routeNetEdges(net, 'full', Math.min(deadline, Date.now() + 5_000))) {
+					this.log(`[pf] ${nm} 让位重布成功（历史罚分 ${(hist.get(nm) ?? 0).toFixed(1)}）`, 'info');
+					hist.delete(nm);
+				} else {
+					this.restoreNets(snap, savedOrder, networks);
+				}
+			}
+			if (!committed && !rerouted) break;
+		}
+		// ── 清判 ──
+		const legal = new Set<string>(this.routedOrder);
+		let promoted = 0, rerouted = 0, demoted = 0;
+		for (const name of [...this.pfTentative]) {
+			if (this.checkCancelled() || Date.now() > this.planDeadline - 5_000) break;
+			const net = networks.find(n => n.name === name);
+			if (!net) continue;
+			const complete = (this.computeMST(net.pads)).every(([si, di]) =>
+				(this.routedEdges.get(name) ?? new Set()).has(`${net.pads[si].id}->${net.pads[di].id}`));
+			if (!complete || (this.netRendered.get(name) ?? []).length === 0) {
+				this.ripupNetInternal(name, true);
+				this.pfTentative.delete(name);
+				demoted++;
+				continue;
+			}
+			// 转正必须过**严格提交口径**：意向路径在松弛世界求出，其过孔/间距
+			// 可能不满足 EDA 真实要求（实测软过孔 15mil 间距 < 23.08 → 终检拆
+			// 孔断网，转正 2 网全军覆没）。铜皮重叠容差 ≤w 也远松于 EDA 的
+			// w+trackToTrack=15.98 —— 一律按严格口径复核，不过走标准重布。
+			const routedSet = new Set(this.routedOrder);
+			const strictObs = this.dynamicObstacles.filter(o => !o.net || routedSet.has(o.net));
+			const strictPrims = mergePrims(this.netRendered.get(name) ?? []);
+			const strictVias = this.plannedVias.filter(v => v.net === name);
+			const viaDiaS = Math.max(24, this.drc.traceWidthMil * 2);
+			let strictOK = this.primsClearOfDynamic(strictPrims, name, strictObs);
+			if (strictOK) {
+				for (const v of strictVias) {
+					if (!this.viaPadClear(v.x, v.y, v.dia / 2, name) ||
+						!this.viaObstacleClear(v.x, v.y, strictObs, v.dia / 2, name)) { strictOK = false; break; }
+				}
+			}
+			if (strictOK) {
+				if (!this.routedOrder.includes(name)) this.routedOrder.push(name);
+				legal.add(name);
+				promoted++;
+				continue;
+			}
+			// 重叠/不达标：标准严格口径重布一次（撕掉自己的意向路径）
+			this.ripupNetInternal(name, true);
+			this.pfTentative.delete(name);
+			if (await this.routeNetEdges(net, 'full', Math.min(this.planDeadline - 5_000, Date.now() + 5_000))) {
+				legal.add(name);
+				rerouted++;
+			} else {
+				demoted++;
+			}
+		}
+		this.pfTentative.clear();
+		this.log(`PathFinder 清判：转正 ${promoted}，重布 ${rerouted}，拆除 ${demoted}`, promoted || rerouted ? 'success' : 'info');
 	}
 
 	/**

@@ -346,11 +346,11 @@ export class TopologicalRouter {
 					netlessAdded++;
 					continue;
 				}
-				// **有网焊盘补漏**：getAllPrimitivesByNet 在文档忙时会瞬时返回**部分**
-				// 列表（只重试空列表拦不住）—— 漏掉的焊盘对路由器隐形，MST 按
-				// 少一个 pad 的拓扑布线，画布上 pad 悬空（EDA 判 Connection Error，
-				// case9 P02 的 e189e13 实测）。全局枚举是原子快照，用它对账补齐。
-				if (seenNetted.has(key)) continue;
+				// 有网焊盘不做全局枚举补漏：两个枚举源的位置字段/精度不同，
+				// toFixed(2) key 对不齐时会加入**重复焊盘**（case12 实测
+				// 73→69）。P02 的 pad 丢失已证伪为采集问题（采集期三 pad
+				// 齐全），真凶在布线后的几何改写，由终审兜底。
+				if (seenNetted.has(key) || net) continue;
 				seenNetted.add(key);
 				const padShape2 = Array.isArray(p.pad) ? p.pad : [];
 				let w2 = padShape2.length >= 3 ? (padShape2[1] ?? 0) : 0;
