@@ -992,7 +992,11 @@ export class PlanningEngine {
 		if ((globalThis as any).__RB_PF__ && !this.checkCancelled() &&
 			networks.some(n => !this.routedOrder.includes(n.name)) && Date.now() < deadline - 25_000) {
 			this.pfTentative.clear();
-			await this.pathfinderPhase(networks, deadline - 25_000);
+			if ((globalThis as any).__RB_PF_ZONE__) {
+				await this.pfZonePhase(networks, deadline - 25_000);
+			} else {
+				await this.pathfinderPhase(networks, deadline - 25_000);
+			}
 			__phase('PathFinder');
 		}
 		// 实验：主连通阶段被限流后，把一部分尾部时间明确分配给最终优化
@@ -4050,6 +4054,113 @@ export class PlanningEngine {
 		}
 		this.pfTentative.clear();
 		this.log(`PathFinder 清判：合法保持 ${keptLegal}，恢复原状 ${restoredLegal}，转正 ${promoted}，重布 ${rerouted}，拆除 ${demoted}`, promoted || rerouted ? 'success' : 'info');
+	}
+
+	/**
+	 * 冲突区限定版 PathFinder（__RB_PF_ZONE__=N 时替代全量版）：
+	 * 只让「pending 网 + 被它们压到的合法网」进战区（cap N，实测 ~10-14 网），
+	 * 战区内全网每轮重布（收敛力完整），区外冻结为合法背景。每轮成本
+	 * 10-14s（对比全量版 40s）—— 4-5 轮装进 80s 窗口，结构性超支的解法。
+	 * 原合法战区网有快照兜底：清判不达标恢复原状，相位绝不净损失。
+	 */
+	private async pfZonePhase(networks: Array<{ name: string; pads: EnginePad[] }>, deadline: number): Promise<void> {
+		const iters = Number((globalThis as any).__RB_PF_ITERS__) || 5;
+		const zoneCap = Number((globalThis as any).__RB_PF_ZONE__) || 14;
+		const hist = new Map<string, number>();
+		this.gridBudgetMs = Math.max(this.gridBudgetMs, 45_000);
+		const pending0 = networks.filter(n => !this.routedOrder.includes(n.name) && this.allPads.filter(p => p.net === n.name).length > 1)
+			.sort((a, b) => this.netPendingEdges(a) - this.netPendingEdges(b) || (a.name < b.name ? -1 : 1));
+		if (!pending0.length) return;
+		// 第 0 轮：只布 pending（软提交），用压越记录选出战区合法网
+		this.pfTentative.clear();
+		for (const net of pending0) {
+			if (this.checkCancelled() || Date.now() > deadline) break;
+			await this.pfTentativeRoute(net, hist, deadline);
+		}
+		const crossedLegal = [...hist.entries()].filter(([n]) => this.routedOrder.includes(n))
+			.sort((a, b) => b[1] - a[1]).slice(0, Math.max(4, zoneCap - pending0.length)).map(([n]) => n);
+		const zone = new Set<string>([...pending0.map(n => n.name), ...crossedLegal]);
+		const zoneLegalNames = crossedLegal.filter(n => this.routedOrder.includes(n));
+		const zoneSnap = this.snapshotNets(zoneLegalNames);
+		const savedOrder = [...this.routedOrder];
+		this.log(`[pf-zone] 战区 ${zone.size} 网（pending ${pending0.length} + 被压合法 ${crossedLegal.length}）：${[...zone].join(', ')}`, 'info');
+		// 迭代：战区全网重布（pending 优先，其后按历史罚分）
+		for (let it = 0; it < iters; it++) {
+			if (this.checkCancelled() || Date.now() > deadline) break;
+			const order = [...zone].map(n => networks.find(x => x.name === n)).filter((x): x is { name: string; pads: EnginePad[] } => !!x)
+				.sort((a, b) => {
+					const pa = this.routedOrder.includes(a.name) ? 1 : 0;
+					const pb = this.routedOrder.includes(b.name) ? 1 : 0;
+					return pa - pb || (hist.get(b.name) ?? 0) - (hist.get(a.name) ?? 0) ||
+						this.netPendingEdges(a) - this.netPendingEdges(b) || (a.name < b.name ? -1 : 1);
+				});
+			let moved = 0;
+			for (const net of order) {
+				if (this.checkCancelled() || Date.now() > deadline) break;
+				this.ripupNetInternal(net.name, true);
+				if (await this.pfTentativeRoute(net, hist, deadline)) moved++;
+			}
+			this.log(`PathFinder(zone) 第 ${it + 1} 轮：战区重布 ${moved}/${zone.size}`, 'info');
+		}
+		// 清判：冻结世界自动合法；战区网按「原合法优先」贪心严格结算
+		const legal = new Set<string>(this.routedOrder.filter(n => !zone.has(n)));
+		let kept = 0, restored = 0, promoted = 0, rerouted = 0, demoted = 0;
+		const settleOne = async (name: string, snapshot?: Map<string, { prims: RenderedPrim[]; vias: PlannedVia[]; doneEdges: Set<string> }>): Promise<void> => {
+			if (this.checkCancelled() || Date.now() > this.planDeadline - 5_000) { legal.add(name); return; }
+			const net = networks.find(n => n.name === name);
+			if (!net) { legal.add(name); return; }
+			const prims = this.netRendered.get(name) ?? [];
+			const vias = this.plannedVias.filter(v => v.net === name);
+			const complete = (this.computeMST(net.pads)).every(([si, di]) =>
+				(this.routedEdges.get(name) ?? new Set()).has(`${net.pads[si].id}->${net.pads[di].id}`));
+			const routedSet = new Set(legal);
+			const strictObs = this.dynamicObstacles.filter(o => !o.net || routedSet.has(o.net));
+			let ok = complete && prims.length > 0 && this.primsClearOfDynamic(mergePrims(prims), name, strictObs);
+			if (ok) {
+				for (const v of vias) {
+					if (!this.viaPadClear(v.x, v.y, v.dia / 2, name) ||
+						!this.viaObstacleClear(v.x, v.y, strictObs, v.dia / 2, name)) { ok = false; break; }
+				}
+			}
+			if (!ok) {
+				this.ripupNetInternal(name, true);
+				ok = await this.routeNetEdges(net, 'full', Math.min(this.planDeadline - 5_000, Date.now() + 4_000));
+			}
+			if (!ok && snapshot) {
+				// 原合法战区网：恢复快照原状（走廊优先权，绝不净损失）
+				this.ripupNetInternal(name, true);
+				const sv = snapshot.get(name);
+				if (sv && sv.prims.length) {
+					this.netRendered.set(name, [...sv.prims]);
+					this.addRenderedToObstacles(mergePrims(sv.prims));
+				}
+				this.routedEdges.set(name, new Set(sv?.doneEdges ?? []));
+				this.plannedVias = this.plannedVias.filter(v => v.net !== name).concat(sv?.vias ?? []);
+				for (const v of (sv?.vias ?? [])) {
+					this.dynamicObstacles.push({
+						id: `via${this.obstacleIdCounter++}`, kind: 'circle', x: v.x, y: v.y,
+						r: v.dia / 2 + Math.max(this.drc.trackToTrackMil, this.drc.trackToPadMil) + this.drc.traceWidthMil / 2 + VIA_WALL_EXTRA,
+						net: name, layer: undefined, group: `via:${name}:${v.x},${v.y}`, noPrune: true,
+					});
+				}
+				ok = true;
+				restored++;
+			}
+			if (ok) {
+				if (!this.routedOrder.includes(name)) this.routedOrder.push(name);
+				legal.add(name);
+				if (snapshot) kept++; else promoted++;
+			} else {
+				demoted++;
+			}
+		};
+		for (const name of zoneLegalNames) await settleOne(name, zoneSnap);
+		for (const name of [...this.pfTentative]) {
+			if (legal.has(name)) continue;
+			await settleOne(name);
+		}
+		this.pfTentative.clear();
+		this.log(`PathFinder(zone) 清判：合法保持 ${kept}，恢复 ${restored}，转正 ${promoted}，重布 ${rerouted}，拆除 ${demoted}`, promoted || rerouted ? 'success' : 'info');
 	}
 
 	/**
