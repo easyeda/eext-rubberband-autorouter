@@ -3652,7 +3652,10 @@ export class PlanningEngine {
 			const routed = this.routedOrder.includes(n);
 			// 已布通网拆了要重布（代价随焊盘数涨）；残段网本来就是失败网，便宜
 			const base = routed ? 70 + 12 * (padCount.get(n) ?? 4) : 25;
-			return base * (1 + (hist.get(n) ?? 0));
+			// 历史平方放大（真实 PathFinder 的 h² 项）：线性 hist 的梯度不足以
+			// 在容量受限区逼出「每网独占车道」的分配 —— 12 轮零转正的教训
+			const h = hist.get(n) ?? 0;
+			return base * (1 + h) * (1 + h * 0.5);
 		};
 		const layers = this.hasBottomLayer ? [1, 2] : [1];
 		const gridCell = Number((globalThis as any).__RB_GRID_CELL__) || 4;
@@ -3803,7 +3806,11 @@ export class PlanningEngine {
 		if (!missing.length) return true;
 		const gridCell = Number((globalThis as any).__RB_GRID_CELL__) || 4;
 		const layers = this.hasBottomLayer ? [1, 2] : [1];
-		const penaltyOf = (n: string): number => (40 + 8 * (this.allPads.filter(p => p.net === n).length)) * (1 + (hist.get(n) ?? 0));
+		// 历史平方放大（与协商罚分同款）：逼惯犯走廊让位的梯度
+		const penaltyOf = (n: string): number => {
+			const h = hist.get(n) ?? 0;
+			return (40 + 8 * (this.allPads.filter(p => p.net === n).length)) * (1 + h) * (1 + h * 0.5);
+		};
 		let anyCommitted = false;
 		for (const [si, di] of missing) {
 			if (this.checkCancelled() || Date.now() > deadline) break;
