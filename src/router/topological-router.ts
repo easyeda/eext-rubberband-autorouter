@@ -928,6 +928,7 @@ export class TopologicalRouter {
 					const sub = await this.route({
 						...options,
 						engine: 'rrouter',
+						hybridDelegate: false,   // 修复阶段不再回委托 BETA API（刚被它坑过）
 						excludeNets: [...excluded, ...routedAcc],
 					});
 					return {
