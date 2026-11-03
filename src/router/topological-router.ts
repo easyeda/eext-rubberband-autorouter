@@ -712,12 +712,12 @@ export class TopologicalRouter {
 					} catch { /* 清理失败不阻断 */ }
 				}
 				const t0 = Date.now();
-				// engine 属性透传（BETA API 的引擎选择；客户端不识别时静默忽略）
+				// 引擎映射：JRouter = COMPLETION(1) 布通率优先；HRouter = FASTER(0) 速度优先
+				// （EPCB_AutoRoutingOptimization；BETA API 不接受未文档化的 engine 属性）
 				const dr = await eda.pcb_Document.autoRouting({
 					RoutingNets: networks.map(n => n.name),
 					ignoreNets: [...excluded],
-					optimization: 1,   // COMPLETION：布通率优先
-					engine: options.engine,
+					optimization: options.engine === 'hrouter' ? 0 : 1,
 				} as never);
 				const dur = Date.now() - t0;
 				this.onLog?.(`${engineLabel} 委托完成：成功 ${dr.successNetsCount}/${dr.totalNetsCount}（${Math.round(dur / 1000)}s），未解 ${(dr.failedNets ?? []).length}`, dr.successNetsCount ? 'success' : 'warn');
