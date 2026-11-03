@@ -99,7 +99,7 @@ npm run build
 | **JRouter** | EDA 内置 | 密排连接器板，布通率优先 | 调用内置自动布线 API，完成后插件自动做拉紧 + 圆润优化 |
 | **HRouter** | EDA 内置 | 追求布线速度 | 内置引擎速度优先（FASTER）→ 插件后处理拉紧圆润 |
 
-- 选择 JRouter / HRouter 时，仅适用于 RRouter 的参数（走线宽度、网络排序、撕毁重布、实时预览、凸包优化、过孔兜底、混合模式、整机委托）会自动隐藏——内置引擎使用自身规则
+- 选择 JRouter / HRouter 时，仅适用于 RRouter 的参数（走线宽度、网络排序、撕毁重布、实时预览、凸包优化、过孔兜底）会自动隐藏——内置引擎使用自身规则
 - RRouter 布通率偏低（<85%）时，日志会建议切换到 JRouter / HRouter
 - J/H 引擎的走线写入画布后，插件会对结果做橡皮筋拉紧与切线圆角，再刷新画布
 
@@ -117,8 +117,6 @@ npm run build
 | 实时预览 | 开 | **仅 RRouter**。每布完一个网络立即写画布；关闭后规划完统一写入，界面更流畅。 |
 | 最后凸包优化 | 开 | **仅 RRouter**。先保证连通，再逐网重求最短路，只有更短才替换。 |
 | 过孔换层兜底 | 开 | **仅 RRouter**。同层绕不过去时自动打孔换层；关闭底层后自动失效。 |
-| 混合模式 | 关 | **仅 RRouter**。引擎结束后把失败网委托给内置路由器（BETA API，单网耗时不可控，7 网实测 ~7 分钟）。 |
-| 整机委托 | 关 | **仅 RRouter**。跳过本引擎，直接用内置路由器布全部网络。 |
 | 布线层 | 顶层 + 底层 | 按当前 PCB 实际可用铜层生成；顶层固定启用，单面板自动禁用底层。 |
 | 排除网络 / 地网络 | 默认排除 GND | 勾掉不参与布线的网络（保持画布现状，焊盘与走线仍作为障碍）。地网络默认不参与布线。 |
 
@@ -364,7 +362,7 @@ Pick an engine at the **top** of the parameter panel; hover the "?" icon for des
 | **JRouter** | EasyEDA built-in | Dense connector boards, completion-rate first | Calls the built-in auto-router API, then the extension applies tautening + smoothing |
 | **HRouter** | EasyEDA built-in | Speed-first routing | Built-in engine with FASTER optimization → extension post-processing |
 
-- When JRouter/HRouter is selected, RRouter-only parameters (trace width, net ordering, rip-up rounds, live preview, final optimization, via fallback, hybrid delegate, delegate-all) are hidden — built-in engines use their own rules
+- When JRouter/HRouter is selected, RRouter-only parameters (trace width, net ordering, rip-up rounds, live preview, final optimization, via fallback) are hidden — built-in engines use their own rules
 - If RRouter completion drops below 85%, the log suggests switching to JRouter/HRouter
 - Built-in engine results are written to the canvas first, then tautened/smoothed by the extension, then refreshed
 
@@ -382,8 +380,6 @@ Pick an engine at the **top** of the parameter panel; hover the "?" icon for des
 | Live preview | On | **RRouter only**. Write each net to the canvas as soon as it is solved. |
 | Final optimization | On | **RRouter only**. After connectivity, re-solve each net; keep only shorter results. |
 | Via layer fallback | On | **RRouter only**. Switch layers when a net cannot route on one layer. |
-| Hybrid delegate | Off | **RRouter only**. Delegate leftover failed nets to the built-in router after the engine finishes (BETA API, per-net latency unbounded). |
-| Delegate all | Off | **RRouter only**. Skip the own engine entirely and hand all nets to the built-in router. |
 | Routing layers | Top + Bottom | Based on the board's available copper layers; single-sided boards disable bottom automatically. |
 | Excluded nets / ground | GND excluded by default | Unchecked nets keep their current state and act as obstacles. Ground nets are excluded by default. |
 

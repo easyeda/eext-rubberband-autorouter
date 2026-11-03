@@ -526,26 +526,6 @@
 						<label class="switch"><input type="checkbox" id="excludeGnd" checked><span></span></label>
 					</div>
 				</div>
-
-				<div class="row rrouter-only">
-					<div class="label">
-						<span>混合模式：失败网委托内置路由器</span>
-						<small>引擎结��后用内置自动布线器处理残留网（耗时不可控）</small>
-					</div>
-					<div class="control">
-						<label class="switch"><input type="checkbox" id="hybridDelegate"><span></span></label>
-					</div>
-				</div>
-
-				<div class="row rrouter-only">
-					<div class="label">
-						<span>整机委托内置路由器</span>
-						<small>跳过本引擎，全部网络交给内置路由器（密压板实测更强）</small>
-					</div>
-					<div class="control">
-						<label class="switch"><input type="checkbox" id="delegateAll"><span></span></label>
-					</div>
-				</div>
 			</section>
 		</div>
 
@@ -618,8 +598,6 @@
 			routeLayers: [1, 2],
 			excludeNets: [],
 			excludeGnd: true,
-			hybridDelegate: false,
-			delegateAll: false,
 			netOrder: 'auto'
 		};
 		var defaults = Object.assign({}, DEFAULTS);
@@ -815,8 +793,6 @@
 			$('finalOptimize').checked = o.finalOptimize !== false;
 			$('viaFallback').checked = o.viaFallback !== false;
 			$('excludeGnd').checked = o.excludeGnd !== false;
-			$('hybridDelegate').checked = o.hybridDelegate === true;
-			$('delegateAll').checked = o.delegateAll === true;
 			var engRadio = document.querySelector('input[name="engine"][value="' + (o.engine || 'rrouter') + '"]')
 				|| document.querySelector('input[name="engine"][value="rrouter"]');
 			if (engRadio) engRadio.checked = true;
@@ -848,8 +824,6 @@
 				livePreview: $('livePreview').checked,
 				finalOptimize: $('finalOptimize').checked,
 				viaFallback: $('viaFallback').checked,
-				hybridDelegate: $('hybridDelegate').checked,
-				delegateAll: $('delegateAll').checked,
 				routeLayers: layers,
 				// 没有网络清单时不要误排除任何网络
 				excludeNets: netRows.length
