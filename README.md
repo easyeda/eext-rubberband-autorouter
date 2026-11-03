@@ -97,7 +97,7 @@ npm run build
 |------|------|----------|------|
 | **RRouter**（默认） | 插件自带 | 常规板，追求走线形态 | 拓扑橡皮筋引擎，边布线边圆润，支持全部参数 |
 | **JRouter** | EDA 内置 | 密排连接器板，布通率优先 | 调用内置自动布线 API，完成后插件自动做拉紧 + 圆润优化 |
-| **HRouter** | EDA 内置 | JRouter 的备选策略 | 同 JRouter：内置引擎布线 → 插件后处理 |
+| **HRouter** | EDA 内置 | 追求布线速度 | 内置引擎速度优先（FASTER）→ 插件后处理拉紧圆润 |
 
 - 选择 JRouter / HRouter 时，仅适用于 RRouter 的参数（走线宽度、网络排序、撕毁重布、实时预览、凸包优化、过孔兜底、混合模式、整机委托）会自动隐藏——内置引擎使用自身规则
 - RRouter 布通率偏低（<85%）时，日志会建议切换到 JRouter / HRouter
@@ -362,7 +362,7 @@ Pick an engine at the **top** of the parameter panel; hover the "?" icon for des
 |--------|--------|----------|----------|
 | **RRouter** (default) | Extension | Typical boards, best trace aesthetics | Topological rubberband engine, routes and smooths live, all parameters available |
 | **JRouter** | EasyEDA built-in | Dense connector boards, completion-rate first | Calls the built-in auto-router API, then the extension applies tautening + smoothing |
-| **HRouter** | EasyEDA built-in | Alternative built-in strategy | Same pipeline as JRouter |
+| **HRouter** | EasyEDA built-in | Speed-first routing | Built-in engine with FASTER optimization → extension post-processing |
 
 - When JRouter/HRouter is selected, RRouter-only parameters (trace width, net ordering, rip-up rounds, live preview, final optimization, via fallback, hybrid delegate, delegate-all) are hidden — built-in engines use their own rules
 - If RRouter completion drops below 85%, the log suggests switching to JRouter/HRouter
