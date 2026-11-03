@@ -699,6 +699,55 @@ export class TopologicalRouter {
 			}
 			if (networks.length === 0) throw new Error('所有网络都被排除，没有可布线的网络');
 
+			// **整机委托模式**（delegateAll）：清理后直接调内置自动布线器处理
+			// 全部待布网络。内置路由器（WASM）在密排板上实测远强于本引擎
+			//（case12：内置 120s 除 GND 全通 vs 本引擎 71-73/98）。本引擎继续
+			// 负责：GND/排除网口径、既有走线清理、DRC 验证与统计上报。
+			if (options.delegateAll === true) {
+				this.onProgress?.({ stage: '委托内置路由器', percentage: 20, message: `内置路由器处理 ${networks.length} 个网络...` });
+				if (options.clearExistingTraces !== false) {
+					await this.clearExistingTraces(networks.map(n => n.name));
+				}
+				const t0 = Date.now();
+				const dr = await eda.pcb_Document.autoRouting({
+					RoutingNets: networks.map(n => n.name),
+					ignoreNets: [...excluded],
+				});
+				const dur = Date.now() - t0;
+				this.onLog?.(`整机委托完成：成功 ${dr.successNetsCount}/${dr.totalNetsCount}（${Math.round(dur / 1000)}s），未解 ${(dr.failedNets ?? []).length}`, dr.successNetsCount ? 'success' : 'warn');
+				// DRC 复核（与引擎路径同口径的上报）
+				this.routedNames = new Set(networks.map(n => n.name).filter(n => !(dr.failedNets ?? []).includes(n)));
+				this.failedNames = new Set(dr.failedNets ?? []);
+				this.totalNets = networks.length;
+				try {
+					const drcRes = await eda.pcb_Drc.check(true, false, true);
+					const connErrNets = new Set<string>();
+					const walk = (node: any): void => {
+						if (!node) return;
+						if (Array.isArray(node)) { node.forEach(walk); return; }
+						if (node.errorType === 'Connection Error' && node.net && this.routedNames.has(node.net)) connErrNets.add(node.net);
+						if (node.list) walk(node.list);
+					};
+					walk(drcRes);
+					if (connErrNets.size) {
+						this.onLog?.(`DRC 复核：${connErrNets.size} 个「已布」网仍有 Connection Error（内置成功语义宽于全连通）：${[...connErrNets].slice(0, 8).join(', ')}`, 'warn');
+						for (const nm of connErrNets) {
+							this.routedNames.delete(nm);
+							this.failedNames.add(nm);
+						}
+					}
+				} catch { /* DRC 复核失败不阻断 */ }
+				this.emitStats();
+				const stats = this.snapshotStats();
+				this.onProgress?.({ stage: '完成', percentage: 100, message: '委托布线完成' });
+				return {
+					...stats,
+					cancelled: this.shouldCancel,
+					failed: [...this.failedNames],
+					logs: [],
+				} as never;
+			}
+
 			// 清掉本轮要布的网络在画布上的既有走线/过孔（含上一次会话留下的）。
 			// 否则它们会被 collectStaticObstacles 当成永久静态铜：每个焊盘旁都在
 			// 相邻网络的旧线 → 新布线自堵，整板 0 布通（2026-10-24 实测
