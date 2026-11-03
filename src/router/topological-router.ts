@@ -713,28 +713,52 @@ export class TopologicalRouter {
 				}
 				const t0 = Date.now();
 				// 引擎映射：JRouter = COMPLETION(1) 布通率优先；HRouter = FASTER(0) 速度优先
-				// （EPCB_AutoRoutingOptimization；BETA API 不接受未文档化的 engine 属性）
-				// BETA API 对大清单不稳定：实测同一批网一次挂起 >900s、一次秒回 undefined
-				//（63 网全量）。undefined 时等 2s 重试一次，仍失败则报错退出而不是崩溃。
-				const callAutoRouting = (): Promise<unknown> => eda.pcb_Document.autoRouting({
-					RoutingNets: networks.map(n => n.name),
-					ignoreNets: [...excluded],
-					optimization: options.engine === 'hrouter' ? 0 : 1,
-				} as never);
-				let dr: any = await callAutoRouting();
-				if (!dr || typeof dr !== 'object') {
-					this.onLog?.(`${engineLabel} 首次调用未返回结果（BETA API 大清单已知问题），2s 后重试一次...`, 'warn');
-					await new Promise<void>(r => setTimeout(r, 2000));
-					dr = await callAutoRouting();
-				}
-				if (!dr || typeof dr !== 'object') {
-					throw new Error(`${engineLabel} 内置引擎未返回布线结果（autoRouting BETA API 不稳定），请改用 RRouter 或重试`);
+				//（EPCB_AutoRoutingOptimization；BETA API 不接受未文档化的 engine 属性）
+				// 拆批委托：BETA API 对大清单不稳定——63 网全量实测两次挂死 >25min（画布
+				// 零写入）、一次秒回 undefined；~7 网小批 445s 成功 6/7。每批 12 网，
+				// 先布批的走线成为后续批的画布障碍（批间自然衔接）。undefined 时等 2s
+				// 重试一次，仍失败则该批记失败并继续（不崩溃、不中断其余批）。
+				const allNames = networks.map(n => n.name);
+				const BATCH = 12;
+				const routedAcc = new Set<string>();
+				const failedAcc = new Set<string>();
+				for (let i = 0; i < allNames.length && !this.shouldCancel; i += BATCH) {
+					const chunk = allNames.slice(i, i + BATCH);
+					const others = allNames.filter(n => !chunk.includes(n));
+					const batchNo = Math.floor(i / BATCH) + 1;
+					const call = (): Promise<unknown> => eda.pcb_Document.autoRouting({
+						RoutingNets: chunk,
+						ignoreNets: [...excluded, ...others],
+						optimization: options.engine === 'hrouter' ? 0 : 1,
+					} as never);
+					let dr: any = await call();
+					if (!dr || typeof dr !== 'object') {
+						this.onLog?.(`${engineLabel} 批 ${batchNo} 未返回结果（BETA API 已知问题），2s 后重试...`, 'warn');
+						await new Promise<void>(r => setTimeout(r, 2000));
+						dr = await call();
+					}
+					if (!dr || typeof dr !== 'object') {
+						this.onLog?.(`${engineLabel} 批 ${batchNo} 仍未返回，${chunk.length} 网记为失败`, 'error');
+						for (const nm of chunk) failedAcc.add(nm);
+						continue;
+					}
+					const failedChunk = new Set<string>(dr.failedNets ?? []);
+					for (const nm of chunk) (failedChunk.has(nm) ? failedAcc : routedAcc).add(nm);
+					this.onLog?.(
+						`${engineLabel} 批 ${batchNo}/${Math.ceil(allNames.length / BATCH)} 完成：成功 ${chunk.length - failedChunk.size}/${chunk.length}（累计 ${Math.round((Date.now() - t0) / 1000)}s）`,
+						failedChunk.size < chunk.length ? 'success' : 'warn',
+					);
+					this.onProgress?.({
+						stage: '委托内置路由器',
+						percentage: 20 + Math.round(70 * Math.min(1, (i + BATCH) / allNames.length)),
+						message: `${engineLabel} 已处理 ${Math.min(i + BATCH, allNames.length)}/${allNames.length} 个网络...`,
+					});
 				}
 				const dur = Date.now() - t0;
-				this.onLog?.(`${engineLabel} 委托完成：成功 ${dr.successNetsCount}/${dr.totalNetsCount}（${Math.round(dur / 1000)}s），未解 ${(dr.failedNets ?? []).length}`, dr.successNetsCount ? 'success' : 'warn');
+				this.onLog?.(`${engineLabel} 委托完成：成功 ${routedAcc.size}/${allNames.length}（${Math.round(dur / 1000)}s），未解 ${failedAcc.size}`, routedAcc.size ? 'success' : 'warn');
 				// DRC 复核（与引擎路径同口径的上报）
-				this.routedNames = new Set(networks.map(n => n.name).filter(n => !(dr.failedNets ?? []).includes(n)));
-				this.failedNames = new Set(dr.failedNets ?? []);
+				this.routedNames = routedAcc;
+				this.failedNames = failedAcc;
 				this.totalNets = networks.length;
 				try {
 					const drcRes = await eda.pcb_Drc.check(true, false, true);
