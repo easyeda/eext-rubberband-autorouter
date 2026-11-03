@@ -3506,14 +3506,22 @@ export class PlanningEngine {
 		//（case9 实测：pending 网的让路集里只有已布网，冻结瞬间找不到互锁组，
 		// 但 ±几轮内同一批网反复互相挤位）—— 这批「乒乓惯犯」就是集群的另一极。
 		const swapHist = new Map<string, number>();
+		// 阶段级失败记录：round 2+ 让新鲜网优先（round 1 的失败网重试价值低）
+		const failedThisPhase = new Set<string>();
 		// 协商重布依赖网格优先链：抢救阶段可能已把网格池烧光，这里保底
 		this.gridBudgetMs = Math.max(this.gridBudgetMs, 60_000);
 		for (let it = 0; it < maxIter; it++) {
 			if (this.checkCancelled() || Date.now() > deadline) break;
 			const pending = networks.filter(n => !this.routedOrder.includes(n.name));
 			if (!pending.length) break;
-			// 易网先走：缺失边少的排前
-			pending.sort((a, b) => this.netPendingEdges(a) - this.netPendingEdges(b) || (a.name < b.name ? -1 : 1));
+			// 易网先走：缺失边少的排前；**本轮已失败过的网排到最后** ——
+			// 76/98 实测 round 1 用尽窗口后，round 2 的 30s 被「重试已知失败」
+			// 吃光，从未试的 12 个新鲜网永远轮不到。新鲜网转化率高于惯失败网。
+			pending.sort((a, b) => {
+				const fa = failedThisPhase.has(a.name) ? 1 : 0;
+				const fb = failedThisPhase.has(b.name) ? 1 : 0;
+				return fa - fb || this.netPendingEdges(a) - this.netPendingEdges(b) || (a.name < b.name ? -1 : 1);
+			});
 			const before = this.routedOrder.length;
 			let tried = 0, accepted = 0, swaps = 0;
 			// 让路集缓存（本轮内有效）：pairwise 尝试算过的直接复用，集群检测
@@ -3527,7 +3535,10 @@ export class PlanningEngine {
 				if (r) {
 					accepted++;
 					if (r === 2) swaps++;
+					failedThisPhase.delete(net.name);
 					ripCache.clear();
+				} else {
+					failedThisPhase.add(net.name);
 				}
 			}
 			// 成对协商无增益 → 升级集群协商：互为让路对象的失败网
