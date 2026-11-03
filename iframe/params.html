@@ -92,7 +92,8 @@
 		overflow: hidden;
 	}
 	.col { display: flex; flex-direction: column; gap: 9px; min-height: 0; min-width: 0; }
-	.col-left { overflow: hidden; padding-right: 2px; }
+	/* 左栏可滚动：引擎卡片 + RRouter 专属行会把底部「执行选项」顶出视口（overflow:hidden 会直接裁掉） */
+	.col-left { overflow-y: auto; padding-right: 2px; }
 	.col-left::-webkit-scrollbar, .net-list::-webkit-scrollbar { width: 7px; }
 	.col-left::-webkit-scrollbar-thumb, .net-list::-webkit-scrollbar-thumb {
 		background: var(--track); border-radius: 999px;

@@ -2,200 +2,248 @@
 
 # 橡皮筋自动布线
 
-基于拓扑橡皮筋算法的 PCB 自动布线工具，使用纯 JavaScript 实现，无需外部服务。
+基于拓扑橡皮筋算法的嘉立创 EDA 专业版 PCB 自动布线扩展：纯本地算法，无需外部服务，支持多引擎与自动拉紧圆润。
+
+**中文** · [English](#english)
+
+---
+
+## 目录
+
+**用户指南**
+
+- [特性](#特性)
+- [安装](#安装)
+- [快速开始](#快速开始)
+- [布线引擎选择](#布线引擎选择)
+- [参数说明](#参数说明)
+- [网络排序策略](#网络排序策略)
+- [常见问题](#常见问题)
+
+**开发者文档**
+
+- [核心算法](#核心算法)
+- [技术架构](#技术架构)
+- [核心模块](#核心模块)
+- [项目结构](#项目结构)
+- [构建与调试](#构建与调试)
+- [依赖](#依赖)
+- [版本与提交规范](#版本与提交规范)
+
+**English**
+
+- [Features](#features)
+- [Installation](#installation)
+- [Quick Start](#quick-start)
+- [Routing Engines](#routing-engines)
+- [Parameters](#parameters)
+- [FAQ](#faq)
+- [For Developers](#for-developers)
+
+---
+
+# 用户指南
 
 ## 特性
 
-- ✅ **本地算法** - 纯 JavaScript 实现，无需启动外部服务
-- ✅ **拓扑橡皮筋** - 可视图 + Dijkstra 求精确切线圆弧路径，凸包拉紧效果
-- ✅ **Worker 并行** - 规划在 Web Worker 中执行，不阻塞 EDA 界面
-- ✅ **参数弹窗** - 左右双栏：左侧走线/策略/执行选项，右侧按当前 PCB 列出可用铜层与全部网络，可关闭底层、勾选需要排除的网络
-- ✅ **自动网络排序** - 按 PCB Layout 习惯自动规划顺序：短连接 → 一般信号 → 电源 → 地；**地网络始终最后布**，避免 GND 先布封死其他网络
-- ✅ **并排焊盘中间优先** - 连接器 / IC 引脚排自动识别共线焊盘，先布中间焊盘、再向两端展开，避免外侧焊盘的走线绕成一圈把中间焊盘的出口封死
-- ✅ **实时进度** - 进度、布通率、**飞线布通率**、统计、日志实时刷新，可随时手动停止
-- ✅ **飞线布通率** - 按焊盘统计已消除飞线的比例：只有该焊盘在 MST 上的**所有**飞线都已布通才计入，避免「100% 但仍有飞线残留」
-- ✅ **实时写入** - 每个网络完成后立即刷新到 PCB 画布，收尾逐网对账保证画布与终态一致
-- ✅ **中心到中心布线** - 焊盘中心 → 可视图最短路 → 焊盘中心，出线方向即最短路起始方向，天然切线连续、没有人为折角
-- ✅ **单层优先** - 优先在顶层或底层完成整条走线，绕不过去才换层；过孔数等于真正跨层网络的数目（实测 14 网 2 孔）
-- ✅ **贴边绕弯** - 可以贴着已布走线/圆弧的弯曲处平滑绕行（弦-弧建模误差在容差内），不再被膨胀盘逼出大圈和 V 形折返尖刺
-- ✅ **换层兜底** - 同层确实无路时自动打孔换层，锚点对按「两端引出 + 直线距离」择优
-- ✅ **密集排退避** - 密集焊盘排里邻盘间距圈吞没焊盘中心时，自动退回「焊盘轮廓出线候选」模型，引出段切线圆角过渡
-- ✅ **铜皮内侵入豁免** - 出线段完全落在自家焊盘铜皮内的「侵入」不算冲突，密集排出线不再被误判堵死
-- ✅ **增强焊盘识别** - 支持 TH、SMD、Via 多种焊盘类型；通孔焊盘按钻孔/多层号识别，顶层底层都设防
-- ✅ **过孔生成** - 自动检测层变化并创建过孔；默认**不在焊盘上打孔**，焊盘外过孔还会校验与相邻焊盘/走线的 DRC 间距
-- ✅ **部分连通保留** - 一个网络里某条 MST 连接失败时，其余已布通的连接照常保留在画布上，不再整网丢弃
-- ✅ **智能避障** - 圆形障碍群 + 动态走线障碍，严格满足 DRC 间距
-- ✅ **优化与冲突消除** - 逐网重布择优 + 成组重排消除瓶颈，被否决的尝试完整回滚（引擎状态 + 画布）
-- ✅ **撕毁重布** - 失败网络自动拆除封路网络后重试
+- ✅ **本地算法** — 纯 JavaScript 实现，无需启动外部服务，设计数据不出本机
+- ✅ **三种布线引擎** — RRouter（插件自带拓扑橡皮筋）/ JRouter / HRouter（EDA 内置引擎），一键切换
+- ✅ **拓扑橡皮筋** — 可视图 + Dijkstra 求精确切线圆弧路径，走线像绳子一样拉紧
+- ✅ **自动拉紧圆润** — 内置引擎（J/H）布完后自动做橡皮筋拉紧与切线圆角优化
+- ✅ **实时进度** — 进度、布通率、飞线布通率、统计、日志实时刷新，可随时停止
+- ✅ **边布线边圆润** — RRouter 每布完一个网络立即写入画布并做圆润处理，过程实时可见
+- ✅ **自动网络排序** — 短连接 → 一般信号 → 电源 → 地；地网络始终最后布
+- ✅ **单层优先** — 优先同层走通，绕不过去才换层；过孔自动校验与相邻焊盘/走线的 DRC 间距
+- ✅ **部分连通保留** — 网络中某条连接失败时，已布通的连接照常保留，不整网丢弃
+- ✅ **撕毁重布** — 失败网络自动拆除封路网络后重试，支持多轮
+- ✅ **增强焊盘识别** — TH、SMD、POLYGON、椭圆/圆角矩形（含旋转）焊盘精确建模
+- ✅ **DRC 严格口径** — 全部图元终检，任何一段不过间距即弃边，宁可少布不产违规
 
 ## 安装
 
-### 方法 1：从 .eext 文件安装
+### 方法 1：从 .eext 文件安装（推荐）
 
-1. 下载 `rubberband-autorouter_v0.0.81.eext` 文件
+1. 从 [Releases](https://github.com/easyeda/eext-rubberband-autorouter/releases) 下载最新的 `rubberband-autorouter_v*.eext`
 2. 打开嘉立创 EDA 专业版
-3. 进入 **扩展管理** (Extensions)
-4. 点击 **从本地安装** (Install from local)
-5. 选择下载的 .eext 文件
-6. 安装完成
+3. 进入 **扩展管理** (Extensions) → **从本地安装**
+4. 选择下载的 .eext 文件
+5. 安装完成，菜单栏出现 **橡皮筋布线器**
 
 ### 方法 2：从源码安装（开发模式）
 
 ```bash
-# 克隆项目
 git clone https://github.com/easyeda/eext-rubberband-autorouter.git
 cd eext-rubberband-autorouter
-
-# 安装依赖
 npm install
-
-# 构建项目
 npm run build
-
-# 打包扩展
-npm run package
 ```
 
-然后在嘉立创 EDA 中选择 **从本地文件夹安装**，选择项目根目录。
+然后在嘉立创 EDA 中选择 **扩展管理 → 从本地文件夹安装**，选择项目根目录。
 
----
-
-## 使用方法
+## 快速开始
 
 1. 打开 PCB 文档
 2. 菜单栏 → **橡皮筋布线器** → **开始布线...**
-3. 参数窗口会贴着 EDA 界面右侧弹出；调整参数后点击 **开始布线**
-4. 进度窗口会实时显示进度、**布通率**、**飞线布通率**、统计与日志；可随时点击 **停止布线**。
-   布通率按网络统计（布通网络 / 总网络），飞线布通率按焊盘统计（已消除全部飞线的焊盘 / 参与布线焊盘），
-   用于判断布线实际消掉了多少飞线段
+3. 参数窗口贴着 EDA 界面右侧弹出；按需调整参数后点击 **开始布线**
+4. 进度窗口实时显示进度、**布通率**（按网络）与**飞线布通率**（按焊盘）；可随时 **停止布线**
 5. 布线过程中每个网络完成后立即写入画布，实时可见
-6. 完成后可点击 **重新布线**（按上次参数直接重跑）或 **布线设置**（改参数后再跑）；
-   布线进行中这两个按钮不可点击
+6. 完成后可 **重新布线**（按上次参数重跑）或 **布线设置**（改参数再跑）
 
-### 参数说明
+## 布线引擎选择
+
+参数窗口**顶部**可并排选择三种引擎，问号图标悬停可查看引擎说明：
+
+| 引擎 | 来源 | 适用场景 | 行为 |
+|------|------|----------|------|
+| **RRouter**（默认） | 插件自带 | 常规板，追求走线形态 | 拓扑橡皮筋引擎，边布线边圆润，支持全部参数 |
+| **JRouter** | EDA 内置 | 密排连接器板，布通率优先 | 调用内置自动布线 API，完成后插件自动做拉紧 + 圆润优化 |
+| **HRouter** | EDA 内置 | JRouter 的备选策略 | 同 JRouter：内置引擎布线 → 插件后处理 |
+
+- 选择 JRouter / HRouter 时，仅适用于 RRouter 的参数（走线宽度、网络排序、撕毁重布、实时预览、凸包优化、过孔兜底、混合模式、整机委托）会自动隐藏——内置引擎使用自身规则
+- RRouter 布通率偏低（<85%）时，日志会建议切换到 JRouter / HRouter
+- J/H 引擎的走线写入画布后，插件会对结果做橡皮筋拉紧与切线圆角，再刷新画布
+
+## 参数说明
 
 | 参数 | 默认值 | 说明 |
 |------|--------|------|
-| 走线宽度 | DRC 最小线宽 | 铜线宽度，同时作为障碍外扩的基准。线越宽，障碍越大，密集区域越难穿插。 |
-| 额外安全间距 | 0 mil | 在 DRC 要求的最小间距之上**再增加**的余量。0 表示严格按 DRC 执行，不额外放大障碍。 |
-| 出线额外余量 | 0 mil | 焊盘边缘到走线中心线除 DRC 之外再保留的距离。0 表示允许按最小间距贴着焊盘出线。 |
-| 撕毁重布轮数 | 3 轮 | 某个网络布不通时，允许拆除挡住它的已布网络后重试的轮数（每轮最多拆 3 条）；0 表示关闭撕毁重布。 |
-| 时间预算 | 30 分钟 | **全部网络首轮布线、撕毁重布、最后优化、冲突消除与过孔兜底共用的规划总时长**，不包含读取 PCB 与把走线写回画布的时间。可选 10 / 20 / 30 / 60 分钟；到期后保留已布走线、停止处理剩余网络，正在求解的当前连接会先完成。「不限时」档位已取消 —— 实测大板不限时跑 9.8 小时，布通率反而低于 30 分钟档（多出来的时间都耗在无望网的反复撕毁上），引擎内部上限也是 60 分钟。 |
-| 网络排序 | 自动规划 | 自动按「短连接 → 一般信号 → 电源 → 地」排序，地网络在所有模式下强制最后布。也可手动选择长→短、短→长、河流（左→右）或反河流。 |
-| 实时预览 | 开 | 每布完一个网络立即把走线写入 PCB 画布，便于观察过程。关闭后改为规划全部完成后统一写入，界面更流畅。 |
-| 最后凸包优化 | 开 | 先保证所有网络连通，再逐网重新求最短路；只有总长更短才替换，失败则保留原走线。关闭可缩短总耗时，但走线可能不够紧凑。 |
-| 过孔换层兜底 | 开 | 同一层确实绕不过去时，自动打孔换到另一层继续走。关闭底层后此选项自动失效。 |
-| 允许焊盘打孔 | 关 | 关闭（默认）时过孔铜环必须完整落在所有焊盘铜皮之外，并按 DRC「走线到焊盘」间距避开相邻焊盘，不会在焊盘上留下孔洞；顶层 SMD ↔ 底层 SMD 这类必须换层的连接改为在焊盘外打孔。开启后允许过孔落在同网络焊盘中心（异网焊盘仍会被避开）。单层布线时此选项自动禁用。 |
-| 布线层 | 顶层 + 底层 | 按当前 PCB 实际可用的铜层生成。顶层固定启用；底层可关闭，关闭后只走顶层且不会产生过孔。单面板会自动禁用底层。 |
-| 排除网络 | 无 | 勾掉不需要自动布线的网络（例如已手工布好的电源/地）。这些网络不参与规划和统计，但它们的焊盘与已有走线仍作为静态障碍，新走线不会压到。 |
+| 布线引擎 | RRouter | 见[布线引擎选择](#布线引擎选择) |
+| 走线宽度 | 10 mil | **仅 RRouter**。铜线宽度，同时作为障碍外扩基准；越宽越难穿插。 |
+| 额外安全间距 | 0 mil | 在 DRC 最小间距之上**再加**的余量，0 = 严格按 DRC 执行。 |
+| 出线额外余量 | 0 mil | 焊盘边缘到走线中心线在 DRC 之外再保留的距离，0 = 按最小间距贴焊盘出线。 |
+| 撕毁重布轮数 | 3 轮 | **仅 RRouter**。网络布不通时，允许拆除挡路的已布网络后重试的轮数；0 = 关闭。 |
+| 时间预算 | 30 分钟 | 全部网络首轮布线、撕毁重布、优化、冲突消除与过孔兜底共用的规划总时长。到期保留已布走线。引擎内部上限 60 分钟。 |
+| 网络排序 | 自动规划 | **仅 RRouter**。见[网络排序策略](#网络排序策略)。 |
+| 实时预览 | 开 | **仅 RRouter**。每布完一个网络立即写画布；关闭后规划完统一写入，界面更流畅。 |
+| 最后凸包优化 | 开 | **仅 RRouter**。先保证连通，再逐网重求最短路，只有更短才替换。 |
+| 过孔换层兜底 | 开 | **仅 RRouter**。同层绕不过去时自动打孔换层；关闭底层后自动失效。 |
+| 混合模式 | 关 | **仅 RRouter**。引擎结束后把失败网委托给内置路由器（BETA API，单网耗时不可控，7 网实测 ~7 分钟）。 |
+| 整机委托 | 关 | **仅 RRouter**。跳过本引擎，直接用内置路由器布全部网络。 |
+| 布线层 | 顶层 + 底层 | 按当前 PCB 实际可用铜层生成；顶层固定启用，单面板自动禁用底层。 |
+| 排除网络 / 地网络 | 默认排除 GND | 勾掉不参与布线的网络（保持画布现状，焊盘与走线仍作为障碍）。地网络默认不参与布线。 |
 
-### 网络排序策略
+## 网络排序策略
 
-默认「自动规划」按 PCB Layout 的通行做法分档：
+默认「自动规划」按 PCB Layout 通行做法分档：
 
-1. **短连接**（两焊盘且跨度 ≤ 板对角线 22%）——先处理，占用少、成功率高；
-2. **一般信号**——按河流（river）方向排序，同向网络成束，减少交叉；
-3. **电源网络**（VCC/VDD/VBAT/±5V 等）——线宽/电流大，放在信号之后；
-4. **地网络**（GND/VSS/0V/EARTH 等）——**永远最后布**。地通常焊盘最多、
-   连接关系最像“网”，先布会像墙一样把板面切碎；最后布则可以利用剩余空间
-   就近打孔/绕行，即使个别连接失败也不影响信号完整性。
+1. **短连接**（两焊盘且跨度 ≤ 板对角线 22%）——先处理，占用少、成功率高
+2. **一般信号**——按河流方向排序，同向网络成束，减少交叉
+3. **电源网络**（VCC/VDD/VBAT/±5V 等）——线宽/电流大，放在信号之后
+4. **地网络**（GND/VSS/0V/EARTH 等）——**永远最后布**：地焊盘最多、连接最像"网"，
+   先布会把板面切碎；最后布则可利用剩余空间就近打孔绕行
 
-地网络判定覆盖常见命名：`GND`、`AGND`、`DGND`、`PGND`、`GND_1`、`VSS`、
-`CHASSIS_GND`、`0V`、`地`、`EARTH`。手动选择其他排序模式时，地网络仍被强制
-排到最后，这是硬规则而不是提示。
+地网络判定覆盖 `GND`、`AGND`、`DGND`、`PGND`、`VSS`、`0V`、`EARTH` 等常见命名；
+手动选择其他排序模式时，地网络仍强制最后布（硬规则）。
 
-在「自动规划」与「河流」模式下还会单独处理**并排焊盘**：同一排共线、间距
-相近的 3 个以上焊盘视为一排（连接器、排针、IC 引脚），排内网络改为
-**中间 → 两端**出线。原因是同一排的外侧焊盘先布时，走线容易绕到排外形成
-包围圈，把中间焊盘朝排外的唯一出口封死；中间焊盘先垂直出线后，外侧焊盘仍可
-从排两端绕出。不同排（以及同一连接器的上下两排）各自成组，不会把互不相关的
-网络块交错；电源/地的层级约束也不受影响。
+「自动规划」与「河流」模式下还会识别**并排焊盘**（连接器/排针/IC 引脚共线排）：
+排内网络改为**中间 → 两端**出线，避免外侧走线绕成包围圈封死中间焊盘的唯一出口。
+
+## 常见问题
+
+### Q: 布通率不理想怎么办？
+
+A: 依次尝试：
+1. 看日志——RRouter 布通率 <85% 时会明确建议切换引擎，切到 **JRouter / HRouter** 试试（密排连接器板内置引擎明显更强）
+2. 增加「撕毁重布轮数」（默认 3）
+3. 保持「过孔换层兜底」开启（双面板几乎必开）
+4. 简化布局密度 / 手工预布关键走线（差分对、时钟线）
+
+### Q: 走线为什么会绕远路？
+
+A: 绕路有两个来源，都已针对性处理：
+1. **出线方向被预设**——现在主模型是焊盘中心直连最短路，出线方向即最短路起始方向
+2. **顶层通道被占**——优化与冲突消除阶段做逐网/成组重排；换层只作兜底，不随意打孔
+
+### Q: 画布上多出的小圆点是什么？是测试点吗？
+
+A: 不是。插件没有放置测试点的逻辑，小圆点是**过孔**（换层连接）。过孔只会落在焊盘之外，并按 DRC 间距校验与相邻焊盘/走线的距离。
+
+### Q: 支持多层板吗？
+
+A: 双面板（顶层 + 底层）完整验证过；当前算法只使用顶/底两层，内层尚未参与布线。单面板自动禁用底层走线。
+
+### Q: 与 FreeRouting 有什么区别？
+
+A: **本地执行**（无需外部服务）、**纯 JavaScript**（易集成维护）、**拓扑橡皮筋算法**（切线圆弧路径，形态自然）、**深度集成 EDA**（直接读写画布、读 DRC 规则、可切换 EDA 内置引擎）。
 
 ---
 
+# 开发者文档
+
 ## 核心算法
 
-### 中心到中心 + 单层优先
+### RRouter：中心到中心 + 单层优先
 
-1. **主模型**：焊盘中心 → 可视图最短路 → 焊盘中心。本网络焊盘不作为障碍，
-   出线方向就是最短路的起始方向——走线天然切线连续，没有人为折角；
-   直线可连时总长恰等于两焊盘直线距离。
-2. **单层优先**：每条连接先在当前层求解；只有同层确实绕不过去（求解失败）才
-   打孔换层。过孔不是长度权衡的筹码，而是走不通时的兜底——实测 14 网络
-   2 个过孔，其余 12 条单层走通。
-   顶层绕过路阈值 1.55× 下界：绕到对侧省下的长度抵不过两个过孔的代价时，
-   宁可换层（`$H2_4`：绕墙 1333mil → 过孔 709mil）。
-3. **密集排退避**：邻焊盘的外扩间距圈吞没本焊盘中心（相邻间距 < 两焊盘半径 +
-   外扩之和）时，中心起点的任何线段都会被判侵入——此时退回「焊盘轮廓出线
-   候选」模型：候选点铺满铜皮轮廓各方向，引出段与路径之间切线圆角过渡；
-   出线段完全落在自家铜皮内的侵入直接豁免（那是焊盘排的既有状态，不是走线造成的）。
-4. **过孔兜底**：同层退避仍失败时，按「两端引出段 + 跨层直线距离」给全部锚点对
-   排序，逐对尝试「引出 → 过孔 → 对层路径 → 过孔 → 引入」。
-5. **焊盘外过孔**：默认过孔铜环与**所有**焊盘铜皮保持距离——同网焊盘至少让出
-   4mil，异网焊盘按 DRC「走线到焊盘」间距再加 0.2mil 校验；焊盘形状按原始
-   矩形/椭圆/圆角矩形（含旋转）精确计算，不依赖外接圆近似。只有显式开启
-   「允许焊盘打孔」才允许过孔落在同网焊盘中心。
+1. **主模型**：焊盘中心 → 可视图最短路 → 焊盘中心。本网焊盘不作为障碍，
+   出线方向就是最短路的起始方向——走线天然切线连续；直线可连时总长恰等于两焊盘直线距离。
+2. **单层优先**：每条连接先在当前层求解；同层确实绕不过去才打孔换层。
+   顶层绕路阈值 1.55× 下界：绕到对侧省的长度抵不过两个过孔的代价时宁可换层。
+3. **密集排退避**：邻盘外扩间距圈吞没本焊盘中心时，退回「焊盘轮廓出线候选」模型，
+   引出段与路径之间切线圆角过渡；完全落在自家铜皮内的侵入直接豁免。
+4. **过孔兜底**：按「两端引出段 + 跨层直线距离」给锚点对排序，逐对尝试
+   「引出 → 过孔 → 对层路径 → 过孔 → 引入」；焊盘外过孔按原始形状（矩形/椭圆/圆角矩形含旋转）精确校验 DRC。
+5. **网格 A\* 兜底**：可视图盲区（端点被邻盘净距圈覆盖、必经点不在切点图）用网格 A\* 兜底，
+   输出经 string-pull 拉直 + 逐段终检后入库。
+
+### JRouter / HRouter 委托管线
+
+```
+purge 待布网络旧走线 → autoRouting BETA API（engine 属性透传）
+  → 结果落盘画布 → 回读 Line/Arc/Via 几何
+  → postProcessImportedNets（登记障碍 → 逐网拉紧 + 圆润）
+  → 整批清除原几何 → 逐网回写 → DRC 复核与统计
+```
+
+- **先落盘再优化再刷新**：内置路由器直接写画布、无插入前钩子，因此后处理在其完成后进行
+- 内置引擎「成功」语义宽于全连通：DRC 复核会把仍有 Connection Error 的网降级为失败
+- BETA API 批量过大时可能返回 undefined（已加防护，静默跳过不崩溃）
 
 ### 优化、冲突消除与收尾对账
 
-- **优化阶段**：逐网拆除重布，只有总长更短才替换；被否决的尝试会连引擎状态
-  （动态障碍、走线、过孔）与画布一起完整回滚，绝不留下幽灵障碍或残缺画面。
-- **冲突消除**：对瓶颈走廊做成组重排（全走廊探测、内向优先），组内每个网络
-  先「独走」求下界，无改善即整体回滚并恢复画布。
-- **收尾对账**：规划结束后按最终规划逐网清写画布——EDA 批量删除偶发不生效，
-  中途被替换的尝试图元可能残留，对账保证画布与引擎终态一致。
-- **部分连通保留**：一个网络通常有多个 MST 连接；某条连接失败时，其余已布通的
-  连接立即提交并保留在画布上（重试时只补未完成的边，不重复叠加过孔）。
-  这类网络计入「失败网络」，但不会再出现「一条连接失败导致整网飞线都没布」。
+- **优化阶段**：逐网拆除重布，只有总长更短才替换；被否决的尝试连引擎状态与画布一起完整回滚
+- **冲突消除**：对瓶颈走廊做成组重排（全走廊探测、内向优先）
+- **收尾对账**：规划结束后按最终规划逐网清写画布，保证画布与引擎终态一致
+- **部分连通保留**：某条 MST 连接失败时其余连接立即提交保留，重试只补未完成的边
 
 ### 拓扑橡皮筋（可视图 + Dijkstra）
 
 1. 焊盘/走线/填充/板框转为圆形障碍群（胶囊、多边形角点、内部阻挡网格）
 2. 构建圆与圆之间的公切线、圆自身的圆弧边，形成可视图
-3. 在可视图上运行 Dijkstra，得到严格满足间距的最短路径
-4. 路径输出为精确图元（直线 + 圆弧），形成“绳子拉紧”的凸包效果；
-   换向处与退避模型引出段过渡处自动插入切线圆弧（G1 连续）
+3. 可视图上运行 Dijkstra，得到严格满足间距的最短路径
+4. 输出精确图元（直线 + 圆弧），换向处自动插入切线圆弧（G1 连续）
 
-### 撕毁重布
+### 撕毁重布与协商
 
-失败网络会识别封路的已布网络，拆除后按外向优先顺序重布，再重布被拆网络；
-支持多轮迭代与最终成组重布。
-
-### Worker 并行
-
-- 纯几何规划（MST、可视图最短路、过孔兜底、撕毁重布）在 Web Worker 中执行
-- 主线程只负责 EDA API 读写、画布刷新与统计
-- Worker 不可用时自动回退到主线程（协作式让出，界面仍可响应）
-
----
+失败网络识别封路的已布网络，拆除后按外向优先重布，再重布被拆网络；
+多轮迭代采用协商式拥塞控制（历史拥挤代价 + 阶段化预算纪律，尾部阶段保底预算）。
 
 ## 技术架构
 
 ```
 主线程 (EDA 宿主)
   ├── 读取 DRC / 焊盘 / 静态障碍
-  ├── 逐网络写入图元（实时刷新）与删除（撕毁）
+  ├── 逐网络写入图元（差量写入调度：同网合并 + 30ms 限速）
+  ├── J/H 引擎委托：autoRouting → 回读 → 后处理 → 回写
   └── 参数弹窗 / 进度弹窗（postMessage 通信）
         │  结构化数据
         ▼
 Web Worker
-  ├── PlanningEngine（MST / 可视图最短路 / 撕毁重布）
+  ├── PlanningEngine（MST / 可视图最短路 / 撕毁重布 / 拉紧圆润）
   ├── VisibilityRouter（可视图 + Dijkstra）
-  └── RubberbandEngine（切线 / 圆群 / 圆角）
+  └── GridRouter（网格 A* 兜底）
 ```
 
-### 核心模块
+## 核心模块
 
 | 模块 | 文件 | 功能 |
 |------|------|------|
-| **EDA 路由宿主** | `src/router/topological-router.ts` | 数据收集、Worker 调度、实时写入/删除、统计 |
-| **规划引擎** | `src/router/planning-engine.ts` | 纯几何规划（零 EDA 依赖） |
-| **可视图路由** | `src/router/visibility-router.ts` | 切线图 + Dijkstra |
+| **EDA 路由宿主** | `src/router/topological-router.ts` | 数据收集、Worker 调度、实时写入/删除、多引擎委托与后处理回写 |
+| **规划引擎** | `src/router/planning-engine.ts` | 纯几何规划（零 EDA 依赖）；`postProcessImportedNets` 为三引擎通用的拉紧圆润公开入口 |
+| **可视图路由** | `src/router/visibility-router.ts` | 切线图 + Dijkstra（旋转感知状态机） |
+| **网格兜底** | `src/router/grid-router.ts` | 八连通 A* + 跨层语义（SMD 限自身层、过孔禁孔圈） |
 | **几何原语** | `src/router/rubberband-engine.ts` | 障碍圆群、切线、圆角 |
 | **Worker 入口** | `src/worker/planning-worker.ts` | 规划消息协议与进度 |
 | **弹窗桥** | `src/ui/dialog-bridge.ts` | 主线程 ↔ iframe 消息 |
-
----
 
 ## 项目结构
 
@@ -203,10 +251,11 @@ Web Worker
 eext-rubberband-autorouter/
 ├── src/
 │   ├── router/
-│   │   ├── topological-router.ts   # EDA 读写 + Worker 调度 + 实时写入
+│   │   ├── topological-router.ts   # EDA 读写 + Worker 调度 + 多引擎委托
 │   │   ├── planning-engine.ts      # 纯几何规划引擎（零 EDA 依赖）
-│   │   ├── rubberband-engine.ts    # 切线/障碍圆群/圆角等几何原语
 │   │   ├── visibility-router.ts    # 可视图 + Dijkstra
+│   │   ├── grid-router.ts          # 网格 A* 兜底
+│   │   ├── rubberband-engine.ts    # 切线/障碍圆群/圆角等几何原语
 │   │   ├── edge-router.ts          # 焊盘出线几何：出线候选/退避走线/间距判定
 │   │   ├── drc-rules.ts            # DRC 规则读取与参数覆盖
 │   │   └── worker-source.ts        # Worker 源码内联与创建
@@ -217,143 +266,185 @@ eext-rubberband-autorouter/
 │   ├── types/
 │   │   ├── index.ts                # 基础类型
 │   │   └── router-params.ts        # 用户可调参数与统计
-│   ├── utils/
-│   │   ├── error-handler.ts        # 错误处理
-│   │   ├── logger.ts               # 日志
-│   │   └── toast.ts                # 吐司通知
+│   ├── utils/                      # 错误处理 / 日志 / 吐司
 │   ├── auto-router-facade.ts       # 参数弹窗 / 进度弹窗 / 布线调度
 │   └── index.ts                    # 主入口
 ├── iframe/
-│   ├── params.html                 # 参数设置弹窗
+│   ├── params.html                 # 参数设置弹窗（含引擎选择）
 │   └── progress.html               # 实时进度与日志弹窗
+├── build/                          # 打包输出（.eext）
 ├── extension.json                  # 扩展配置
-├── package.json                    # 项目配置
-└── tsconfig.json                   # TS 配置
+└── package.json
 ```
 
----
-
-## 开发
-
-### 构建命令
+## 构建与调试
 
 ```bash
-# 安装依赖
-npm install
-
-# 开发模式（监听文件变化）
-npm run watch
-
-# 构建项目
-npm run build
-
-# 打包扩展
-npm run package
+npm install        # 安装依赖
+npm run watch      # 开发模式（监听文件变化）
+npm run build      # 构建（自动递增补丁版本号）+ 打包
+npm run package    # 仅打包 .eext
 ```
 
-### 调试
+调试流程：
 
-1. 在嘉立创 EDA 中以开发模式安装扩展
-2. 修改源代码
-3. 运行 `npm run build` 重新构建
-4. 在 EDA 中重新加载扩展
-
----
+1. 在嘉立创 EDA 中以开发模式安装扩展（从本地文件夹）
+2. 修改源代码后 `npm run build`
+3. 在 EDA 中重新加载扩展；按 F12 查看引擎日志（`[Router2]` 前缀）
 
 ## 依赖
 
-### 运行时依赖
+**运行时**：delaunator ^5.0.0（Delaunay 三角剖分）
 
-- **delaunator** ^5.0.0 - Delaunay 三角剖分库
+**开发**：TypeScript ^5、esbuild ^0.19、tsx ^4、jszip ^3.10、fs-extra ^11
 
-### 开发依赖
+## 版本与提交规范
 
-- **TypeScript** ^5.0.0 - 类型安全的 JavaScript
-- **esbuild** ^0.19.0 - 快速的 JavaScript 打包工具
-- **tsx** ^4.0.0 - TypeScript 执行器
-- **jszip** ^3.10.0 - ZIP 文件处理
-- **fs-extra** ^11.0.0 - 文件操作
-
----
-
-## 常见问题
-
-### Q: 走线为什么会绕远路？
-
-A: 绕路有两个来源，都已针对性处理：
-
-1. **出线方向被预设**：早期算法强制从固定方向（端帽长轴）出线，即使正对目标
-   也要先拐一下。现在主模型是焊盘中心直连最短路，出线方向即最短路的起始方向。
-2. **顶层通道被占**：窄通道只能容纳一条走线，先布的网络会把后来的网络逼到
-   绕远。现在优化与冲突消除阶段会做逐网/成组重排，重排无改善则保留原走线；
-   换层只在同层确实绕不过去时作为兜底使用，不再为了抄近路随意打孔。
-
-### Q: 如何提高布线成功率？
-
-A: 建议：
-1. 增加「撕毁重布轮数」（默认 3）
-2. 简化 PCB 布局，减少元件密度
-3. 保持「过孔换层兜底」开启（双面板几乎必开）
-4. 合理设置 DRC 规则
-
-### Q: 为什么画布上会多出小圆点？是自动测试点吗？
-
-A: 不是。代码中**没有任何自动放置测试点（Test Point / Fiducial / Probe）的逻辑**，
-布线过程只创建过孔（`pcb_PrimitiveVia`）、走线（`pcb_PrimitiveLine`）和圆弧
-（`pcb_PrimitiveArc`）。看到的小圆点就是过孔，通常是换层连接。默认「允许焊盘打孔」
-关闭，过孔只落在焊盘外；如需把测试点专门放在焊盘或指定位置，需手工放置。
-
-### Q: 支持多层板吗？
-
-A: 支持过孔自动生成，双面板走线已完整验证（顶层 + 底层）。
-当前算法只使用顶层与底层两层，内层（layer 3+）尚未参与布线。
-单面板会自动探测并禁用底层走线。
-
-### Q: 与 FreeRouting 有什么区别？
-
-A: 主要区别：
-- **本地执行**：无需启动外部服务
-- **纯 JavaScript**：更易于集成和维护
-- **简化界面**：更简洁的配置选项
-- **算法不同**：使用拓扑橡皮筋算法
-- **v2.7.0 增强**：障碍物绕行、DRC 检查、路径优化
+- 语义化版本（SemVer）；`npm run build` 自动递增补丁号
+- 提交信息：`feat: 描述` / `fix: 描述` / `docs: 描述` / `refactor: 描述`
+- 引擎隔离原则：RRouter 的引擎管线与 J/H 的委托后处理相互独立；
+  拉紧/圆润通过 `postProcessImportedNets` 适配三引擎数据
 
 ---
 
-## 许可证
+# English
+
+**中文** · **English**
+
+This is a PCB auto-routing extension for EasyEDA Pro (嘉立创 EDA 专业版) built on the topological rubberband algorithm: fully local computation, no external service, multiple routing engines with automatic tautening and corner smoothing.
+
+## Features
+
+- ✅ **Local algorithm** — pure JavaScript, design data never leaves your machine
+- ✅ **Three routing engines** — RRouter (built-in topological rubberband) / JRouter / HRouter (EasyEDA built-in engines), one-click switch
+- ✅ **Topological rubberband** — visibility graph + Dijkstra produces exact tangent line/arc paths that tighten like a pulled string
+- ✅ **Automatic post-processing** — built-in engines (J/H) get rubberband tautening + tangent fillets applied by the extension
+- ✅ **Live progress** — progress, completion rate, rats-nest completion, stats and logs in real time; stop any time
+- ✅ **Route-and-smooth** — RRouter writes each net to the canvas as soon as it is solved, already smoothed
+- ✅ **Smart net ordering** — short nets → signals → power → ground; ground always last
+- ✅ **Same-layer first** — only change layers when a net truly cannot route on one layer; via placements are DRC-checked against neighboring pads/traces
+- ✅ **Partial connectivity preserved** — failed MST branches don't discard the already-routed branches
+- ✅ **Rip-up and reroute** — failed nets automatically tear blocking nets and retry, multiple rounds
+- ✅ **Rich pad modeling** — TH, SMD, POLYGON, ellipse/rounded-rect (with rotation) pads modeled exactly
+- ✅ **Strict DRC discipline** — every primitive is re-checked before commit; a segment that fails clearance is dropped
+
+## Installation
+
+1. Download the latest `rubberband-autorouter_v*.eext` from [Releases](https://github.com/easyeda/eext-rubberband-autorouter/releases)
+2. Open EasyEDA Pro → **Extensions** → **Install from local**
+3. Select the .eext file — a **Rubberband Router** menu appears
+
+From source (development mode):
+
+```bash
+git clone https://github.com/easyeda/eext-rubberband-autorouter.git
+cd eext-rubberband-autorouter
+npm install
+npm run build
+```
+
+Then in EasyEDA Pro choose **Extensions → Install from local folder** and pick the project root.
+
+## Quick Start
+
+1. Open a PCB document
+2. Menu → **Rubberband Router** → **Start Routing...**
+3. The parameter panel docks to the right of the EDA window; adjust and click **Start**
+4. Watch live progress, completion rate and rats-nest completion; stop any time
+5. Routed nets appear on the canvas immediately as they complete
+6. After finishing: **Re-route** (same parameters) or **Routing Settings** (change and run)
+
+## Routing Engines
+
+Pick an engine at the **top** of the parameter panel; hover the "?" icon for descriptions:
+
+| Engine | Source | Best for | Behavior |
+|--------|--------|----------|----------|
+| **RRouter** (default) | Extension | Typical boards, best trace aesthetics | Topological rubberband engine, routes and smooths live, all parameters available |
+| **JRouter** | EasyEDA built-in | Dense connector boards, completion-rate first | Calls the built-in auto-router API, then the extension applies tautening + smoothing |
+| **HRouter** | EasyEDA built-in | Alternative built-in strategy | Same pipeline as JRouter |
+
+- When JRouter/HRouter is selected, RRouter-only parameters (trace width, net ordering, rip-up rounds, live preview, final optimization, via fallback, hybrid delegate, delegate-all) are hidden — built-in engines use their own rules
+- If RRouter completion drops below 85%, the log suggests switching to JRouter/HRouter
+- Built-in engine results are written to the canvas first, then tautened/smoothed by the extension, then refreshed
+
+## Parameters
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| Routing engine | RRouter | See [Routing Engines](#routing-engines) |
+| Trace width | 10 mil | **RRouter only**. Copper width; also widens obstacle inflation. |
+| Extra clearance | 0 mil | Added on top of the DRC minimum; 0 = strict DRC. |
+| Escape margin | 0 mil | Extra pad-edge-to-trace-center distance; 0 = escape at minimum clearance. |
+| Rip-up rounds | 3 | **RRouter only**. Rounds of tearing blocking nets to retry a failed net; 0 = off. |
+| Time budget | 30 min | Shared planning budget for first pass, rip-up, optimization, conflict resolution and via fallback. Engine hard cap: 60 min. |
+| Net ordering | Auto | **RRouter only**. Short nets → signals → power → ground (ground last). |
+| Live preview | On | **RRouter only**. Write each net to the canvas as soon as it is solved. |
+| Final optimization | On | **RRouter only**. After connectivity, re-solve each net; keep only shorter results. |
+| Via layer fallback | On | **RRouter only**. Switch layers when a net cannot route on one layer. |
+| Hybrid delegate | Off | **RRouter only**. Delegate leftover failed nets to the built-in router after the engine finishes (BETA API, per-net latency unbounded). |
+| Delegate all | Off | **RRouter only**. Skip the own engine entirely and hand all nets to the built-in router. |
+| Routing layers | Top + Bottom | Based on the board's available copper layers; single-sided boards disable bottom automatically. |
+| Excluded nets / ground | GND excluded by default | Unchecked nets keep their current state and act as obstacles. Ground nets are excluded by default. |
+
+## FAQ
+
+### Q: The completion rate is low. What can I do?
+
+A: In order: (1) check the log — below 85% RRouter explicitly suggests switching engines; try **JRouter/HRouter**; (2) raise rip-up rounds; (3) keep via layer fallback enabled on double-sided boards; (4) hand-route critical nets (differential pairs, clocks) first.
+
+### Q: Why do traces take detours?
+
+A: Two causes, both addressed: escape direction now follows the pad-center shortest path; congested corridors are re-solved per-net and in groups. Layer changes are a fallback, not a shortcut trade.
+
+### Q: What are the small dots on the canvas? Test points?
+
+A: No. The extension never places test points — the dots are **vias** (layer changes). Vias are always placed outside pads and DRC-checked against neighboring pads and traces.
+
+### Q: Are 4+ layer boards supported?
+
+A: Double-sided (top + bottom) is fully verified. Inner layers are not used yet. Single-sided boards disable the bottom layer automatically.
+
+### Q: How is this different from FreeRouting?
+
+A: Fully local (no external service), pure JavaScript, topological rubberband algorithm with natural tangent-arc aesthetics, and deep EasyEDA integration — reads DRC rules, writes the canvas directly, and can delegate to EasyEDA's built-in engines.
+
+<a id="for-developers"></a>
+## For Developers
+
+**Architecture**: the main thread collects DRC rules / pads / static obstacles, schedules a Web Worker (pure geometry, zero EDA dependency), and applies worker output to the canvas through a diff-write scheduler (same-net merge + 30ms throttle). Multi-engine delegation (`topological-router.ts`) calls the `autoRouting` BETA API with an `engine` property, reads the resulting geometry back, post-processes it via `PlanningEngine.postProcessImportedNets` (obstacle registration → per-net tauten + smooth), then purges and rewrites the nets.
+
+**Core modules**: `topological-router.ts` (EDA host, delegation, write-back) · `planning-engine.ts` (pure planning engine; shared tauten/smooth entry for all three engines) · `visibility-router.ts` (tangent graph + Dijkstra with rotation-aware state) · `grid-router.ts` (grid A* fallback with per-layer pad semantics) · `rubberband-engine.ts` (obstacle circle groups, tangents, fillets).
+
+**Pipeline**: pads/traces/fills/board-outline → circle obstacle groups → visibility graph (common tangents + arcs) → Dijkstra → exact line/arc primitives → fillet insertion → per-segment DRC re-check before commit. Failed nets go through negotiated-congestion rip-up and reroute, then grid-A* and via-fallback rescue, all under phase-budget discipline.
+
+**Build**:
+
+```bash
+npm install
+npm run watch     # dev, watch mode
+npm run build     # build + bump patch version + package
+npm run package   # package .eext only
+```
+
+**Conventions**: SemVer (patch auto-bumped on build); commit prefixes `feat:` / `fix:` / `docs:` / `refactor:`; engine isolation — the RRouter pipeline and the J/H delegate pipeline stay independent, sharing only `postProcessImportedNets` for geometry post-processing.
+
+---
+
+## 许可证 License
 
 Apache-2.0
 
----
+## 致谢 Acknowledgements
 
-## 致谢
+- 原FreeRouting 集成项目 / Original FreeRouting integration project
+- Ruby PCB Router 核心算法 / Ruby PCB Router core algorithm
+- 嘉立创 EDA 团队 / The EasyEDA team
+- Delaunator 库作者 / The Delaunator author
 
-- 原 FreeRouting 集成项目
-- Ruby PCB Router 核心算法
-- 嘉立创 EDA 团队
-- Delaunator 库作者
+## 相关链接 Links
 
----
-
-## 相关链接
-
-- [嘉立创 EDA 官网](https://lceda.cn/)
-- [扩展开发文档](https://prodocs.lceda.cn/cn/api/guide/)
-- [问题反馈](https://github.com/easyeda/eext-rubberband-autorouter/issues)
-- [更新日志](./CHANGELOG.md)
-
----
-
-## 贡献
-
-欢迎提交 Issue 和 Pull Request！
-
----
-
-## 支持
-
-如有问题，请：
-1. 查看 [常见问题](#常见问题)
-2. 查看 [更新日志](./CHANGELOG.md)
-3. 提交 [Issue](https://github.com/easyeda/eext-rubberband-autorouter/issues)
-4. 联系嘉立创技术支持
+- [嘉立创 EDA 官网 EasyEDA Official Site](https://lceda.cn/)
+- [扩展开发文档 Extension Dev Docs](https://prodocs.lceda.cn/cn/api/guide/)
+- [问题反馈 Issues](https://github.com/easyeda/eext-rubberband-autorouter/issues)
+- [更新日志 Changelog](./CHANGELOG.md)
