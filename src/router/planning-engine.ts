@@ -3990,8 +3990,43 @@ export class PlanningEngine {
 			let ok = complete && prims.length > 0 && this.primsClearOfDynamic(mergePrims(prims), name, strictObs);
 			if (ok) {
 				for (const v of vias) {
-					if (!this.viaPadClear(v.x, v.y, v.dia / 2, name) ||
-						!this.viaObstacleClear(v.x, v.y, strictObs, v.dia / 2, name)) { ok = false; break; }
+					if (this.viaPadClear(v.x, v.y, v.dia / 2, name) &&
+						this.viaObstacleClear(v.x, v.y, strictObs, v.dia / 2, name)) continue;
+					// 意向过孔落点微移复活（罚分网格的落点粗于引擎精细放置）：
+					// 16 方向 × 0.4~3.0mil，衔接线端点同步平移（与提交链微移同款）
+					let placed = false;
+					const primsArr = this.netRendered.get(name) ?? [];
+					const incident = primsArr.filter(p => p.kind === 'line' && this.primEndsNear(p, v.x, v.y, 1.0));
+					if (incident.length && incident.every(p => p.kind === 'line')) {
+						for (const dist of [0.4, 0.8, 1.2, 1.8, 2.4, 3.0]) {
+							for (let k = 0; k < 16 && !placed; k++) {
+								const a = (k * Math.PI) / 8;
+								const nx = v.x + Math.cos(a) * dist, ny = v.y + Math.sin(a) * dist;
+								if (!this.viaPadClear(nx, ny, v.dia / 2, name) ||
+									!this.viaObstacleClear(nx, ny, strictObs, v.dia / 2, name)) continue;
+								let swept = false;
+								for (const p of incident) {
+									if (p.kind !== 'line') continue;
+									const ox = p.x1 ?? 0, oy = p.y1 ?? 0, ex = p.x2 ?? 0, ey = p.y2 ?? 0;
+									const sx = Math.hypot(ox - v.x, oy - v.y) < 1.0 ? nx : ox;
+									const sy = Math.hypot(ox - v.x, oy - v.y) < 1.0 ? ny : oy;
+									const tx = Math.hypot(ex - v.x, ey - v.y) < 1.0 ? nx : ex;
+									const ty = Math.hypot(ex - v.x, ey - v.y) < 1.0 ? ny : ey;
+									if (!this.lineStillClear(sx, sy, tx, ty, p.layer, name)) { swept = true; break; }
+								}
+								if (swept) continue;
+								for (const p of incident) {
+									if (p.kind !== 'line') continue;
+									if (Math.hypot((p.x1 ?? 0) - v.x, (p.y1 ?? 0) - v.y) < 1.0) { p.x1 = nx; p.y1 = ny; }
+									else if (Math.hypot((p.x2 ?? 0) - v.x, (p.y2 ?? 0) - v.y) < 1.0) { p.x2 = nx; p.y2 = ny; }
+								}
+								v.x = nx; v.y = ny;
+								placed = true;
+							}
+							if (placed) break;
+						}
+					}
+					if (!placed) { ok = false; break; }
 				}
 			}
 			if (!ok) {
@@ -4039,8 +4074,43 @@ export class PlanningEngine {
 			let ok = complete && prims.length > 0 && this.primsClearOfDynamic(mergePrims(prims), name, strictObs);
 			if (ok) {
 				for (const v of vias) {
-					if (!this.viaPadClear(v.x, v.y, v.dia / 2, name) ||
-						!this.viaObstacleClear(v.x, v.y, strictObs, v.dia / 2, name)) { ok = false; break; }
+					if (this.viaPadClear(v.x, v.y, v.dia / 2, name) &&
+						this.viaObstacleClear(v.x, v.y, strictObs, v.dia / 2, name)) continue;
+					// 意向过孔落点微移复活（罚分网格的落点粗于引擎精细放置）：
+					// 16 方向 × 0.4~3.0mil，衔接线端点同步平移（与提交链微移同款）
+					let placed = false;
+					const primsArr = this.netRendered.get(name) ?? [];
+					const incident = primsArr.filter(p => p.kind === 'line' && this.primEndsNear(p, v.x, v.y, 1.0));
+					if (incident.length && incident.every(p => p.kind === 'line')) {
+						for (const dist of [0.4, 0.8, 1.2, 1.8, 2.4, 3.0]) {
+							for (let k = 0; k < 16 && !placed; k++) {
+								const a = (k * Math.PI) / 8;
+								const nx = v.x + Math.cos(a) * dist, ny = v.y + Math.sin(a) * dist;
+								if (!this.viaPadClear(nx, ny, v.dia / 2, name) ||
+									!this.viaObstacleClear(nx, ny, strictObs, v.dia / 2, name)) continue;
+								let swept = false;
+								for (const p of incident) {
+									if (p.kind !== 'line') continue;
+									const ox = p.x1 ?? 0, oy = p.y1 ?? 0, ex = p.x2 ?? 0, ey = p.y2 ?? 0;
+									const sx = Math.hypot(ox - v.x, oy - v.y) < 1.0 ? nx : ox;
+									const sy = Math.hypot(ox - v.x, oy - v.y) < 1.0 ? ny : oy;
+									const tx = Math.hypot(ex - v.x, ey - v.y) < 1.0 ? nx : ex;
+									const ty = Math.hypot(ex - v.x, ey - v.y) < 1.0 ? ny : ey;
+									if (!this.lineStillClear(sx, sy, tx, ty, p.layer, name)) { swept = true; break; }
+								}
+								if (swept) continue;
+								for (const p of incident) {
+									if (p.kind !== 'line') continue;
+									if (Math.hypot((p.x1 ?? 0) - v.x, (p.y1 ?? 0) - v.y) < 1.0) { p.x1 = nx; p.y1 = ny; }
+									else if (Math.hypot((p.x2 ?? 0) - v.x, (p.y2 ?? 0) - v.y) < 1.0) { p.x2 = nx; p.y2 = ny; }
+								}
+								v.x = nx; v.y = ny;
+								placed = true;
+							}
+							if (placed) break;
+						}
+					}
+					if (!placed) { ok = false; break; }
 				}
 			}
 			if (ok) {
@@ -4124,8 +4194,43 @@ export class PlanningEngine {
 			let ok = complete && prims.length > 0 && this.primsClearOfDynamic(mergePrims(prims), name, strictObs);
 			if (ok) {
 				for (const v of vias) {
-					if (!this.viaPadClear(v.x, v.y, v.dia / 2, name) ||
-						!this.viaObstacleClear(v.x, v.y, strictObs, v.dia / 2, name)) { ok = false; break; }
+					if (this.viaPadClear(v.x, v.y, v.dia / 2, name) &&
+						this.viaObstacleClear(v.x, v.y, strictObs, v.dia / 2, name)) continue;
+					// 意向过孔落点微移复活（罚分网格的落点粗于引擎精细放置）：
+					// 16 方向 × 0.4~3.0mil，衔接线端点同步平移（与提交链微移同款）
+					let placed = false;
+					const primsArr = this.netRendered.get(name) ?? [];
+					const incident = primsArr.filter(p => p.kind === 'line' && this.primEndsNear(p, v.x, v.y, 1.0));
+					if (incident.length && incident.every(p => p.kind === 'line')) {
+						for (const dist of [0.4, 0.8, 1.2, 1.8, 2.4, 3.0]) {
+							for (let k = 0; k < 16 && !placed; k++) {
+								const a = (k * Math.PI) / 8;
+								const nx = v.x + Math.cos(a) * dist, ny = v.y + Math.sin(a) * dist;
+								if (!this.viaPadClear(nx, ny, v.dia / 2, name) ||
+									!this.viaObstacleClear(nx, ny, strictObs, v.dia / 2, name)) continue;
+								let swept = false;
+								for (const p of incident) {
+									if (p.kind !== 'line') continue;
+									const ox = p.x1 ?? 0, oy = p.y1 ?? 0, ex = p.x2 ?? 0, ey = p.y2 ?? 0;
+									const sx = Math.hypot(ox - v.x, oy - v.y) < 1.0 ? nx : ox;
+									const sy = Math.hypot(ox - v.x, oy - v.y) < 1.0 ? ny : oy;
+									const tx = Math.hypot(ex - v.x, ey - v.y) < 1.0 ? nx : ex;
+									const ty = Math.hypot(ex - v.x, ey - v.y) < 1.0 ? ny : ey;
+									if (!this.lineStillClear(sx, sy, tx, ty, p.layer, name)) { swept = true; break; }
+								}
+								if (swept) continue;
+								for (const p of incident) {
+									if (p.kind !== 'line') continue;
+									if (Math.hypot((p.x1 ?? 0) - v.x, (p.y1 ?? 0) - v.y) < 1.0) { p.x1 = nx; p.y1 = ny; }
+									else if (Math.hypot((p.x2 ?? 0) - v.x, (p.y2 ?? 0) - v.y) < 1.0) { p.x2 = nx; p.y2 = ny; }
+								}
+								v.x = nx; v.y = ny;
+								placed = true;
+							}
+							if (placed) break;
+						}
+					}
+					if (!placed) { ok = false; break; }
 				}
 			}
 			if (!ok) {
