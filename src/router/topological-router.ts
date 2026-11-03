@@ -706,7 +706,9 @@ export class TopologicalRouter {
 			if (options.delegateAll === true) {
 				this.onProgress?.({ stage: '委托内置路由器', percentage: 20, message: `内置路由器处理 ${networks.length} 个网络...` });
 				if (options.clearExistingTraces !== false) {
-					await this.clearExistingTraces(networks.map(n => n.name));
+					try {
+						await this.purgeNetsBatch(new Set(networks.map(n => n.name)));
+					} catch { /* 清理失败不阻断 */ }
 				}
 				const t0 = Date.now();
 				const dr = await eda.pcb_Document.autoRouting({
