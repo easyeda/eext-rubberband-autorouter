@@ -714,40 +714,51 @@ export class TopologicalRouter {
 				const t0 = Date.now();
 				// 引擎映射：JRouter = COMPLETION(1) 布通率优先；HRouter = FASTER(0) 速度优先
 				//（EPCB_AutoRoutingOptimization；BETA API 不接受未文档化的 engine 属性）
-				// 拆批委托：BETA API 对大清单不稳定——63 网全量实测两次挂死 >25min（画布
-				// 零写入）、一次秒回 undefined；~7 网小批 445s 成功 6/7。每批 12 网，
-				// 先布批的走线成为后续批的画布障碍（批间自然衔接）。undefined 时等 2s
-				// 重试一次，仍失败则该批记失败并继续（不崩溃、不中断其余批）。
+				// 拆批委托：BETA API 对大清单不稳定——case12 12 网批实测「4 批全满后
+				// 连续两批挂死」（批 5 挂 11min 才吐 undefined）。批级 race 超时 600s
+				//（case9 最难 7 网批 445s 仍在界内），超时/undefined 的批**二分细分
+				// 重试**（12→6→3，floor 3）：小批已知能成。
 				const allNames = networks.map(n => n.name);
 				const BATCH = 12;
 				const routedAcc = new Set<string>();
 				const failedAcc = new Set<string>();
-				for (let i = 0; i < allNames.length && !this.shouldCancel; i += BATCH) {
-					const chunk = allNames.slice(i, i + BATCH);
+				const callChunk = (chunk: string[]): Promise<unknown> => {
 					const others = allNames.filter(n => !chunk.includes(n));
-					const batchNo = Math.floor(i / BATCH) + 1;
-					const call = (): Promise<unknown> => eda.pcb_Document.autoRouting({
-						RoutingNets: chunk,
-						ignoreNets: [...excluded, ...others],
-						optimization: options.engine === 'hrouter' ? 0 : 1,
-					} as never);
-					let dr: any = await call();
+					return Promise.race([
+						eda.pcb_Document.autoRouting({
+							RoutingNets: chunk,
+							ignoreNets: [...excluded, ...others],
+							optimization: options.engine === 'hrouter' ? 0 : 1,
+						} as never),
+						new Promise<undefined>(r => setTimeout(() => r(undefined), 600_000)),
+					]);
+				};
+				const delegateChunk = async (chunk: string[], depth: number, label: string): Promise<void> => {
+					if (this.shouldCancel) return;
+					let dr: any = await callChunk(chunk);
 					if (!dr || typeof dr !== 'object') {
-						this.onLog?.(`${engineLabel} 批 ${batchNo} 未返回结果（BETA API 已知问题），2s 后重试...`, 'warn');
-						await new Promise<void>(r => setTimeout(r, 2000));
-						dr = await call();
-					}
-					if (!dr || typeof dr !== 'object') {
-						this.onLog?.(`${engineLabel} 批 ${batchNo} 仍未返回，${chunk.length} 网记为失败`, 'error');
+						if (chunk.length > 3 && depth < 3) {
+							this.onLog?.(`${engineLabel} ${label} 超时/未返回，二分为 ${Math.ceil(chunk.length / 2)}+${Math.floor(chunk.length / 2)} 网重试`, 'warn');
+							const mid = Math.ceil(chunk.length / 2);
+							await delegateChunk(chunk.slice(0, mid), depth + 1, `${label}a`);
+							await delegateChunk(chunk.slice(mid), depth + 1, `${label}b`);
+							return;
+						}
+						this.onLog?.(`${engineLabel} ${label} 仍未返回，${chunk.length} 网记为失败`, 'error');
 						for (const nm of chunk) failedAcc.add(nm);
-						continue;
+						return;
 					}
 					const failedChunk = new Set<string>(dr.failedNets ?? []);
 					for (const nm of chunk) (failedChunk.has(nm) ? failedAcc : routedAcc).add(nm);
 					this.onLog?.(
-						`${engineLabel} 批 ${batchNo}/${Math.ceil(allNames.length / BATCH)} 完成：成功 ${chunk.length - failedChunk.size}/${chunk.length}（累计 ${Math.round((Date.now() - t0) / 1000)}s）`,
+						`${engineLabel} ${label} 完成：成功 ${chunk.length - failedChunk.size}/${chunk.length}（累计 ${Math.round((Date.now() - t0) / 1000)}s）`,
 						failedChunk.size < chunk.length ? 'success' : 'warn',
 					);
+				};
+				for (let i = 0; i < allNames.length && !this.shouldCancel; i += BATCH) {
+					const chunk = allNames.slice(i, i + BATCH);
+					const batchNo = Math.floor(i / BATCH) + 1;
+					await delegateChunk(chunk, 0, `批 ${batchNo}/${Math.ceil(allNames.length / BATCH)}`);
 					this.onProgress?.({
 						stage: '委托内置路由器',
 						percentage: 20 + Math.round(70 * Math.min(1, (i + BATCH) / allNames.length)),
