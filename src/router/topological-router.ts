@@ -790,7 +790,10 @@ export class TopologicalRouter {
 				networks,
 				staticObstacles,
 				padShapes,
-				budgetMs: options.budgetMs,
+				// 混合委托模式：引擎只拿总预算的 40%（且至少留 240s 给委托阶段）
+				budgetMs: options.hybridDelegate
+					? Math.max(60_000, Math.min(options.budgetMs * 0.4, options.budgetMs - 240_000))
+					: options.budgetMs,
 				copperLayers: bottomEnabled ? detectedLayers : 1,
 				options: {
 					// 首轮只求连通；连通完成后再做中心到中心最短路拉紧优化
