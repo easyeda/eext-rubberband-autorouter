@@ -924,10 +924,14 @@ export class TopologicalRouter {
 				});
 				try {
 					const dr = await eda.pcb_Document.autoRouting({ RoutingNets: result.failed });
-					this.onLog?.(
-						`委托内置路由器：成功 ${dr.successNetsCount}/${dr.totalNetsCount}（${Math.round((dr.duration || 0) / 1000)}s），未解 ${(dr.failedNets ?? []).length}`,
-						dr.successNetsCount ? 'success' : 'warn',
-					);
+					if (!dr || typeof dr !== 'object') {
+						this.onLog?.(`委托内置路由器返回异常：${JSON.stringify(dr) ?? 'undefined'}（BETA API 静默失败，跳过委托）`, 'warn');
+					} else {
+						this.onLog?.(
+							`委托内置路由器：成功 ${dr.successNetsCount}/${dr.totalNetsCount}（${Math.round((dr.duration || 0) / 1000)}s），未解 ${(dr.failedNets ?? []).length}`,
+							dr.successNetsCount ? 'success' : 'warn',
+						);
+					}
 				} catch (err) {
 					this.onLog?.('委托内置路由器失败：' + (err instanceof Error ? err.message : String(err)), 'error');
 				}
