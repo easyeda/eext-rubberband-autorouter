@@ -14,7 +14,7 @@ import {
 	pointSegDist, padExitModel, padShapeToCircles, padShapeDistance, fanoutFillet,
 	slotCoverHalfExtents,
 } from './rubberband-engine';
-import { routeConnection } from './visibility-router';
+import { routeConnection, validatePrimsAgainst } from './visibility-router';
 import { polygonToRect } from './rubberband-engine';
 export { vrStats, vrStatsReset } from './visibility-router';
 export { polygonToRect };
@@ -6049,11 +6049,11 @@ export class PlanningEngine {
 	 * 输入的 prims 直接来自画布读回（pcb_PrimitiveLine/Arc.getAll 按 net
 	 * 分组），vias 同理。处理在内存完成，调用方负责回写画布。
 	 */
-	public postProcessImportedNets(
+	public async postProcessImportedNets(
 		entries: Array<{ name: string; prims: RenderedPrim[]; vias: PlannedVia[] }>,
 		drc: DRCRules,
 		allPads: EnginePad[],
-	): Array<{ name: string; prims: RenderedPrim[]; vias: PlannedVia[]; changed: boolean }> {
+	): Promise<Array<{ name: string; prims: RenderedPrim[]; vias: PlannedVia[]; changed: boolean }>> {
 		this.drc = drc;
 		this.allPads = allPads;
 		this.planOptions = { connectivityFirst: true, optimize: false };
@@ -6063,24 +6063,80 @@ export class PlanningEngine {
 		this.routedEdges.clear();
 		this.routedOrder = [];
 		const out: Array<{ name: string; prims: RenderedPrim[]; vias: PlannedVia[]; changed: boolean }> = [];
-		// 先登记全部铜皮为障碍（后处理的拉紧/圆润要看到其它网的铜皮）
+		// 先登记全部铜皮为障碍（后处理的拉紧/圆润要看到其它网的铜皮），
+		// 并按网记账——拉紧某网时把它的旧几何摘出世界（旧路不挡新路）。
+		const obsByNet = new Map<string, RBObstacle[]>();
 		for (const e of entries) {
 			this.netRendered.set(e.name, e.prims);
 			this.plannedVias.push(...e.vias);
+			const mark = this.dynamicObstacles.length;
 			if (e.prims.length) this.addRenderedToObstacles(mergePrims(e.prims));
+			obsByNet.set(e.name, this.dynamicObstacles.slice(mark));
 		}
 		for (const e of entries) {
 			const before = renderedLength(e.prims);
 			let prims = e.prims;
+			let vias = e.vias;
 			try {
-				this.tautenNet(e.name);
-				prims = this.netRendered.get(e.name) ?? prims;
+				// 1) 摘除本网旧几何与旧过孔
+				const own = new Set(obsByNet.get(e.name) ?? []);
+				this.dynamicObstacles = this.dynamicObstacles.filter(o => !own.has(o));
+				this.plannedVias = this.plannedVias.filter(v => v.net !== e.name);
+				// 2) 真拉紧：可视图逐边重解（仅同层网；更短且全量复验通过才采纳）
+				let adopted: RenderedPrim[] | null = null;
+				try {
+					adopted = e.vias.length ? null : await this.resolveImportedNet(e.name);
+				} catch { adopted = null; }
+				if (adopted) {
+					prims = adopted;
+					vias = [];
+				} else {
+					// 3) 退回隔点拉直（Manhattan 折线删得动的地方有限）
+					this.tautenNet(e.name);
+					prims = this.netRendered.get(e.name) ?? e.prims;
+				}
+				// 4) 圆润（拐角切线圆弧）
 				const smoothed = this.smoothCorners(mergePrims(prims), e.name);
 				if (renderedLength(smoothed) <= renderedLength(prims) + 0.5) prims = smoothed;
 			} catch { /* 后处理失败保留原几何（外部引擎产物已可用） */ }
+			// 5) 登记最终形态为障碍（后续网的拉紧要看到本网的最终位置）
 			this.netRendered.set(e.name, prims);
-			out.push({ name: e.name, prims, vias: e.vias, changed: renderedLength(prims) < before - 0.5 });
+			if (prims.length) this.addRenderedToObstacles(mergePrims(prims));
+			this.plannedVias.push(...vias);
+			out.push({ name: e.name, prims, vias, changed: renderedLength(prims) < before - 0.5 });
 		}
+		return out;
+	}
+
+	/**
+	 * 导入网的可视图重解（真拉紧）：按 MST 逐边在「其它网铜皮」世界求
+	 * 最短路。仅处理无过孔的纯同层网（跨层网保持原几何走隔点拉直）。
+	 * 更短且 validatePrimsAgainst 全量复验通过才采纳，否则返回 null。
+	 */
+	private async resolveImportedNet(name: string): Promise<RenderedPrim[] | null> {
+		const pads = this.allPads.filter(p => p.net === name);
+		if (pads.length < 2) return null;
+		const edges = this.computeMST(pads);
+		const out: RenderedPrim[] = [];
+		for (const [ia, ib] of edges) {
+			const a = pads[ia], b = pads[ib];
+			const layer = getRoutingLayer(a, b);
+			if (bottomCapable(a) !== bottomCapable(b) && layer === 1) return null;   // 跨层网不重解
+			// 该层世界：动态障碍按层过滤（全层障碍保留）
+			const obs = this.dynamicObstacles.filter(o => o.layer === undefined || o.layer === layer);
+			const r = await routeConnection(
+				{ x: a.x, y: a.y }, { x: b.x, y: b.y }, obs, name,
+				[150, 500], 3000, () => this.checkCancelled(),
+			);
+			if (!r.ok || !r.prims.length) return null;
+			for (const p of r.prims) out.push({ ...(p as RenderedPrim), net: name, layer });
+		}
+		const orig = this.netRendered.get(name);
+		if (!orig || !orig.length || renderedLength(out) >= renderedLength(orig) - 0.5) return null;
+		const layer = getRoutingLayer(pads[0], pads[1]);
+		const obs = this.dynamicObstacles.filter(o => o.layer === undefined || o.layer === layer);
+		const valid = await validatePrimsAgainst(out as unknown as RBPrimitive[], obs, name);
+		if (!valid) return null;
 		return out;
 	}
 }

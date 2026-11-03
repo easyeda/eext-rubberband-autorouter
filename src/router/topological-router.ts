@@ -823,9 +823,10 @@ export class TopologicalRouter {
 							byNet.set(net, e);
 						}
 						const entries = [...byNet.entries()].map(([name, e]) => ({ name, ...e }));
-						// 后处理管线（引擎公开入口）：登记障碍 → 逐网拉紧 + 圆润
+						// 后处理管线（引擎公开入口）：摘本网旧几何 → 可视图逐边重解
+						//（真拉紧）→ 更短才采纳 → 圆润。allPads 传真实焊盘（MST/保护集）
 						const eng = new PlanningEngine();
-						const optimized = eng.postProcessImportedNets(entries, drc, []);
+						const optimized = await eng.postProcessImportedNets(entries, drc, networks.flatMap(n => n.pads));
 						// 回写：整批清掉原几何，逐网写优化结果
 						await this.purgeManagedNets(new Set(entries.map(e => e.name)));
 						this.netPrimIds.clear();
