@@ -25,8 +25,6 @@ export interface RouterUiOptions {
 	finalOptimize: boolean;
 	/** 失败网络允许过孔换层（底层兜底） */
 	viaFallback: boolean;
-	/** 允许过孔落在焊盘上（默认关闭：过孔铜环必须避开所有焊盘铜皮） */
-	allowViaInPad: boolean;
 	/** 允许布线的铜层 ID（1 = 顶层，2 = 底层；顶层始终可用） */
 	routeLayers: number[];
 	/** 布线前清除待布网络的既有走线（重新布线语义；默认开启） */
@@ -35,6 +33,8 @@ export interface RouterUiOptions {
 	excludeNets: string[];
 	/** 自动排除 GND/VSS 等地网络（默认开启）：不布地网、不清理其既有走线 */
 	excludeGnd: boolean;
+	/** 布线引擎：rrouter = 插件自带橡皮筋引擎；jrouter/hrouter = EDA 内置引擎 */
+	engine: 'rrouter' | 'jrouter' | 'hrouter';
 	/** 混合模式：引擎结束后把失败网委托给内置自动布线器（BETA API，耗时不可控，默认关闭） */
 	hybridDelegate: boolean;
 	/** 整机委托模式：跳过本引擎，直接用内置路由器布全部网络（密压板实测更强） */
@@ -56,11 +56,11 @@ export const DEFAULT_ROUTER_OPTIONS: RouterUiOptions = {
 	livePreview: true,
 	finalOptimize: true,
 	viaFallback: true,
-	allowViaInPad: false,
 	routeLayers: [1, 2],
 	clearExistingTraces: true,
 	excludeNets: [],
 	excludeGnd: true,
+	engine: 'rrouter',
 	hybridDelegate: false,
 	delegateAll: false,
 	netOrder: 'auto',
@@ -96,11 +96,11 @@ export function normalizeRouterOptions(input: Partial<RouterUiOptions> | undefin
 		livePreview: o.livePreview !== false,
 		finalOptimize: o.finalOptimize !== false,
 		viaFallback: o.viaFallback !== false,
-		allowViaInPad: o.allowViaInPad === true,
 		routeLayers: [...layers].sort((a, b) => a - b),
 		clearExistingTraces: o.clearExistingTraces !== false,
 		excludeNets: excluded,
 		excludeGnd: o.excludeGnd !== false,
+		engine: ['rrouter','jrouter','hrouter'].includes(o.engine) ? o.engine : 'rrouter',
 		hybridDelegate: o.hybridDelegate === true,
 		delegateAll: o.delegateAll === true,
 		netOrder: NET_ORDERS.includes(o.netOrder) ? o.netOrder : 'auto',

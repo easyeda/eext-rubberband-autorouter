@@ -158,7 +158,11 @@ export async function gridRoute(req: GridRouteRequest): Promise<GridRouteResult>
 	const x1 = Math.ceil(Math.max(src.x, dst.x) + margin);
 	const y0 = Math.floor(Math.min(src.y, dst.y) - margin);
 	const y1 = Math.ceil(Math.max(src.y, dst.y) + margin);
-	const maxCells = req.maxCells ?? 400_000;
+	// 单元尺寸自适应：保证每层网格 ≤ maxCells。
+	// 400k 上限会把长边（跨板连接器网）逼到 cell≈7.3 —— 0.5mm 排的
+	// 15.98mil 逃逸车道在粗网格里无法表示（case9 LCD 墙的直接死因）。
+	// 1.2M 单元 ≈ 3.2MB 瞬态内存，cell=4 可覆盖 ~1500mil 跨度。
+	const maxCells = req.maxCells ?? 1_200_000;
 	// 单元尺寸自适应：保证每层网格 ≤ maxCells
 	let cell = Math.max(4, req.cell ?? 8);
 	for (;;) {

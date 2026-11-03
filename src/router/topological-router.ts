@@ -703,20 +703,24 @@ export class TopologicalRouter {
 			// 全部待布网络。内置路由器（WASM）在密排板上实测远强于本引擎
 			//（case12：内置 120s 除 GND 全通 vs 本引擎 71-73/98）。本引擎继续
 			// 负责：GND/排除网口径、既有走线清理、DRC 验证与统计上报。
-			if (options.delegateAll === true) {
-				this.onProgress?.({ stage: '委托内置路由器', percentage: 20, message: `内置路由器处理 ${networks.length} 个网络...` });
+			if (options.delegateAll === true || options.engine === 'jrouter' || options.engine === 'hrouter') {
+				const engineLabel = options.engine === 'hrouter' ? 'HRouter' : 'JRouter';
+				this.onProgress?.({ stage: '委托内置路由器', percentage: 20, message: `${engineLabel} 处理 ${networks.length} 个网络...` });
 				if (options.clearExistingTraces !== false) {
 					try {
 						await this.purgeNetsBatch(new Set(networks.map(n => n.name)));
 					} catch { /* 清理失败不阻断 */ }
 				}
 				const t0 = Date.now();
+				// engine 属性透传（BETA API 的引擎选择；客户端不识别时静默忽略）
 				const dr = await eda.pcb_Document.autoRouting({
 					RoutingNets: networks.map(n => n.name),
 					ignoreNets: [...excluded],
-				});
+					optimization: 1,   // COMPLETION：布通率优先
+					engine: options.engine,
+				} as never);
 				const dur = Date.now() - t0;
-				this.onLog?.(`整机委托完成：成功 ${dr.successNetsCount}/${dr.totalNetsCount}（${Math.round(dur / 1000)}s），未解 ${(dr.failedNets ?? []).length}`, dr.successNetsCount ? 'success' : 'warn');
+				this.onLog?.(`${engineLabel} 委托完成：成功 ${dr.successNetsCount}/${dr.totalNetsCount}（${Math.round(dur / 1000)}s），未解 ${(dr.failedNets ?? []).length}`, dr.successNetsCount ? 'success' : 'warn');
 				// DRC 复核（与引擎路径同口径的上报）
 				this.routedNames = new Set(networks.map(n => n.name).filter(n => !(dr.failedNets ?? []).includes(n)));
 				this.failedNames = new Set(dr.failedNets ?? []);
@@ -739,6 +743,55 @@ export class TopologicalRouter {
 						}
 					}
 				} catch { /* DRC 复核失败不阻断 */ }
+
+				// ── 后处理：读回画布几何 → 拉紧 + 圆润（适配三个引擎的产物）→ 回写
+				// 决策：先落盘再优化再刷新（内置路由器直接写画布，无插入前钩子）。
+				if (!this.shouldCancel && this.routedNames.size) {
+					try {
+						this.onProgress?.({ stage: '形态优化', percentage: 90, message: '对内置路由结果做拉紧/圆润优化...' });
+						const lines = (await eda.pcb_PrimitiveLine.getAll()) ?? [];
+						const arcs = (await eda.pcb_PrimitiveArc.getAll()) ?? [];
+						const vias = (await eda.pcb_PrimitiveVia.getAll()) ?? [];
+						const byNet = new Map<string, { prims: RenderedPrim[]; vias: PlannedVia[] }>();
+						for (const l of lines as any[]) {
+							const net = String(l.net ?? '');
+							if (!this.routedNames.has(net)) continue;
+							const e = byNet.get(net) ?? { prims: [], vias: [] };
+							e.prims.push({ kind: 'line', net, layer: l.layer ?? l.layerId ?? 1, x1: l.startX ?? l.x, y1: l.startY ?? l.y, x2: l.endX, y2: l.endY });
+							byNet.set(net, e);
+						}
+						for (const a of arcs as any[]) {
+							const net = String(a.net ?? '');
+							if (!this.routedNames.has(net)) continue;
+							const e = byNet.get(net) ?? { prims: [], vias: [] };
+							e.prims.push({ kind: 'arc', net, layer: a.layer ?? a.layerId ?? 1, cx: a.centerX ?? a.cx, cy: a.centerY ?? a.cy, r: a.radius ?? a.r, startAngle: a.startAngle, sweep: a.sweep });
+							byNet.set(net, e);
+						}
+						for (const v of vias as any[]) {
+							const net = String(v.net ?? '');
+							if (!this.routedNames.has(net)) continue;
+							const e = byNet.get(net) ?? { prims: [], vias: [] };
+							e.vias.push({ net, x: v.x, y: v.y, dia: v.viaDiameter ?? 24, hole: v.holeDiameter ?? 12 });
+							byNet.set(net, e);
+						}
+						const entries = [...byNet.entries()].map(([name, e]) => ({ name, ...e }));
+						// 后处理管线（引擎公开入口）：登记障碍 → 逐网拉紧 + 圆润
+						const eng = new PlanningEngine();
+						const optimized = eng.postProcessImportedNets(entries, drc, []);
+						// 回写：整批清掉原几何，逐网写优化结果
+						await this.purgeManagedNets(new Set(entries.map(e => e.name)));
+						this.netPrimIds.clear();
+						for (const e of optimized) {
+							if (!e.prims.length) continue;
+							await this.writeNet(e.name, e.prims, e.vias, true);
+						}
+						const changed = optimized.filter(e => e.changed).length;
+						this.onLog?.(`形态优化完成：${optimized.length} 网（${changed} 网有缩短）`, 'info');
+					} catch (err) {
+						this.onLog?.('后处理失败（保留内置路由原几何）：' + (err instanceof Error ? err.message : String(err)), 'warn');
+					}
+				}
+
 				this.emitStats();
 				const stats = this.snapshotStats();
 				this.onProgress?.({ stage: '完成', percentage: 100, message: '委托布线完成' });
@@ -800,7 +853,7 @@ export class TopologicalRouter {
 					connectivityFirst: true,
 					optimize: options.finalOptimize !== false,
 					allowViaFallback: options.viaFallback !== false,
-					allowViaInPad: options.allowViaInPad === true,
+					allowViaInPad: false,
 					escapeClearanceMil: options.escapeClearanceMil,
 					ripupRounds: options.ripupRounds,
 					powerNetsFirst: options.powerNetsFirst,

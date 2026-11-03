@@ -119,6 +119,29 @@
 		box-shadow: 0 0 0 3px var(--accent-soft);
 	}
 	.section-title .spacer { flex: 1; }
+	.engine-radios {
+		display: flex; gap: 6px; margin: 6px 0 4px;
+	}
+	.engine-radio {
+		flex: 1; display: flex; align-items: center; justify-content: center; gap: 5px;
+		padding: 7px 4px; border: 1px solid var(--border); border-radius: 8px;
+		cursor: pointer; font-size: 11.5px; font-weight: 600; color: var(--muted);
+		transition: all 0.15s;
+	}
+	.engine-radio input { accent-color: var(--accent); margin: 0; }
+	.engine-radio:has(input:checked) {
+		border-color: var(--accent); color: var(--text);
+		background: var(--accent-soft);
+	}
+	.engine-help {
+		width: 14px; height: 14px; border-radius: 50%;
+		border: 1px solid var(--border); color: var(--muted);
+		font-size: 9px; font-weight: 700; display: inline-flex;
+		align-items: center; justify-content: center; cursor: help;
+		margin-left: auto;
+	}
+	.engine-hint { display: block; color: var(--muted); font-size: 10px; line-height: 1.5; margin-bottom: 4px; }
+	.rrouter-only { }
 	.section-title .count {
 		font-size: 10px; font-weight: 600; color: var(--faint);
 		text-transform: none; letter-spacing: 0;
@@ -357,9 +380,23 @@
 		<!-- 左栏：参数 -->
 		<div class="col col-left">
 			<section class="card">
+				<div class="section-title">
+					<span class="dot"></span>布线引擎
+					<span class="engine-help" id="engineHelp" title="">?</span>
+				</div>
+
+				<div class="engine-radios">
+					<label class="engine-radio"><input type="radio" name="engine" value="rrouter" checked><span>RRouter</span></label>
+					<label class="engine-radio"><input type="radio" name="engine" value="jrouter"><span>JRouter</span></label>
+					<label class="engine-radio"><input type="radio" name="engine" value="hrouter"><span>HRouter</span></label>
+				</div>
+				<small class="engine-hint" id="engineHint">插件自带橡皮筋引擎，支持实时预览与形态优化；布通率不理想时可切换 JRouter / HRouter（EDA 内置引擎）</small>
+			</section>
+
+			<section class="card">
 				<div class="section-title"><span class="dot"></span>走线</div>
 
-				<div class="row">
+				<div class="row rrouter-only">
 					<div class="label">
 						<span>走线宽度</span>
 						<small>同时影响障碍外扩半径，越宽越难穿插</small>
@@ -396,7 +433,7 @@
 			<section class="card">
 				<div class="section-title"><span class="dot"></span>布线策略</div>
 
-				<div class="row">
+				<div class="row rrouter-only">
 					<div class="label">
 						<span>网络排序</span>
 						<small>自动 = 短连接 → 信号 → 电源 → 地（地最后）</small>
@@ -413,7 +450,7 @@
 					</div>
 				</div>
 
-				<div class="row">
+				<div class="row rrouter-only">
 					<div class="label">
 						<span>撕毁重布轮数</span>
 						<small>布不通时拆除挡路网络重试的轮数，越大越慢</small>
@@ -449,7 +486,7 @@
 			<section class="card">
 				<div class="section-title"><span class="dot"></span>执行选项</div>
 
-				<div class="row">
+				<div class="row rrouter-only">
 					<div class="label">
 						<span>实时预览</span>
 						<small>每网完成即刷新；关闭则最后写入（更快）</small>
@@ -459,7 +496,7 @@
 					</div>
 				</div>
 
-				<div class="row">
+				<div class="row rrouter-only">
 					<div class="label">
 						<span>最后凸包优化</span>
 						<small>全部布通后做端帽/圆角/拉紧</small>
@@ -469,7 +506,7 @@
 					</div>
 				</div>
 
-				<div class="row">
+				<div class="row rrouter-only">
 					<div class="label">
 						<span>过孔换层兜底</span>
 						<small>同层不通时打孔换层（关闭底层后失效）</small>
@@ -489,17 +526,7 @@
 					</div>
 				</div>
 
-				<div class="row">
-					<div class="label">
-						<span>允许焊盘打孔</span>
-						<small>过孔可直接落在焊盘上（默认关闭）</small>
-					</div>
-					<div class="control">
-						<label class="switch"><input type="checkbox" id="allowViaInPad"><span></span></label>
-					</div>
-				</div>
-
-				<div class="row">
+				<div class="row rrouter-only">
 					<div class="label">
 						<span>混合模式：失败网委托内置路由器</span>
 						<small>引擎结��后用内置自动布线器处理残留网（耗时不可控）</small>
@@ -509,7 +536,7 @@
 					</div>
 				</div>
 
-				<div class="row">
+				<div class="row rrouter-only">
 					<div class="label">
 						<span>整机委托内置路由器</span>
 						<small>跳过本引擎，全部网络交给内置路由器（密压板实测更强）</small>
@@ -587,7 +614,6 @@
 			livePreview: true,
 			finalOptimize: true,
 			viaFallback: true,
-			allowViaInPad: false,
 			routeLayers: [1, 2],
 			excludeNets: [],
 			excludeGnd: true,
@@ -787,10 +813,13 @@
 			$('livePreview').checked = o.livePreview !== false;
 			$('finalOptimize').checked = o.finalOptimize !== false;
 			$('viaFallback').checked = o.viaFallback !== false;
-			$('allowViaInPad').checked = o.allowViaInPad === true;
 			$('excludeGnd').checked = o.excludeGnd !== false;
 			$('hybridDelegate').checked = o.hybridDelegate === true;
 			$('delegateAll').checked = o.delegateAll === true;
+			var engRadio = document.querySelector('input[name="engine"][value="' + (o.engine || 'rrouter') + '"]')
+				|| document.querySelector('input[name="engine"][value="rrouter"]');
+			if (engRadio) engRadio.checked = true;
+			setEngineUi(o.engine || 'rrouter');
 
 			if (netRows.length) {
 				applyNetSelection(o.excludeNets || []);
@@ -818,7 +847,6 @@
 				livePreview: $('livePreview').checked,
 				finalOptimize: $('finalOptimize').checked,
 				viaFallback: $('viaFallback').checked,
-				allowViaInPad: $('allowViaInPad').checked,
 				hybridDelegate: $('hybridDelegate').checked,
 				delegateAll: $('delegateAll').checked,
 				routeLayers: layers,
@@ -827,14 +855,42 @@
 					? netRows.filter(function (r) { return !r.input.checked; }).map(function (r) { return r.name; })
 					: [],
 				excludeGnd: $('excludeGnd').checked && !gndChecked,
-				netOrder: $('netOrder').value
+				netOrder: $('netOrder').value,
+				engine: (document.querySelector('input[name="engine"]:checked') || {}).value || 'rrouter'
 			};
+		}
+
+		// ── 引擎选择 ──────────────────────────────
+		var ENGINE_META = {
+			rrouter: {
+				hint: '插件自带橡皮筋引擎，支持实时预览与形态优化；布通率不理想时可切换 JRouter / HRouter（EDA 内置引擎）',
+				title: 'RRouter：插件自带的橡皮筋引擎（持续迭代中）。逐网拓扑布线 + 拥挤协商 + 实时圆润。对常规板布通质量最好；密排连接器板若布通率低，建议切换 JRouter / HRouter。'
+			},
+			jrouter: {
+				hint: 'EDA 内置引擎 J：布通率优先，密压板表现更强；完成后自动做拉紧/圆润优化',
+				title: 'JRouter：EDA 内置自动布线引擎（布通率优先）。密排连接器板表现显著更强；完成后插件会对结果做橡皮筋拉紧与圆润优化。部分 RRouter 选项不适用于内置引擎。'
+			},
+			hrouter: {
+				hint: 'EDA 内置引擎 H：另一种内置布线策略；完成后自动做拉紧/圆润优化',
+				title: 'HRouter：EDA 内置自动布线引擎（另一种布线策略）。完成后插件会对结果做橡皮筋拉紧与圆润优化。部分 RRouter 选项不适用于内置引擎。'
+			}
+		};
+		function setEngineUi(engine) {
+			var meta = ENGINE_META[engine] || ENGINE_META.rrouter;
+			var hint = document.getElementById('engineHint');
+			var help = document.getElementById('engineHelp');
+			if (hint) hint.textContent = meta.hint;
+			if (help) help.title = meta.title;
+			// RRouter 专属选项仅在 RRouter 下显示（内置引擎使用自身规则）
+			var rows = document.querySelectorAll('.rrouter-only');
+			for (var i = 0; i < rows.length; i++) {
+				rows[i].style.display = engine === 'rrouter' ? '' : 'none';
+			}
 		}
 
 		function updateLayerState() {
 			var single = $('layerBottom').disabled || !$('layerBottom').checked;
 			$('viaFallback').disabled = single;
-			$('allowViaInPad').disabled = single;
 			if (single) {
 				$('viaFallback').checked = false;
 			}
@@ -876,6 +932,12 @@
 		});
 
 		$('layerBottom').addEventListener('change', updateLayerState);
+		// 引擎切换：更新提示文案 + 隐藏内置引擎不支持的 RRouter 专属选项
+		Array.prototype.forEach.call(document.querySelectorAll('input[name="engine"]'), function (radio) {
+			radio.addEventListener('change', function () {
+				if (this.checked) setEngineUi(this.value);
+			});
+		});
 		$('excludeGnd').addEventListener('change', function () {
 			// 关闭「排除 GND」时把地网络恢复为选中（用户仍可在列表里单独取消）
 			if (!this.checked) {

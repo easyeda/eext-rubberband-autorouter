@@ -377,7 +377,6 @@ export class PlanningEngine {
 		return this.copperLayers >= 2;
 	}
 
-	/** 是否允许过孔落在焊盘铜皮上（默认关闭） */
 	private get allowViaInPad(): boolean {
 		return this.planOptions.allowViaInPad === true;
 	}
@@ -6040,5 +6039,48 @@ export class PlanningEngine {
 			}
 		}
 		this.progress(98, '优化完成');
+	}
+
+	/**
+	 * J/H 引擎结果的后处理入口（多引擎架构）：外部引擎（内置自动布线等）
+	 * 的走线读回后，登记障碍并逐网做拉紧（tauten）+ 圆润（smoothCorners）
+	 * —— 让三个引擎的产物共享同一套形态优化管线。
+	 *
+	 * 输入的 prims 直接来自画布读回（pcb_PrimitiveLine/Arc.getAll 按 net
+	 * 分组），vias 同理。处理在内存完成，调用方负责回写画布。
+	 */
+	public postProcessImportedNets(
+		entries: Array<{ name: string; prims: RenderedPrim[]; vias: PlannedVia[] }>,
+		drc: DRCRules,
+		allPads: EnginePad[],
+	): Array<{ name: string; prims: RenderedPrim[]; vias: PlannedVia[]; changed: boolean }> {
+		this.drc = drc;
+		this.allPads = allPads;
+		this.planOptions = { connectivityFirst: true, optimize: false };
+		this.netRendered.clear();
+		this.dynamicObstacles = [];
+		this.plannedVias = [];
+		this.routedEdges.clear();
+		this.routedOrder = [];
+		const out: Array<{ name: string; prims: RenderedPrim[]; vias: PlannedVia[]; changed: boolean }> = [];
+		// 先登记全部铜皮为障碍（后处理的拉紧/圆润要看到其它网的铜皮）
+		for (const e of entries) {
+			this.netRendered.set(e.name, e.prims);
+			this.plannedVias.push(...e.vias);
+			if (e.prims.length) this.addRenderedToObstacles(mergePrims(e.prims));
+		}
+		for (const e of entries) {
+			const before = renderedLength(e.prims);
+			let prims = e.prims;
+			try {
+				this.tautenNet(e.name);
+				prims = this.netRendered.get(e.name) ?? prims;
+				const smoothed = this.smoothCorners(mergePrims(prims), e.name);
+				if (renderedLength(smoothed) <= renderedLength(prims) + 0.5) prims = smoothed;
+			} catch { /* 后处理失败保留原几何（外部引擎产物已可用） */ }
+			this.netRendered.set(e.name, prims);
+			out.push({ name: e.name, prims, vias: e.vias, changed: renderedLength(prims) < before - 0.5 });
+		}
+		return out;
 	}
 }
