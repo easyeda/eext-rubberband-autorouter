@@ -475,6 +475,18 @@ export class PlanningEngine {
 		// 网络排序（auto = 专业自动规划；地网络永远最后）
 		const networks = this.sortNetworks(input.networks);
 
+		// ── 总线束前置（Topola antrouter 思路第一片）——实验否定：case9 离线
+		// 52/63 vs 基线 56，重排覆盖面过大摧毁了调校过的 auto 顺序（与「顺序
+		// 扰动有害」的既有结论一致）。默认关闭，__RB_BUNDLE__=1 显式启用。
+		if ((globalThis as any).__RB_BUNDLE__ === 1 && networks.length > 8) {
+			const bundled = this.reorderByBundles(networks);
+			if (bundled) {
+				networks.length = 0;
+				networks.push(...bundled);
+				this.log(`[bundle] 总线束前置重排：${bundled.map(n => n.name).join(' → ')}`, 'info');
+			}
+		}
+
 		this.log(`网络顺序（${this.planOptions.netOrder ?? 'auto'}）：${networks.map(n => n.name).join(' → ')}`, 'info');
 		const pendingNets: Array<{ name: string; pads: EnginePad[] }> = [];
 
@@ -1298,6 +1310,60 @@ export class PlanningEngine {
 	 * 显式几何顺序仍可指定 river / shortest / longest / max-x / reverse，
 	 * 层内比较规则与 river 相同（按 minX 聚束），只是全局扫描方向不同。
 	 */
+	/**
+	 * 总线束重排：识别「同向 + 同源行 + 同目标带」的两焊盘网聚成束，
+	 * 束内按目标横向位置排序（逃逸不交叉），大束优先置前；其余网保持
+	 * 原相对顺序。无束则返回 null（不重排）。
+	 */
+	private reorderByBundles(networks: Array<{ name: string; pads: EnginePad[] }>): Array<{ name: string; pads: EnginePad[] }> | null {
+		const PAR = 0.26;    // ≈15°：方向平行阈值（|cross|/|d1||d2|）
+		const SRC_BAND = 130;  // 源焊盘垂直偏移带宽（mil）——同一「行」
+		const DST_BAND = 220;  // 目标焊盘垂直偏移带宽（mil）
+		const two = networks.filter(n => n.pads.length === 2);
+		if (two.length < 3) return null;
+		const vecOf = (n: { pads: EnginePad[] }): { dx: number; dy: number; len: number } => {
+			const dx = n.pads[1].x - n.pads[0].x, dy = n.pads[1].y - n.pads[0].y;
+			const len = Math.hypot(dx, dy) || 1;
+			return { dx, dy, len };
+		};
+		const perpOf = (p: EnginePad, o: { x: number; y: number }, dir: { dx: number; dy: number; len: number }): number =>
+			((p.x - o.x) * dir.dy - (p.y - o.y) * dir.dx) / dir.len;
+		const used = new Set<string>();
+		const bundles: Array<Array<{ name: string; pads: EnginePad[] }>> = [];
+		for (const seed of two) {
+			if (used.has(seed.name)) continue;
+			const sv = vecOf(seed);
+			if (sv.len < 150) continue;   // 太短的网不构成走廊束
+			const members: Array<{ name: string; pads: EnginePad[] }> = [seed];
+			used.add(seed.name);
+			for (const cand of two) {
+				if (used.has(cand.name)) continue;
+				const cv = vecOf(cand);
+				const cross = Math.abs(sv.dx * cv.dy - sv.dy * cv.dx) / (sv.len * cv.len);
+				const dot = (sv.dx * cv.dx + sv.dy * cv.dy) / (sv.len * cv.len);
+				if (cross > PAR || dot < 0.9) continue;
+				// 同源行 + 同目标带（垂直于束方向的偏移都在带宽内）
+				if (Math.abs(perpOf(cand.pads[0], seed.pads[0], sv)) > SRC_BAND) continue;
+				if (Math.abs(perpOf(cand.pads[1], seed.pads[1], sv)) > DST_BAND) continue;
+				members.push(cand);
+				used.add(cand.name);
+			}
+			if (members.length >= 3) bundles.push(members);
+			else members.forEach(m => used.delete(m.name));   // 不成束的放回
+		}
+		if (!bundles.length) return null;
+		// 束内按目标端横向坐标排序（垂直于束方向），逃逸天然不交叉
+		for (const b of bundles) {
+			const dir = vecOf(b[0]);
+			b.sort((a, c) => perpOf(a.pads[1], b[0].pads[1], dir) - perpOf(c.pads[1], b[0].pads[1], dir));
+		}
+		bundles.sort((a, c) => c.length - a.length);   // 大束优先
+		const front = new Map<string, { name: string; pads: EnginePad[] }>();
+		for (const b of bundles) for (const m of b) front.set(m.name, m);
+		const rest = networks.filter(n => !front.has(n.name));
+		return [...bundles.flat(), ...rest];
+	}
+
 	private sortNetworks(nets: Array<{ name: string; pads: EnginePad[] }>): Array<{ name: string; pads: EnginePad[] }> {
 		const mode = this.planOptions.netOrder ?? 'auto';
 		const span = (n: { name: string; pads: EnginePad[] }) => {
