@@ -714,11 +714,22 @@ export class TopologicalRouter {
 				const t0 = Date.now();
 				// 引擎映射：JRouter = COMPLETION(1) 布通率优先；HRouter = FASTER(0) 速度优先
 				// （EPCB_AutoRoutingOptimization；BETA API 不接受未文档化的 engine 属性）
-				const dr = await eda.pcb_Document.autoRouting({
+				// BETA API 对大清单不稳定：实测同一批网一次挂起 >900s、一次秒回 undefined
+				//（63 网全量）。undefined 时等 2s 重试一次，仍失败则报错退出而不是崩溃。
+				const callAutoRouting = (): Promise<unknown> => eda.pcb_Document.autoRouting({
 					RoutingNets: networks.map(n => n.name),
 					ignoreNets: [...excluded],
 					optimization: options.engine === 'hrouter' ? 0 : 1,
 				} as never);
+				let dr: any = await callAutoRouting();
+				if (!dr || typeof dr !== 'object') {
+					this.onLog?.(`${engineLabel} 首次调用未返回结果（BETA API 大清单已知问题），2s 后重试一次...`, 'warn');
+					await new Promise<void>(r => setTimeout(r, 2000));
+					dr = await callAutoRouting();
+				}
+				if (!dr || typeof dr !== 'object') {
+					throw new Error(`${engineLabel} 内置引擎未返回布线结果（autoRouting BETA API 不稳定），请改用 RRouter 或重试`);
+				}
 				const dur = Date.now() - t0;
 				this.onLog?.(`${engineLabel} 委托完成：成功 ${dr.successNetsCount}/${dr.totalNetsCount}（${Math.round(dur / 1000)}s），未解 ${(dr.failedNets ?? []).length}`, dr.successNetsCount ? 'success' : 'warn');
 				// DRC 复核（与引擎路径同口径的上报）
