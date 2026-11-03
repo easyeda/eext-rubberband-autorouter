@@ -853,8 +853,14 @@ export class TopologicalRouter {
 							const walkV = (node: any): void => {
 								if (!node) return;
 								if (Array.isArray(node)) { node.forEach(walkV); return; }
+								// 连接类错误（errorType=Connection Error，未连接焊盘的
+								// errorObjType 是 "SMD Pad"/"TH Pad" 且无 minDistance）
+								// 不是走线间距违规——c12v143 实测误归属把 77 网降到 20。
+								if (node.errorType === 'Connection Error') return;
 								if (node.errorObjType && node.errorObjType !== 'Connection Error' && node.errorObjType !== 'Board Outline to SMD Pad') {
 									const ed = node.explanation?.errData ?? {};
+									// 真间距违规必带 minDistance/clearance；缺的是连接/其它类
+									if (!Number.isFinite(ed.minDistance) && !Number.isFinite(ed.clearance)) return;
 									const p = ed.position;
 									if (p && Number.isFinite(p.x) && Number.isFinite(p.y)) viol.push({ x: p.x * 10, y: p.y * 10, kind: String(node.errorObjType) });
 									return;
