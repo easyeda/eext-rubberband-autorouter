@@ -920,6 +920,9 @@ export class TopologicalRouter {
 				//（排除网的走线 collectStaticObstacles 照收，README 语义）。
 				this.netPrimIds.clear();
 				this.touchedNets.clear();
+				// 子 route() 的 isRouting 守卫会拦住递归（外层还挂着 true）——
+				// 递归是本运行的最后动作，临时放开，外层 finally 再兜底复位。
+				this.isRouting = false;
 				this.hybridRepairDepth++;
 				try {
 					const sub = await this.route({
