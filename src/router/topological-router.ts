@@ -824,9 +824,12 @@ export class TopologicalRouter {
 						}
 						const entries = [...byNet.entries()].map(([name, e]) => ({ name, ...e }));
 						// 后处理管线（引擎公开入口）：摘本网旧几何 → 可视图逐边重解
-						//（真拉紧）→ 更短才采纳 → 圆润。allPads 传真实焊盘（MST/保护集）
+						//（真拉紧）→ 更短才采纳 → 圆润。allPads 传真实焊盘（MST/保护集），
+						// baseWorld 传全画布静态世界（邻网/排除网焊盘走线铺铜板框——
+						// 缺了它重解路径会合法地压上这些铜，DRC 违规暴涨）。
+						const staticWorld = await this.collectStaticObstacles(drc);
 						const eng = new PlanningEngine();
-						const optimized = await eng.postProcessImportedNets(entries, drc, networks.flatMap(n => n.pads));
+						const optimized = await eng.postProcessImportedNets(entries, drc, networks.flatMap(n => n.pads), staticWorld);
 						// 回写：整批清掉原几何，逐网写优化结果
 						await this.purgeManagedNets(new Set(entries.map(e => e.name)));
 						this.netPrimIds.clear();

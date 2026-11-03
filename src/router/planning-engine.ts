@@ -6053,12 +6053,16 @@ export class PlanningEngine {
 		entries: Array<{ name: string; prims: RenderedPrim[]; vias: PlannedVia[] }>,
 		drc: DRCRules,
 		allPads: EnginePad[],
+		baseWorld?: RBObstacle[],
 	): Promise<Array<{ name: string; prims: RenderedPrim[]; vias: PlannedVia[]; changed: boolean }>> {
 		this.drc = drc;
 		this.allPads = allPads;
 		this.planOptions = { connectivityFirst: true, optimize: false };
 		this.netRendered.clear();
-		this.dynamicObstacles = [];
+		// 世界 = 全画布静态铜（其它网焊盘/走线/铺铜/板框，调用方收集）+ 导入铜皮。
+		// 缺静态世界时重解路径会合法地压上排除网/邻网铜皮（case9 实测 SMD Pad
+		// to Track 39 处的真凶）。
+		this.dynamicObstacles = [...(baseWorld ?? [])];
 		this.plannedVias = [];
 		this.routedEdges.clear();
 		this.routedOrder = [];
@@ -6073,7 +6077,9 @@ export class PlanningEngine {
 			if (e.prims.length) this.addRenderedToObstacles(mergePrims(e.prims));
 			obsByNet.set(e.name, this.dynamicObstacles.slice(mark));
 		}
-		for (const e of entries) {
+		// 从最短导线组开始拉直：短网纠缠少、先定形，长网在稳定世界上重解
+		const order = [...entries].sort((a, b) => renderedLength(a.prims) - renderedLength(b.prims));
+		for (const e of order) {
 			const before = renderedLength(e.prims);
 			let prims = e.prims;
 			let vias = e.vias;
@@ -6122,8 +6128,11 @@ export class PlanningEngine {
 			const a = pads[ia], b = pads[ib];
 			const layer = getRoutingLayer(a, b);
 			if (bottomCapable(a) !== bottomCapable(b) && layer === 1) return null;   // 跨层网不重解
-			// 该层世界：动态障碍按层过滤（全层障碍保留）
-			const obs = this.dynamicObstacles.filter(o => o.layer === undefined || o.layer === layer);
+			// 该层世界：routeConnection 不自带同网过滤（主管线由调用方
+			// layerObstacles 过滤）——这里必须先剔除本网障碍（自家焊盘/旧迹），
+			// 否则端点落在自家焊盘中心直接判侵入。
+			const obs = this.dynamicObstacles.filter(o =>
+				!(o.net && o.net === name) && (o.layer === undefined || o.layer === layer));
 			const r = await routeConnection(
 				{ x: a.x, y: a.y }, { x: b.x, y: b.y }, obs, name,
 				[150, 500], 3000, () => this.checkCancelled(),
@@ -6134,7 +6143,8 @@ export class PlanningEngine {
 		const orig = this.netRendered.get(name);
 		if (!orig || !orig.length || renderedLength(out) >= renderedLength(orig) - 0.5) return null;
 		const layer = getRoutingLayer(pads[0], pads[1]);
-		const obs = this.dynamicObstacles.filter(o => o.layer === undefined || o.layer === layer);
+		const obs = this.dynamicObstacles.filter(o =>
+			!(o.net && o.net === name) && (o.layer === undefined || o.layer === layer));
 		const valid = await validatePrimsAgainst(out as unknown as RBPrimitive[], obs, name);
 		if (!valid) return null;
 		return out;
