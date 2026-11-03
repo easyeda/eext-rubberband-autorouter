@@ -35,6 +35,8 @@ export interface RouterUiOptions {
 	excludeNets: string[];
 	/** 自动排除 GND/VSS 等地网络（默认开启）：不布地网、不清理其既有走线 */
 	excludeGnd: boolean;
+	/** 混合模式：引擎结束后把失败网委托给内置自动布线器（BETA API，耗时不可控，默认关闭） */
+	hybridDelegate: boolean;
 	/** 网络排序策略（auto = 按 PCB 布局专业规则自动规划） */
 	netOrder: NetOrder;
 }
@@ -57,6 +59,7 @@ export const DEFAULT_ROUTER_OPTIONS: RouterUiOptions = {
 	clearExistingTraces: true,
 	excludeNets: [],
 	excludeGnd: true,
+	hybridDelegate: false,
 	netOrder: 'auto',
 };
 
@@ -95,6 +98,7 @@ export function normalizeRouterOptions(input: Partial<RouterUiOptions> | undefin
 		clearExistingTraces: o.clearExistingTraces !== false,
 		excludeNets: excluded,
 		excludeGnd: o.excludeGnd !== false,
+		hybridDelegate: o.hybridDelegate === true,
 		netOrder: NET_ORDERS.includes(o.netOrder) ? o.netOrder : 'auto',
 	};
 }

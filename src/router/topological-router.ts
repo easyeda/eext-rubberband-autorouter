@@ -856,6 +856,29 @@ export class TopologicalRouter {
 				await this.reconcileCanvas(result);
 			}
 
+			// 混合模式：引擎失败网委托内置自动布线器（BETA API）。内置路由器
+			// 对残留网的处理与画布上已有铜皮天然兼容（existingPrimitiveMode
+			// 默认保留），case9 实测 7 个失败网委托后 Via 错误 9 → 5（约 4 网
+			// 被接通）。耗时不可控（case12 的 29 网委托 >590s 未完成），故为
+			// 显式选项（hybridDelegate，默认关）。
+			if (this.currentOptions?.hybridDelegate && !this.shouldCancel &&
+				Array.isArray(result.failed) && result.failed.length) {
+				this.onProgress?.({
+					stage: '委托内置路由器',
+					percentage: 99,
+					message: `内置路由器处理 ${result.failed.length} 个残留网络（耗时不可控）...`,
+				});
+				try {
+					const dr = await eda.pcb_Document.autoRouting({ RoutingNets: result.failed });
+					this.onLog?.(
+						`委托内置路由器：成功 ${dr.successNetsCount}/${dr.totalNetsCount}（${Math.round((dr.duration || 0) / 1000)}s），未解 ${(dr.failedNets ?? []).length}`,
+						dr.successNetsCount ? 'success' : 'warn',
+					);
+				} catch (err) {
+					this.onLog?.('委托内置路由器失败：' + (err instanceof Error ? err.message : String(err)), 'error');
+				}
+			}
+
 			// 以规划结果为准刷新统计
 			if (!this.shouldCancel) {
 				this.routedNames = new Set(result.routedNets);
