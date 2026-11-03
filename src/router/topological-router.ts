@@ -87,6 +87,8 @@ export class TopologicalRouter {
 	 */
 	/** 定稿闸门：收尾对账开始后，在途的逐网消息一律忽略（否则旧几何会把终态覆盖回去） */
 	private finalizing = false;
+	/** 混合修复递归深度（J/H 失败网转 RRouter 重布；限 1 层防环） */
+	private hybridRepairDepth = 0;
 	/** 单网最后写入时刻（限频用） */
 	private lastWriteAt = new Map<string, number>();
 	/** 单网已写入几何的签名（收尾时跳过无变化的重写） */
@@ -892,15 +894,45 @@ export class TopologicalRouter {
 					}
 				}
 
-				this.emitStats();
-				const stats = this.snapshotStats();
-				this.onProgress?.({ stage: '完成', percentage: 100, message: '委托布线完成' });
-				return {
-					...stats,
-					cancelled: this.shouldCancel,
-					failed: [...this.failedNames],
-					logs: [],
-				} as never;
+				// ── 混合修复：J/H 全部成功 → 收工；有失败/违规网 → 受限递归一次
+				// RRouter（成功网进 excludeNets：不再布、其走线留画布当静态障碍，
+				// 修复网绕行）。复用整条主管线，避免在本块内复制规划/写入逻辑。
+				if (!this.failedNames.size || this.shouldCancel || this.hybridRepairDepth > 0) {
+					this.emitStats();
+					const stats = this.snapshotStats();
+					this.onProgress?.({ stage: '完成', percentage: 100, message: '委托布线完成' });
+					return {
+						...stats,
+						cancelled: this.shouldCancel,
+						failed: [...this.failedNames],
+						logs: [],
+					} as never;
+				}
+				const jhRouted = routedAcc.size;
+				const jhFailed = [...this.failedNames];
+				this.onLog?.(`混合修复：${jhFailed.length} 网未解/违规，转 RRouter 重布（J/H 已布 ${jhRouted} 网保留）`, 'info');
+				// 子 route() 开头会按 netPrimIds/touchedNets 清「上一轮走线」——
+				// 先清空账本让它跳过，J/H 成功走线留在画布当修复网的静态障碍
+				//（排除网的走线 collectStaticObstacles 照收，README 语义）。
+				this.netPrimIds.clear();
+				this.touchedNets.clear();
+				this.hybridRepairDepth++;
+				try {
+					const sub = await this.route({
+						...options,
+						engine: 'rrouter',
+						excludeNets: [...excluded, ...routedAcc],
+					});
+					return {
+						...sub,
+						totalNets: allNames.length,
+						routedNets: jhRouted + sub.routedNets,
+						failedNets: sub.failedNets,
+						elapsedMs: (sub.elapsedMs ?? 0) + (Date.now() - t0),
+					} as never;
+				} finally {
+					this.hybridRepairDepth--;
+				}
 			}
 
 			// 清掉本轮要布的网络在画布上的既有走线/过孔（含上一次会话留下的）。
