@@ -1000,6 +1000,13 @@ export class TopologicalRouter {
 			const stats = this.snapshotStats();
 			// 诊断出口：E2E/测试台审计引擎终态用（逐网 prims/vias）
 			(this as unknown as { lastResult?: PlanningResult }).lastResult = result;
+			// RRouter 布通率偏低时建议切换内置引擎（需求：引擎选择引导）
+			if (!this.shouldCancel && this.totalNets > 0 && result.failed.length / this.totalNets >= 0.15) {
+				this.onLog?.(
+					`RRouter 布通率偏低（${this.totalNets - result.failed.length}/${this.totalNets}）：建议在参数弹窗顶部切换 JRouter / HRouter（EDA 内置引擎，密排板布通率更高）`,
+					'warn',
+				);
+			}
 			this.onProgress?.({
 				stage: this.shouldCancel ? '已停止' : '完成',
 				percentage: 100,
