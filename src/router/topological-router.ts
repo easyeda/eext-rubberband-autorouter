@@ -833,6 +833,60 @@ export class TopologicalRouter {
 						}
 						const changed = optimized.filter(e => e.changed).length;
 						this.onLog?.(`形态优化完成：${optimized.length} 网（${changed} 网有缩短）`, 'info');
+
+						// ── DRC 违规归属降级（诚实口径）：内置引擎产物可能带间距违规
+						//（case9 拆批实测 ~70 处 SMD Pad to Track / Track to Via 等）。
+						// errData.position 单位是 10mil（×10 转画布 mil），obj1/obj2 的
+						// net 常缺失 → 按违规点到已布网图元的最近距离（≤30mil）归属。
+						// 违规网从「已布」降级为「失败」，后续可做选择性混合修复。
+						try {
+							const drcRes2 = await eda.pcb_Drc.check(true, false, true);
+							const viol: Array<{ x: number; y: number; kind: string }> = [];
+							const walkV = (node: any): void => {
+								if (!node) return;
+								if (Array.isArray(node)) { node.forEach(walkV); return; }
+								if (node.errorObjType && node.errorObjType !== 'Connection Error' && node.errorObjType !== 'Board Outline to SMD Pad') {
+									const ed = node.explanation?.errData ?? {};
+									const p = ed.position;
+									if (p && Number.isFinite(p.x) && Number.isFinite(p.y)) viol.push({ x: p.x * 10, y: p.y * 10, kind: String(node.errorObjType) });
+									return;
+								}
+								if (node.list) walkV(node.list);
+							};
+							walkV(drcRes2);
+							if (viol.length) {
+								const segDist = (px: number, py: number, x1: number, y1: number, x2: number, y2: number): number => {
+									const dx = x2 - x1, dy = y2 - y1;
+									const L2 = dx * dx + dy * dy;
+									const t = L2 ? Math.max(0, Math.min(1, ((px - x1) * dx + (py - y1) * dy) / L2)) : 0;
+									return Math.hypot(px - (x1 + t * dx), py - (y1 + t * dy));
+								};
+								const bad = new Map<string, number>();
+								for (const v of viol) {
+									let bestNet = '', bestD = 30;
+									for (const e of optimized) {
+										for (const pr of e.prims) {
+											if (pr.kind === 'line') {
+												const d2 = segDist(v.x, v.y, pr.x1 ?? 0, pr.y1 ?? 0, pr.x2 ?? pr.x1 ?? 0, pr.y2 ?? pr.y1 ?? 0);
+												if (d2 < bestD) { bestD = d2; bestNet = e.name; }
+											}
+										}
+										for (const pv of e.vias) {
+											const d2 = Math.hypot(v.x - pv.x, v.y - pv.y);
+											if (d2 < bestD) { bestD = d2; bestNet = e.name; }
+										}
+									}
+									if (bestNet && this.routedNames.has(bestNet)) bad.set(bestNet, (bad.get(bestNet) ?? 0) + 1);
+								}
+								if (bad.size) {
+									for (const nm of bad.keys()) {
+										this.routedNames.delete(nm);
+										this.failedNames.add(nm);
+									}
+									this.onLog?.(`DRC 违规归属：${bad.size} 网带间距违规已降级为失败（${[...bad].slice(0, 6).map(([n, c]) => `${n}×${c}`).join(', ')}）`, 'warn');
+								}
+							}
+						} catch { /* 违规归属失败不阻断 */ }
 					} catch (err) {
 						this.onLog?.('后处理失败（保留内置路由原几何）：' + (err instanceof Error ? err.message : String(err)), 'warn');
 					}
