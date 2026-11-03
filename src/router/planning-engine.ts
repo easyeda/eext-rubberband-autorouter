@@ -479,6 +479,35 @@ export class PlanningEngine {
 		this.log(`网络顺序（${this.planOptions.netOrder ?? 'auto'}）：${networks.map(n => n.name).join(' → ')}`, 'info');
 		const pendingNets: Array<{ name: string; pads: EnginePad[] }> = [];
 
+		// __RB_LANE_RESERVE__=1：排网走廊预约（车道分配第一层）。
+		// case9 墙的根因：密排连接器排（LCD/P0x）的逃逸扇区被横向穿越网
+		//（+5V/$1N5xxx 等）压死。这里先算出每个行网的 solo 走廊，注册为
+		// 硬障碍「预约车道」—— 其它网求解时绕行；行网自己布线时同网豁免，
+		// 布通后回收自己的预约（换上真实走线障碍）。
+		if ((globalThis as any).__RB_LANE_RESERVE__ && !this.checkCancelled()) {
+			const t0r = Date.now();
+			const laneCap = t0r + 30_000;
+			let reservedNets = 0;
+			for (const net of networks) {
+				if (this.checkCancelled() || Date.now() > laneCap) break;
+				if (!net.pads.some(p => this.rowInfo.get(p.id) && (this.rowInfo.get(p.id)?.gap ?? 99) <= 47)) continue;
+				if (this.routedOrder.includes(net.name)) continue;
+				const solo = await this.soloRoute(net);
+				if (!solo) continue;
+				const laneR = this.drc.traceWidthMil / 2 + Math.max(this.drc.trackToTrackMil, this.drc.trackToPadMil) + 2;
+				for (const p of solo.prims) {
+					if (p.kind !== 'line') continue;
+					// soloRoute 的 RBLine 不带层信息：预约障碍跨层登记（保守）
+					this.dynamicObstacles.push(...buildPolylineObstacle(
+						[{ x: p.x1!, y: p.y1! }, { x: p.x2!, y: p.y2! }],
+						laneR, net.name, undefined, `lane:${net.name}`,
+					));
+				}
+				reservedNets++;
+			}
+			if (reservedNets) this.log(`[lane] 车道预约：${reservedNets} 个行网的 solo 走廊已注册（${Date.now() - t0r}ms）`, 'info');
+		}
+
 		let __tPhase = Date.now();
 		const __t0 = __tPhase;
 		const __phase = (label: string) => {
@@ -1465,8 +1494,12 @@ export class PlanningEngine {
 			if (!set) { set = new Set(); components.set(root, set); }
 			set.add(name);
 		}
-		const byInteriority = (a: T, b: T) =>
-			(rowScore.get(b.net.name) ?? 0) - (rowScore.get(a.net.name) ?? 0);
+		const byInteriority = (a: T, b: T) => {
+			const s = (rowScore.get(b.net.name) ?? 0) - (rowScore.get(a.net.name) ?? 0);
+			// __RB_ROW_EDGE_FIRST__=1：端边优先（平面扇实验）——目的地序与焊盘序
+			// 一致的排，端边先走、逐次向内，天然无交叉；中间优先会制造交叉墙
+			return (globalThis as any).__RB_ROW_EDGE_FIRST__ ? -s : s;
+		};
 		for (const members of components.values()) {
 			const signalSlots: number[] = [];
 			const powerSlots: number[] = [];
@@ -2244,6 +2277,11 @@ export class PlanningEngine {
 			rds.push(...mergedEdge);
 			this.netRendered.set(net.name, rds);
 			this.addRenderedToObstacles(mergedEdge);
+			// 车道预约回收：行网布通后撤掉自己的 solo 预约障碍（真实走线障碍
+			// 已由 addRenderedToObstacles 登记），别让过时的预约墙约束后续网
+			if (this.dynamicObstacles.some(o => o.group === `lane:${net.name}`)) {
+				this.dynamicObstacles = this.dynamicObstacles.filter(o => o.group !== `lane:${net.name}`);
+			}
 			// 过孔已在逐边提交时即时入账（plannedVias + 动态障碍），这里不再重复
 		}
 		if (complete && !this.routedOrder.includes(net.name)) this.routedOrder.push(net.name);
