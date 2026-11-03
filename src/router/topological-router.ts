@@ -723,6 +723,8 @@ export class TopologicalRouter {
 				const allNames = networks.map(n => n.name);
 				const BATCH = 12;
 				const routedAcc = new Set<string>();
+					// 违规但保留几何的网（不进修复名单，防价值摧毁）
+					const violatingAcc = new Set<string>();
 				const failedAcc = new Set<string>();
 				const callChunk = (chunk: string[]): Promise<unknown> => {
 					const others = allNames.filter(n => !chunk.includes(n));
@@ -888,6 +890,11 @@ export class TopologicalRouter {
 									for (const nm of bad.keys()) {
 										this.routedNames.delete(nm);
 										this.failedNames.add(nm);
+										// 违规网的几何保留在画布上（连通但 DRC 脏）——
+										// c12v142 实测把它们拆给修复引擎重布、预算不足时
+										// 64 网悬空（80→34 的价值摧毁）。修复名单只收
+										// 无几何的网，违规网通过 excludeNets 保护。
+										violatingAcc.add(nm);
 									}
 									this.onLog?.(`DRC 违规归属：${bad.size} 网带间距违规已降级为失败（${[...bad].slice(0, 6).map(([n, c]) => `${n}×${c}`).join(', ')}）`, 'warn');
 								}
@@ -914,7 +921,10 @@ export class TopologicalRouter {
 				}
 				const jhRouted = routedAcc.size;
 				const jhFailed = [...this.failedNames];
-				this.onLog?.(`混合修复：${jhFailed.length} 网未解/违规，转 RRouter 重布（J/H 已布 ${jhRouted} 网保留）`, 'info');
+				// 修复名单 = 无几何的网（未解 + 连通降级）；违规网几何保留，
+				// 通过 excludeNets 挡在修复运行外（其走线照旧当静态障碍）
+				const repairCount = jhFailed.filter(n => !violatingAcc.has(n)).length;
+				this.onLog?.(`混合修复：${repairCount} 网无几何转 RRouter 重布；${violatingAcc.size} 网违规保留几何（DRC 脏但连通）`, 'info');
 				// 子 route() 开头会按 netPrimIds/touchedNets 清「上一轮走线」——
 				// 先清空账本让它跳过，J/H 成功走线留在画布当修复网的静态障碍
 				//（排除网的走线 collectStaticObstacles 照收，README 语义）。
@@ -929,7 +939,7 @@ export class TopologicalRouter {
 						...options,
 						engine: 'rrouter',
 						hybridDelegate: false,   // 修复阶段不再回委托 BETA API（刚被它坑过）
-						excludeNets: [...excluded, ...routedAcc],
+						excludeNets: [...excluded, ...routedAcc, ...violatingAcc],
 					});
 					return {
 						...sub,
