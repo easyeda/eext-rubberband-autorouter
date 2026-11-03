@@ -425,6 +425,37 @@ export async function gridRoute(req: GridRouteRequest): Promise<GridRouteResult>
 	const idxOf = (i: number, j: number, li: number) => li * stride + j * nx + i;
 	const hOf = (i: number, j: number) => Math.hypot(i - d.i, j - d.j) * cell;
 
+	// ── Lazy Theta*（任意角捷径，吸收自 Topola thetastar.rs）──
+	// 生成邻格时额外尝试「祖父格→邻格」直线（光栅 LOS，采样步长 0.4 cell），
+	// 代价 = g(祖父) + 欧氏距离；弹出时才做 LOS 校验（lazy），失败退回常规
+	// A* 父链。最终图元仍逐段过 segClear 真几何校验，合法性口径不变——
+	// 收益 = 拐点更少（楼梯在搜索期就消失）、扩展节点更少、拉直后路径更短。
+	// __RB_THETA_GRID__ = 0 可关闭（A/B 对照）。
+	const anyAngle = (globalThis as unknown as { __RB_THETA_GRID__?: number }).__RB_THETA_GRID__ !== 0;
+	const lazyParent = new Int32Array(total).fill(-1);
+	const lazyG = new Float64Array(total).fill(Infinity);
+	const rasterLos = (a: number, b: number, li: number): boolean => {
+		const base = li * stride;
+		const remA = a - base;
+		const remB = b - base;
+		if (remA < 0 || remA >= stride || remB < 0 || remB >= stride) return false;
+		const aj = Math.floor(remA / nx), ai = remA - aj * nx;
+		const bj = Math.floor(remB / nx), bi = remB - bj * nx;
+		const ax = x0 + ai * cell, ay = y0 + aj * cell;
+		const bx = x0 + bi * cell, by = y0 + bj * cell;
+		const dist = Math.hypot(bx - ax, by - ay);
+		const steps = Math.max(1, Math.ceil(dist / (cell * 0.4)));
+		for (let t = 0; t <= steps; t++) {
+			const f = t / steps;
+			const px = ax + (bx - ax) * f, py = ay + (by - ay) * f;
+			const ci = Math.round((px - x0) / cell);
+			const cj = Math.round((py - y0) / cell);
+			if (ci < 0 || cj < 0 || ci >= nx || cj >= ny) return false;
+			if (blocked[base + cj * nx + ci]) return false;
+		}
+		return true;
+	};
+
 	// 起点：焊盘中心格（cost 0）+ 各出线候选点格（cost = 中心到候选点距离，
 	// 引出段长度计入路径代价）。多层（TH 焊盘）各层都可起步。
 	interface Seed { i: number; j: number; li: number; stub: { x: number; y: number } | null; cost: number }
@@ -492,6 +523,16 @@ export async function gridRoute(req: GridRouteRequest): Promise<GridRouteResult>
 		const rem = cur - li * stride;
 		const j = Math.floor(rem / nx);
 		const i = rem - j * nx;
+		// Lazy Theta*：弹出时才校验捷径 LOS；成立则采纳祖父直连（更少拐点），
+		// 失败保持常规 A* 父链。只裁决一次。
+		if (anyAngle && lazyParent[cur] >= 0 && lazyG[cur] < gScore[cur] - 1e-9) {
+			const p = lazyParent[cur];
+			if (Math.floor(p / stride) === li && rasterLos(p, cur, li)) {
+				gScore[cur] = lazyG[cur];
+				cameFrom[cur] = p;
+			}
+			lazyParent[cur] = -1;
+		}
 		const g = gScore[cur];
 		if (isGoal.has(cur)) {
 			const total = g + (goalCost.get(cur) ?? 0);
@@ -514,6 +555,20 @@ export async function gridRoute(req: GridRouteRequest): Promise<GridRouteResult>
 				gScore[nid] = ng;
 				cameFrom[nid] = cur;
 				heap.push(ng + hOf(ni, nj), nid);
+			}
+			// Lazy Theta* 捷径候选：祖父格直连邻格（同层），弹出时验 LOS
+			if (anyAngle) {
+				const p = cameFrom[cur];
+				const pRem = p >= 0 ? p - li * stride : -1;
+				if (pRem >= 0 && pRem < stride) {
+					const pj = Math.floor(pRem / nx), pi = pRem - pj * nx;
+					const cand = gScore[p] + Math.hypot(ni - pi, nj - pj) * cell;
+					if (cand < gScore[nid] - 1e-9 && cand < lazyG[nid] - 1e-9) {
+						lazyG[nid] = cand;
+						lazyParent[nid] = p;
+						heap.push(cand + hOf(ni, nj), nid);
+					}
+				}
 			}
 		}
 		// 层间过孔边（同格跨层）
