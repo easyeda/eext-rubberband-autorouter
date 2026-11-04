@@ -6141,6 +6141,7 @@ export class PlanningEngine {
 		allPads: EnginePad[],
 		baseWorld?: RBObstacle[],
 		onLog?: (message: string, level: string) => void,
+		onNet?: (name: string, prims: RenderedPrim[], vias: PlannedVia[]) => void | Promise<void>,
 	): Promise<Array<{ name: string; prims: RenderedPrim[]; vias: PlannedVia[]; changed: boolean }>> {
 		this.drc = drc;
 		this.allPads = allPads;
@@ -6232,6 +6233,8 @@ export class PlanningEngine {
 			if (prims.length) this.addRenderedToObstacles(mergePrims(prims));
 			for (const v of vias) this.dynamicObstacles.push(this.viaObstacleOf(v));
 			this.plannedVias.push(...vias);
+			// 逐网回调：调用方实时上画布（拉紧过程动态可见）
+			if (onNet) await onNet(e.name, prims, vias);
 			out.push({ name: e.name, prims, vias, changed: renderedLength(prims) < before - 0.5 });
 		}
 		this.log(`后处理：真拉紧采纳 ${adoptedN} 网 / 隔点拉直 ${tautenN} 网（共 ${order.length}）`, 'info');
@@ -6271,11 +6274,29 @@ export class PlanningEngine {
 		if (!split) return null;
 		const { segments, leftover } = split;
 		if (!segments.length) return null;
-		// 世界 = 其它网铜皮（dynamicObstacles，硬校验）。焊盘不走硬障碍：
-		// EDA 画布有存量焊盘违规（硬墙会让违规区整体不可重解），改走
-		// 「违规数不恶化」口径（countPadViolations 新 ≤ 原才采纳）
+		// 世界 = 其它网铜皮（dynamicObstacles，硬校验）。焊盘两级口径：
+		// tier-1 带焊盘墙求完全合规路径（首选）；tier-2 焊盘不入世界 +
+		// 「违规数不恶化」门（EDA 画布有存量焊盘违规，硬墙会让违规区
+		// 整体不可重解；无墙最短路又会贴焊盘——由计数门兜住下限）
 		const obsAt = (ly: number) => this.dynamicObstacles.filter(o =>
 			!(o.net && o.net === name) && (o.layer === undefined || o.layer === ly));
+		const padWalls = this.padObstacles(this.allPads, name);
+		const obsWithPads = (ly: number) => [
+			...padWalls, ...this.dynamicObstacles,
+		].filter(o => !(o.net && o.net === name) && (o.layer === undefined || o.layer === ly));
+		const solveSegment = async (a: { x: number; y: number }, b: { x: number; y: number }, ly: number): Promise<RenderedPrim[] | null> => {
+			const run = async (obs: RBObstacle[]): Promise<RenderedPrim[] | null> => {
+				const r = await routeConnection(a, b, obs, name,
+					[150, 500], 3000, () => this.checkCancelled());
+				if (!r.ok || !r.prims.length) return null;
+				return r.prims.map(p => ({ ...(p as RenderedPrim), net: name, layer: ly }));
+			};
+			// tier-1：焊盘是墙（合法区首选，产物零新增焊盘违规）
+			const t1 = await run(obsWithPads(ly));
+			if (t1) return t1;
+			// tier-2：焊盘不入世界，交给不恶化计数门
+			return await run(obsAt(ly));
+		};
 		const temp: RBObstacle[] = [];
 		const addTemp = (prims: RenderedPrim[]): string[] => {
 			const before = new Set<RBObstacle>(this.dynamicObstacles);
@@ -6302,24 +6323,22 @@ export class PlanningEngine {
 				// 大绕路只占 12%，比例门限会把它跳过（LCD5 注入绕路实测）
 				if (oldLen - straight < 25 || Date.now() - t0 > 10000) { this.runStats.skipped++; continue; }
 				this.runStats.tried++;
-				const origSegPrims = seg.prims;
 				removeGroups(seg.groups);
-				let cand: RenderedPrim[] | null = null;
-				const r = await routeConnection(seg.a, seg.b, obsAt(seg.layer), name,
-					[150, 500], 3000, () => this.checkCancelled());
-				if (r.ok && r.prims.length) {
-					cand = r.prims.map(p => ({ ...(p as RenderedPrim), net: name, layer: seg.layer }));
-				}
+				const cand: RenderedPrim[] | null = await solveSegment(seg.a, seg.b, seg.layer);
 				const __diag = !!(globalThis as any).__RB_TIGHTEN_DIAG__;
+				// tier-2（无焊盘墙）的采纳必须「新路径焊盘违规为 0」：计数指标
+				// 可能漏检（采样/形状近似），要求 0 才能保证 EDA DRC 不新增。
+				// 已违规区里「以少换多」的交易等罚分路由再开。
+				const padOK = !cand || this.countPadViolations(cand, name) === 0;
 				if (cand && renderedLength(cand) < oldLen - 0.5 &&
 					await validatePrimsAgainst(cand as unknown as RBPrimitive[], obsAt(seg.layer), name) &&
-					this.countPadViolations(cand, name) <= this.countPadViolations(origSegPrims, name)) {
+					padOK) {
 					seg.prims = cand;
 					this.runStats.adopted++;
 				} else {
 					this.runStats.noPath++;
 					if (__diag) {
-						this.log(`[段诊断] ${name} (${seg.a.x.toFixed(0)},${seg.a.y.toFixed(0)})→(${seg.b.x.toFixed(0)},${seg.b.y.toFixed(0)}) L${seg.layer} 原长${oldLen.toFixed(0)} 直距${straight.toFixed(0)} 新长${cand ? renderedLength(cand).toFixed(0) : '无路'}${cand && renderedLength(cand) >= oldLen - 0.5 ? '(不够短)' : ''}${cand ? ` 焊盘违规${this.countPadViolations(cand, name)}/${this.countPadViolations(origSegPrims, name)}` : ''}`, 'info');
+						this.log(`[段诊断] ${name} (${seg.a.x.toFixed(0)},${seg.a.y.toFixed(0)})→(${seg.b.x.toFixed(0)},${seg.b.y.toFixed(0)}) L${seg.layer} 原长${oldLen.toFixed(0)} 直距${straight.toFixed(0)} 新长${cand ? renderedLength(cand).toFixed(0) : '无路'}${cand && renderedLength(cand) >= oldLen - 0.5 ? '(不够短)' : ''}${cand && !padOK ? ` 焊盘违规${this.countPadViolations(cand, name)}` : ''}`, 'info');
 					}
 				}
 				// 本段当前形态（原始或新）回到世界
@@ -6427,10 +6446,9 @@ export class PlanningEngine {
 	}
 
 	/**
-	 * 图元采样点对异网焊盘（含钻孔）的净距违规计数。「不恶化解」口径：
-	 * EDA 画布常有存量焊盘违规（case9 实测 62 处 SMD Pad to Track），
-	 * 硬把焊盘当墙会让违规区域整体不可重解；改为新段违规数 ≤ 原段即放行
-	 * ——整网级、菜单级都不恶化，而已有违规区里的明显绕路仍能拉直。
+	 * 图元采样点对异网焊盘（含钻孔）的净距违规计数（1.5mil 采样——4mil
+	 * 会漏掉细条重叠，实测 +5V 重写后 EDA 报 7 处 d=0 而计数通过）。
+	 * 「不恶化」口径的精确度前提；tier-2 采纳要求新路径计数为 0。
 	 */
 	private countPadViolations(prims: RenderedPrim[], netName: string): number {
 		if (!prims.length) return 0;
@@ -6438,7 +6456,7 @@ export class PlanningEngine {
 		for (const p of prims) {
 			if (p.kind === 'line') {
 				const L = Math.hypot((p.x2 ?? 0) - (p.x1 ?? 0), (p.y2 ?? 0) - (p.y1 ?? 0));
-				const n = Math.max(1, Math.ceil(L / 4));
+				const n = Math.max(1, Math.ceil(L / 1.5));
 				for (let k = 0; k <= n; k++) {
 					const t = k / n;
 					samples.push({
@@ -6513,15 +6531,24 @@ export class PlanningEngine {
 			!(o.net && o.net === name) && (o.layer === undefined || o.layer === ly));
 		const routeEdgeAt = async (a: EnginePad, b: EnginePad, ly: number): Promise<RenderedPrim[] | null> => {
 			const obs = obsAt(ly);
-			const r = await routeConnection(
-				{ x: a.x, y: a.y }, { x: b.x, y: b.y }, obs, name,
-				[150, 500], 3000, () => this.checkCancelled(),
-			);
-			if (r.ok && r.prims.length) {
-				return r.prims.map(p => ({ ...(p as RenderedPrim), net: name, layer: ly }));
-			}
+			const obsPad = [...this.padObstacles(this.allPads, name).filter(o =>
+				o.layer === undefined || o.layer === ly), ...obs];
+			const run = async (o: RBObstacle[]): Promise<RenderedPrim[] | null> => {
+				const r = await routeConnection(
+					{ x: a.x, y: a.y }, { x: b.x, y: b.y }, o, name,
+					[150, 500], 3000, () => this.checkCancelled(),
+				);
+				if (r.ok && r.prims.length) {
+					return r.prims.map(p => ({ ...(p as RenderedPrim), net: name, layer: ly }));
+				}
+				return null;
+			};
+			// tier-1：焊盘是墙（合法区首选）；tier-2：无焊盘墙（不恶化门兜底）
+			const t1 = await run(obsPad);
+			if (t1) return t1;
+			let prims = await run(obs);
 			// 密集焊盘排里邻盘净距圈吞没焊盘中心：从焊盘轮廓边界出线退避
-			let prims = await this.candidateEdgeRoute(a, b, name, ly, obs);
+			if (!prims) prims = await this.candidateEdgeRoute(a, b, name, ly, obs);
 			// 并排焊盘排（连接器/LED 排，0.5mm 间距）：排中焊盘唯一合法出线是
 			// 排法向冲出（主线同款预留；rowInfo 在本入口开头补建）
 			const srcRow = this.rowInfo.get(a.id);
@@ -6625,8 +6652,10 @@ export class PlanningEngine {
 				if (!pr.length) continue;
 				if (!await validatePrimsAgainst(pr as unknown as RBPrimitive[], obsAt(ly), name)) return fail(`复验拒L${ly}`);
 			}
-			if (this.countPadViolations(out, name) > this.countPadViolations(orig, name)) {
-				return fail(`焊盘恶化${this.countPadViolations(out, name)}/${this.countPadViolations(orig, name)}`);
+			// 焊盘口径与逐段路径一致：新网焊盘违规必须为 0（计数指标可能
+			// 漏检，只有 0 才能保证 EDA DRC 不新增；干净区的重解本就该零违规）
+			if (this.countPadViolations(out, name) > 0) {
+				return fail(`焊盘违规${this.countPadViolations(out, name)}`);
 			}
 			for (const v of outVias) {
 				if (!this.viaObstacleClear(v.x, v.y, obsAt(1), v.dia / 2, name) ||

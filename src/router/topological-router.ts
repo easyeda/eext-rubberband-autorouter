@@ -212,6 +212,26 @@ export class TopologicalRouter {
 
 	// ── 0. 收集焊盘与静态障碍 ────────────────────
 
+	/** 缓存焊盘原始形状（pcb_PrimitivePad.getAll 的 pad/hole 数组，按位置键） */
+	private async cachePadShapes(): Promise<void> {
+		this.padShapeCache.clear();
+		try {
+			const padPrims = await eda.pcb_PrimitivePad.getAll();
+			for (const sp of padPrims) {
+				const p = sp as any;
+				if (Array.isArray(p.pad)) {
+					const key = `${(p.x ?? 0).toFixed(2)},${(p.y ?? 0).toFixed(2)}`;
+					this.padShapeCache.set(key, {
+						pad: p.pad,
+						hole: Array.isArray(p.hole) ? p.hole : null,
+						rotation: p.rotation ?? 0,
+						holeRotation: p.holeRotation ?? 0,
+					});
+				}
+			}
+		} catch { /* 形状缓存失败则用默认圆 */ }
+	}
+
 	/**
 	 * 拉紧已有布线（独立菜单命令）：对当前 PCB 上所有已布网络做
 	 * 真拉紧（可视图逐边重解）+ 切线圆角圆润，然后回写画布。
@@ -222,6 +242,7 @@ export class TopologicalRouter {
 		this.onProgress?.({ stage: '拉紧已有布线', percentage: 5, message: '正在读取 DRC 规则与画布几何...' });
 		const drcBase = await fetchDRCRules(this.onLog);
 		const drc = applyRouterOptionsToDRC(drcBase, normalizeRouterOptions({}));
+		await this.cachePadShapes();   // 焊盘形状：违规计数/过孔校验的精度前提
 		const { padMap, allPads } = await this.collectPads();
 		if (!padMap.size) throw new Error('当前 PCB 没有网络');
 		const lines = (await eda.pcb_PrimitiveLine.getAll()) ?? [];
@@ -254,16 +275,26 @@ export class TopologicalRouter {
 		if (!entries.length) throw new Error('画布上没有可拉紧的走线');
 		this.onProgress?.({ stage: '拉紧已有布线', percentage: 30, message: `收集静态世界与 ${entries.length} 个网络的走线...` });
 		const staticWorld = await this.collectStaticObstacles(drc);
-		this.onProgress?.({ stage: '拉紧已有布线', percentage: 50, message: '真拉紧（可视图逐边重解）+ 圆润处理中...' });
+		this.onProgress?.({ stage: '拉紧已有布线', percentage: 50, message: '真拉紧（可视图逐段重解）+ 圆润处理中...' });
 		const eng = new PlanningEngine();
-		const optimized = await eng.postProcessImportedNets(entries, drc, Array.from(padMap.values()).flat(), staticWorld, (m, l) => this.onLog?.(m, l));
-		this.onProgress?.({ stage: '拉紧已有布线', percentage: 80, message: '回写画布...' });
-		await this.purgeManagedNets(new Set(entries.map(e => e.name)));
+		// 逐网实时上画布：每算完一个网立即替换该网几何（动态可见，不再
+		// 全算完才一次性重放——用户实测「画布没有动态渲染拉紧过程」）
+		let done = 0;
+		const optimized = await eng.postProcessImportedNets(
+			entries, drc, Array.from(padMap.values()).flat(), staticWorld,
+			(m, l) => this.onLog?.(m, l),
+			async (name, prims, vias) => {
+				await this.purgeManagedNets(new Set([name]));
+				this.netPrimIds.delete(name);
+				if (prims.length) await this.writeNet(name, prims, vias, true);
+				done++;
+				this.onProgress?.({
+					stage: '拉紧已有布线', percentage: 50 + Math.round((done / entries.length) * 45),
+					message: `拉紧 ${done}/${entries.length}：${name}`,
+				});
+			},
+		);
 		this.netPrimIds.clear();
-		for (const e of optimized) {
-			if (!e.prims.length) continue;
-			await this.writeNet(e.name, e.prims, e.vias, true);
-		}
 		const changed = optimized.filter(e => e.changed).length;
 		this.onLog?.(`拉紧完成：${optimized.length} 网（${changed} 网有缩短）`, 'success');
 		this.onProgress?.({ stage: '完成', percentage: 100, message: `拉紧完成：${changed}/${optimized.length} 网有缩短` });
@@ -740,21 +771,7 @@ export class TopologicalRouter {
 			const drc = applyRouterOptionsToDRC(drcBase, options);
 
 			// 缓存焊盘原始形状（getAllPrimitivesByNet 的焊盘没有 pad/hole 字段）
-			try {
-				const padPrims = await eda.pcb_PrimitivePad.getAll();
-				for (const sp of padPrims) {
-					const p = sp as any;
-					if (Array.isArray(p.pad)) {
-						const key = `${(p.x ?? 0).toFixed(2)},${(p.y ?? 0).toFixed(2)}`;
-						this.padShapeCache.set(key, {
-							pad: p.pad,
-							hole: Array.isArray(p.hole) ? p.hole : null,
-							rotation: p.rotation ?? 0,
-							holeRotation: p.holeRotation ?? 0,
-						});
-					}
-				}
-			} catch { /* 形状缓存失败则用默认圆 */ }
+			await this.cachePadShapes();
 
 			this.onProgress?.({ stage: '解析 PCB', percentage: 8, message: '正在获取 PCB 数据...' });
 			const { padMap, allPads } = await this.collectPads();
