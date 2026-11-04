@@ -41,7 +41,7 @@
 		background: var(--bg);
 		overflow: hidden;
 	}
-	.app { height: 100%; display: flex; flex-direction: column; gap: 8px; padding: 12px 14px; }
+	.app { height: 100%; display: flex; flex-direction: column; gap: 7px; padding: 10px 12px; }
 
 	.top { display: flex; align-items: center; gap: 8px; }
 	.pulse {
@@ -83,7 +83,6 @@
 	}
 	.stats { display: flex; gap: 14px; font-size: 11px; color: var(--muted); padding: 0 2px; }
 	.stats b { color: var(--text); font-variant-numeric: tabular-nums; }
-	.spacer { flex: 1; }
 	.foot { display: flex; align-items: center; gap: 8px; }
 	.foot .hint { flex: 1; font-size: 10.5px; color: var(--faint); }
 	button {
@@ -117,11 +116,10 @@
 
 	<div class="stats">
 		<span>已处理 <b id="done">0</b>/<b id="total">0</b> 网</span>
-		<span>缩短 <b id="changed">0</b> 网</span>
+		<span>缩短 <b id="changed">0</b> 网 · <b id="saved">0</b> mil</span>
 		<span>入库 <b id="adopted">0</b> 段</span>
 	</div>
 
-	<div class="spacer"></div>
 	<div class="foot">
 		<div class="hint" id="hint">关闭窗口将停止拉紧（已写入部分保留）</div>
 		<button class="primary" id="closeBtn">停止</button>
@@ -141,6 +139,7 @@
 			done: document.getElementById('done'),
 			total: document.getElementById('total'),
 			changed: document.getElementById('changed'),
+			saved: document.getElementById('saved'),
 			adopted: document.getElementById('adopted'),
 			hint: document.getElementById('hint'),
 			closeBtn: document.getElementById('closeBtn'),
@@ -172,13 +171,14 @@
 				if (typeof data.done === 'number') els.done.textContent = data.done;
 				if (typeof data.total === 'number' && data.total) { els.total.textContent = data.total; els.done.textContent = '0'; }
 				if (typeof data.changed === 'number') els.changed.textContent = data.changed;
+				if (typeof data.savedMil === 'number') els.saved.textContent = Math.round(data.savedMil);
 				if (typeof data.adopted === 'number') els.adopted.textContent = data.adopted;
 			} else if (data.type === 'done') {
 				finished = true;
 				els.pulse.classList.add('done');
 				setPercent(100);
 				els.stage.textContent = '完成';
-				els.msg.textContent = '拉紧完成：' + (data.changed || 0) + '/' + (data.total || 0) + ' 网有缩短，用时 ' + ((Date.now() - startedAt) / 1000).toFixed(1) + 's';
+				els.msg.textContent = '拉紧完成：' + (data.changed || 0) + '/' + (data.total || 0) + ' 网有缩短，共省 ' + Math.round(data.savedMil || 0) + 'mil，用时 ' + ((Date.now() - startedAt) / 1000).toFixed(1) + 's';
 				els.hint.textContent = '可以关闭窗口';
 				els.closeBtn.textContent = '关闭';
 				els.closeBtn.classList.remove('primary');

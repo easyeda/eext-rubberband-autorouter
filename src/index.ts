@@ -4,7 +4,7 @@
 import * as extensionConfig from '../extension.json';
 import { AutoRouterFacade } from './auto-router-facade';
 import { DialogBridge } from './ui/dialog-bridge';
-import { showError, showSuccess, showWarning } from './utils/toast';
+import { showError, showWarning } from './utils/toast';
 
 // eslint-disable-next-line @typescript-eslint/no-unused-vars
 export function activate(_status?: 'onStartupFinished', _arg?: string): void {}
@@ -58,7 +58,7 @@ export async function tightenExisting(): Promise<void> {
 	);
 
 	try {
-		await bridge.open('tighten', '/iframe/tighten.html', 380, 236, '橡皮筋布线器 · 拉紧已有布线', {
+		await bridge.open('tighten', '/iframe/tighten.html', 380, 188, '橡皮筋布线器 · 拉紧已有布线', {
 			onReady: (send) => send({ type: 'begin', startedAt: Date.now() }),
 			onMessage: (msg) => {
 				if (msg.type === 'close') {
@@ -73,24 +73,19 @@ export async function tightenExisting(): Promise<void> {
 			},
 		});
 
+		// 完成结果只在进度弹窗里展示（用户要求不再弹完成提示窗）
 		const res = await router.tightenExistingRouting();
 		sendDone(bridge, res);
-		if (res.changed > 0) {
-			showSuccess(`拉紧完成：${res.changed}/${res.nets} 个网络有缩短`);
-		} else {
-			showWarning(`拉紧完成：${res.nets} 个网络已是紧凑形态，无需调整`);
-		}
 	} catch (err) {
 		const msg = err instanceof Error ? err.message : String(err);
 		bridge.send('tighten', { type: 'error', message: msg });
 		showError('拉紧失败：' + msg);
 	} finally {
 		tightening = false;
-		tightenRouter = null;
 	}
 }
 
 /** 把最终统计推给弹窗（弹窗转「关闭」态） */
-function sendDone(bridge: DialogBridge, res: { nets: number; changed: number }): void {
-	bridge.send('tighten', { type: 'done', total: res.nets, changed: res.changed });
+function sendDone(bridge: DialogBridge, res: { nets: number; changed: number; savedMil: number }): void {
+	bridge.send('tighten', { type: 'done', total: res.nets, changed: res.changed, savedMil: res.savedMil });
 }

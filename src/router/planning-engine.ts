@@ -6229,6 +6229,14 @@ export class PlanningEngine {
 				// 4) 圆润（拐角切线圆弧）
 				const smoothed = this.smoothCorners(mergePrims(prims), e.name);
 				if (renderedLength(smoothed) <= renderedLength(prims) + 0.5) prims = smoothed;
+				// 4.5) 终态守卫：段级门只校验候选段，合并/圆润之后必须整网
+				// 复检——实测 +5V 重解后整网压上 55×53mil 的 GND 大焊盘
+				//（EDA 报 SMD Pad to Track d=0），段级计数因形状/合并漏检。
+				// 终态焊盘违规比原几何多 → 整个网回退原几何（宁可不拉紧）
+				if (this.countPadViolations(prims, e.name) > this.countPadViolations(e.prims, e.name)) {
+					prims = e.prims;
+					vias = e.vias;
+				}
 			} catch { /* 后处理失败保留原几何（外部引擎产物已可用） */ }
 			// 5) 登记最终形态为障碍（后续网的拉紧要看到本网的最终位置）
 			this.netRendered.set(e.name, prims);
@@ -6240,7 +6248,7 @@ export class PlanningEngine {
 			out.push({ name: e.name, prims, vias, changed: renderedLength(prims) < before - 0.5 });
 		}
 		this.log(`后处理：真拉紧采纳 ${adoptedN} 网 / 隔点拉直 ${tautenN} 网（共 ${order.length}）`, 'info');
-		this.log(`段级重解：尝试 ${this.runStats.tried} 段 / 采纳 ${this.runStats.adopted} / 近直线跳过 ${this.runStats.skipped} / 无解 ${this.runStats.noPath}`, 'info');
+		this.log(`段级重解：尝试 ${this.runStats.tried} 段 / 采纳 ${this.runStats.adopted}（其中修复 ${this.runStats.repaired}）/ 近直线跳过 ${this.runStats.skipped} / 无解 ${this.runStats.noPath}`, 'info');
 		if (failHist.size) {
 			this.log(`重解未采纳：${[...failHist.entries()].map(([k, n]) => `${k}×${n}`).join('，')}`, 'info');
 		}
@@ -6259,8 +6267,8 @@ export class PlanningEngine {
 	 */
 	/** 当前网重解未采纳的原因（resolveImportedNet 写入，诊断用） */
 	private resolveFail = '';
-	/** 段级重解计数（solveViaRuns 累计，诊断用）：近直线跳过/尝试/采纳/无解 */
-	private runStats = { skipped: 0, tried: 0, adopted: 0, noPath: 0 };
+	/** 段级重解计数（solveViaRuns 累计，诊断用）：近直线跳过/尝试/采纳/无解/修复 */
+	private runStats = { skipped: 0, tried: 0, adopted: 0, noPath: 0, repaired: 0 };
 
 	/**
 	 * 带过孔网的真拉紧（逐段重解）：原走线链按过孔断点切成同层段，
@@ -6325,22 +6333,26 @@ export class PlanningEngine {
 				// 大绕路只占 12%，比例门限会把它跳过（LCD5 注入绕路实测）
 				if (oldLen - straight < 25 || Date.now() - t0 > 10000) { this.runStats.skipped++; continue; }
 				this.runStats.tried++;
+				const origSegPrims = seg.prims;
 				removeGroups(seg.groups);
 				const cand: RenderedPrim[] | null = await solveSegment(seg.a, seg.b, seg.layer);
 				const __diag = !!(globalThis as any).__RB_TIGHTEN_DIAG__;
 				// tier-2（无焊盘墙）的采纳必须「新路径焊盘违规为 0」：计数指标
 				// 可能漏检（采样/形状近似），要求 0 才能保证 EDA DRC 不新增。
-				// 已违规区里「以少换多」的交易等罚分路由再开。
-				const padOK = !cand || this.countPadViolations(cand, name) === 0;
-				if (cand && renderedLength(cand) < oldLen - 0.5 &&
-					await validatePrimsAgainst(cand as unknown as RBPrimitive[], obsAt(seg.layer), name) &&
-					padOK) {
+				// 修复例外：原段已有焊盘违规、候选为 0 → 即使更长也采纳（只修不恶化）。
+				const candPad = cand ? this.countPadViolations(cand, name) : 0;
+				const origPad = this.countPadViolations(origSegPrims, name);
+				const okShorter = !!cand && renderedLength(cand) < oldLen - 0.5 && candPad === 0;
+				const okRepair = !!cand && candPad === 0 && origPad > 0;
+				if (cand && (okShorter || okRepair) &&
+					await validatePrimsAgainst(cand as unknown as RBPrimitive[], obsAt(seg.layer), name)) {
 					seg.prims = cand;
 					this.runStats.adopted++;
+					if (okRepair) this.runStats.repaired = (this.runStats.repaired ?? 0) + 1;
 				} else {
 					this.runStats.noPath++;
 					if (__diag) {
-						this.log(`[段诊断] ${name} (${seg.a.x.toFixed(0)},${seg.a.y.toFixed(0)})→(${seg.b.x.toFixed(0)},${seg.b.y.toFixed(0)}) L${seg.layer} 原长${oldLen.toFixed(0)} 直距${straight.toFixed(0)} 新长${cand ? renderedLength(cand).toFixed(0) : '无路'}${cand && renderedLength(cand) >= oldLen - 0.5 ? '(不够短)' : ''}${cand && !padOK ? ` 焊盘违规${this.countPadViolations(cand, name)}` : ''}`, 'info');
+						this.log(`[段诊断] ${name} (${seg.a.x.toFixed(0)},${seg.a.y.toFixed(0)})→(${seg.b.x.toFixed(0)},${seg.b.y.toFixed(0)}) L${seg.layer} 原长${oldLen.toFixed(0)} 直距${straight.toFixed(0)} 新长${cand ? renderedLength(cand).toFixed(0) : '无路'}${cand && !okShorter && !okRepair ? `(不采纳 焊盘${candPad}/原${origPad})` : ''}`, 'info');
 					}
 				}
 				// 本段当前形态（原始或新）回到世界

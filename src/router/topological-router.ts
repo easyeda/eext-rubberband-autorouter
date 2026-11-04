@@ -74,6 +74,33 @@ function canvasArcToPrim(a: any, net: string): RenderedPrim | null {
 	return { kind: 'arc', net, layer, cx, cy, r: R, startAngle: a0, sweep };
 }
 
+/**
+ * 拉紧后几何是否与原几何「实质相同」：图元数/长度/端点都在容差内。
+ * 相同的网跳过重写——否则 50 个网全删全建，观感就是「只看到删除重建」。
+ */
+function sameNetGeometry(
+	origPrims: RenderedPrim[], origVias: PlannedVia[],
+	newPrims: RenderedPrim[], newVias: PlannedVia[],
+): boolean {
+	if (origPrims.length !== newPrims.length || origVias.length !== newVias.length) return false;
+	if (Math.abs(renderedLength(origPrims) - renderedLength(newPrims)) > 0.5) return false;
+	for (let i = 0; i < origPrims.length; i++) {
+		const a = origPrims[i], b = newPrims[i];
+		if (a.kind !== b.kind || a.layer !== b.layer) return false;
+		if (a.kind === 'line' && b.kind === 'line') {
+			if (Math.abs((a.x1 ?? 0) - (b.x1 ?? 0)) > 0.5 || Math.abs((a.y1 ?? 0) - (b.y1 ?? 0)) > 0.5 ||
+				Math.abs((a.x2 ?? 0) - (b.x2 ?? 0)) > 0.5 || Math.abs((a.y2 ?? 0) - (b.y2 ?? 0)) > 0.5) return false;
+		} else if (a.kind === 'arc' && b.kind === 'arc') {
+			if (Math.abs((a.cx ?? 0) - (b.cx ?? 0)) > 0.5 || Math.abs((a.cy ?? 0) - (b.cy ?? 0)) > 0.5 ||
+				Math.abs((a.r ?? 0) - (b.r ?? 0)) > 0.5) return false;
+		}
+	}
+	for (let i = 0; i < origVias.length; i++) {
+		if (Math.hypot(origVias[i].x - newVias[i].x, origVias[i].y - newVias[i].y) > 0.5) return false;
+	}
+	return true;
+}
+
 export class TopologicalRouter {
 	private onProgress?: ProgressCallback;
 	private onLog?: LogCallback;
@@ -240,7 +267,7 @@ export class TopologicalRouter {
 	 * 复用 J/H 引擎结果的形态优化管线——让用户无需完整布线即可
 	 * 单独查看/使用橡皮筋优化效果（含另外两个引擎的产物）。
 	 */
-	public async tightenExistingRouting(): Promise<{ nets: number; changed: number }> {
+	public async tightenExistingRouting(): Promise<{ nets: number; changed: number; savedMil: number }> {
 		this.shouldCancel = false;
 		this.tightening = true;
 		try {
@@ -278,6 +305,26 @@ export class TopologicalRouter {
 		}
 		const entries = [...byNet.entries()].map(([name, e]) => ({ name, ...e })).filter(e => e.prims.length);
 		if (!entries.length) throw new Error('画布上没有可拉紧的走线');
+		// 开头一次性收集图元 ID（按网）：逐网 purgeManagedNets 会做 3 次全画布
+		// 扫描 × 50 网 = 150 次 getAll，慢且触发 EDA 删除告警
+		const idsByNet = new Map<string, { lines: string[]; arcs: string[]; vias: string[] }>();
+		const addId = (net: string, kind: 'lines' | 'arcs' | 'vias', id: unknown): void => {
+			if (typeof id !== 'string' || !id) return;
+			const rec = idsByNet.get(net) ?? { lines: [], arcs: [], vias: [] };
+			rec[kind].push(id);
+			idsByNet.set(net, rec);
+		};
+		for (const l of lines as any[]) addId(String(l.net ?? ''), 'lines', l.primitiveId);
+		for (const a of arcs as any[]) addId(String(a.net ?? ''), 'arcs', a.primitiveId);
+		for (const v of vias as any[]) addId(String(v.net ?? ''), 'vias', v.primitiveId);
+		const purgeNetByIds = async (name: string): Promise<void> => {
+			const rec = idsByNet.get(name);
+			if (!rec) return;
+			idsByNet.delete(name);
+			try { if (rec.lines.length) await eda.pcb_PrimitiveLine.delete(rec.lines); } catch { /* ignore */ }
+			try { if (rec.arcs.length) await eda.pcb_PrimitiveArc.delete(rec.arcs); } catch { /* ignore */ }
+			try { if (rec.vias.length) await eda.pcb_PrimitiveVia.delete(rec.vias); } catch { /* ignore */ }
+		};
 		this.onProgress?.({ stage: '收集世界', percentage: 30, message: `收集静态世界与 ${entries.length} 个网络的走线...` });
 		const staticWorld = await this.collectStaticObstacles(drc);
 		this.onProgress?.({ stage: '真拉紧', percentage: 45, message: `逐段重解与圆润（共 ${entries.length} 网）...`, total: entries.length, done: 0, changed: 0, adopted: 0 });
@@ -287,19 +334,33 @@ export class TopologicalRouter {
 		const beforeLen = new Map(entries.map(e => [e.name, renderedLength(e.prims)]));
 		let done = 0;
 		let changedN = 0;
+		let savedMil = 0;
 		const optimized = await eng.postProcessImportedNets(
 			entries, drc, Array.from(padMap.values()).flat(), staticWorld,
 			(m, l) => this.onLog?.(m, l),
 			async (name, prims, vias) => {
-				await this.purgeManagedNets(new Set([name]));
+				// 未变化的网跳过重写：原先 50 网全删全建，画布上只看到
+				// 「导线删除重建」而没有变化（用户实测观感）
+				const orig = entries.find(e => e.name === name);
+				if (orig && sameNetGeometry(orig.prims, orig.vias, prims, vias)) {
+					done++;
+					this.onProgress?.({
+						stage: '真拉紧', percentage: 45 + Math.round((done / entries.length) * 50),
+						message: `检查 ${done}/${entries.length}：${name}（已紧凑，跳过）`,
+						done, total: entries.length, changed: changedN, savedMil,
+					});
+					return;
+				}
+				await purgeNetByIds(name);
 				this.netPrimIds.delete(name);
 				if (prims.length) await this.writeNet(name, prims, vias, true);
 				done++;
-				if (renderedLength(prims) < (beforeLen.get(name) ?? 0) - 0.5) changedN++;
+				const saved = (beforeLen.get(name) ?? 0) - renderedLength(prims);
+				if (saved > 0.5) { changedN++; savedMil += saved; }
 				this.onProgress?.({
 					stage: '真拉紧', percentage: 45 + Math.round((done / entries.length) * 50),
 					message: `拉紧 ${done}/${entries.length}：${name}`,
-					done, total: entries.length, changed: changedN,
+					done, total: entries.length, changed: changedN, savedMil,
 				});
 			},
 			() => this.shouldCancel,
@@ -307,15 +368,15 @@ export class TopologicalRouter {
 		this.netPrimIds.clear();
 		const changed = optimized.filter(e => e.changed).length;
 		const cancelled = this.shouldCancel;
-		this.onLog?.(`拉紧完成：${optimized.length} 网（${changed} 网有缩短）`, 'success');
+		this.onLog?.(`拉紧完成：${optimized.length} 网（${changed} 网有缩短，共省 ${savedMil.toFixed(0)}mil）`, 'success');
 		this.onProgress?.({
 			stage: cancelled ? '已停止' : '完成', percentage: 100,
 			message: cancelled
 				? `拉紧已停止：已处理 ${optimized.length} 网（${changed} 网有缩短）`
-				: `拉紧完成：${changed}/${optimized.length} 网有缩短`,
-			done: optimized.length, total: entries.length, changed,
+				: `拉紧完成：${changed}/${optimized.length} 网有缩短，共省 ${savedMil.toFixed(0)}mil`,
+			done: optimized.length, total: entries.length, changed, savedMil,
 		});
-		return { nets: optimized.length, changed };
+		return { nets: optimized.length, changed, savedMil };
 		} finally {
 			this.tightening = false;
 		}

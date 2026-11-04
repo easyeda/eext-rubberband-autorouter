@@ -29,11 +29,12 @@ export interface RoutingProgress {
 	percentage: number;
 	/** 进度消息 */
 	message: string;
-	/** 拉紧菜单：已处理网数 / 总网数 / 缩短网数 / 真拉紧入库段数 */
+	/** 拉紧菜单：已处理网数 / 总网数 / 缩短网数 / 真拉紧入库段数 / 累计缩短 mil */
 	done?: number;
 	total?: number;
 	changed?: number;
 	adopted?: number;
+	savedMil?: number;
 }
 
 // ==================== IFrame 通信 ====================
