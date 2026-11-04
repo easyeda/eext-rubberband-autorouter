@@ -1981,6 +1981,15 @@ export class PlanningEngine {
 
 	/** 逃逸通道预约已废弃：新算法由最短路自行决定出线方向 */
 
+	/** 过孔 → 动态障碍（两层通挡；半径与主管线过孔入账同式） */
+	private viaObstacleOf(v: PlannedVia): RBObstacle {
+		return {
+			id: `via${this.obstacleIdCounter++}`, kind: 'circle', x: v.x, y: v.y,
+			r: v.dia / 2 + Math.max(this.drc.trackToTrackMil, this.drc.trackToPadMil) + this.drc.traceWidthMil / 2 + VIA_WALL_EXTRA,
+			net: v.net, layer: undefined, group: `via:${v.net}:${v.x},${v.y}`, noPrune: true,
+		};
+	}
+
 	/** 渲染图元 → 动态障碍（端点圆可绕行 + 沿线阻挡） */
 	private addRenderedToObstacles(prims: RenderedPrim[]): void {
 		const drc = this.drc;
@@ -2034,6 +2043,9 @@ export class PlanningEngine {
 		const rank = (o: RBObstacle): number => (o.soft ? 2 : o.blockerOnly ? 1 : 0);
 		const uniq = new Map<string, RBObstacle>();
 		for (const o of this.dynamicObstacles) {
+			// 防御：坐标不全的障碍不进去重键（toFixed 会崩）、也不进世界——
+			// 引擎自建障碍必然齐备，脏的只可能来自画布收集的静态世界
+			if (!o || !Number.isFinite(o.x) || !Number.isFinite(o.y) || !Number.isFinite(o.r)) continue;
 			const key = `${o.layer ?? ''}|${o.net ?? ''}|${o.x.toFixed(1)}|${o.y.toFixed(1)}|${o.r.toFixed(2)}${o.forceBlock ? '|f' : ''}`;
 			const prev = uniq.get(key);
 			if (!prev || rank(o) < rank(prev)) uniq.set(key, o);
@@ -5322,7 +5334,12 @@ export class PlanningEngine {
 		if ((globalThis as any).__RB_GRID_DEBUG__) {
 			this.log(`[via-debug] ${netName} ${src.id}(L${src.layer})→${dst.id}(L${dst.layer}) anchorsA=${anchorsA.length} anchorsB=${anchorsB.length}`, 'info');
 		}
-		if (!anchorsA.length || !anchorsB.length) return null;
+		if (!anchorsA.length || !anchorsB.length) {
+			if ((globalThis as any).__RB_TIGHTEN_DIAG__) {
+				this.log(`[via-diag] ${netName} ${src.id}(L${src.layer})→${dst.id}(L${dst.layer}) 锚点不足 A=${anchorsA.length} B=${anchorsB.length}`, 'info');
+			}
+			return null;
+		}
 
 		// 按「引出段总长 + 底层直线距离」升序逐对尝试落点：
 		// 估值最优的一对底层未必走得通（会被先布网络的斜线封死），
@@ -5412,6 +5429,9 @@ export class PlanningEngine {
 		if (!pickA || !pickB || !bottomPrims) {
 			if ((globalThis as any).__RB_GRID_DEBUG__) {
 				this.log(`[via-debug] ${netName} ${src.id}→${dst.id} 全部 ${tried} 对候选失败`, 'warn');
+			}
+			if ((globalThis as any).__RB_TIGHTEN_DIAG__) {
+				this.log(`[via-diag] ${netName} ${src.id}(L${src.layer})→${dst.id}(L${dst.layer}) ${tried} 对候选全败（底层路径不通/微移失败）`, 'info');
 			}
 			return null;
 		}
@@ -6120,15 +6140,42 @@ export class PlanningEngine {
 		drc: DRCRules,
 		allPads: EnginePad[],
 		baseWorld?: RBObstacle[],
+		onLog?: (message: string, level: string) => void,
 	): Promise<Array<{ name: string; prims: RenderedPrim[]; vias: PlannedVia[]; changed: boolean }>> {
 		this.drc = drc;
 		this.allPads = allPads;
+		this.callbacks = { onLog };
 		this.planOptions = { connectivityFirst: true, optimize: false };
+		// 并排焊盘行信息：rowEscapeRoute（排内垂直出线预留）依赖。主线在
+		// 排序期顺带构建，后处理独立补建——否则 0.5mm 排里的重解边全部
+		// 无路（LED7 实测：走廊零障碍仍边无解 = 中心被邻盘净距圈吞没）
+		this.rowInfo.clear();
+		{
+			const byNetPads = new Map<string, EnginePad[]>();
+			for (const p of allPads) {
+				const arr = byNetPads.get(p.net);
+				if (arr) arr.push(p); else byNetPads.set(p.net, [p]);
+			}
+			this.prioritizeRowInteriorPads(
+				[...byNetPads.values()].map(ps => ({ net: { name: ps[0].net, pads: ps }, tier: 1 })));
+		}
 		this.netRendered.clear();
 		// 世界 = 全画布静态铜（其它网焊盘/走线/铺铜/板框，调用方收集）+ 导入铜皮。
 		// 缺静态世界时重解路径会合法地压上排除网/邻网铜皮（case9 实测 SMD Pad
 		// to Track 39 处的真凶）。
-		this.dynamicObstacles = [...(baseWorld ?? [])];
+		// 坐标非法的障碍（画布多边形脏点 → undefined/NaN 圆心）直接剔除：
+		// 去重键要做 toFixed，脏障碍会让整个拉紧流程崩掉（实测 case9）。
+		const rawWorld = baseWorld ?? [];
+		const world = rawWorld.filter(o => !!o && Number.isFinite(o.x) && Number.isFinite(o.y) && Number.isFinite(o.r));
+		if (world.length !== rawWorld.length) {
+			this.log(`静态世界剔除 ${rawWorld.length - world.length} 个坐标非法的障碍（画布几何脏点）`, 'warn');
+		}
+		this.dynamicObstacles = world;
+		// 网格兜底预算池：主线 plan() 里按整轮预算切分，后处理独立成池
+		//（gridFallbackEdge 见 0 直接放弃，重解的密集焊盘边就全靠它了）。
+		// 拉紧菜单是用户显式等待的场景：池给足（J/H 画布实测 20s 池只够
+		// ~10 条失败边，37 个边无解里大半是池耗尽假象）。
+		this.gridBudgetMs = Number((globalThis as any).__RB_TIGHTEN_GRID_MS__) || 90000;
 		this.plannedVias = [];
 		this.routedEdges.clear();
 		this.routedOrder = [];
@@ -6141,10 +6188,15 @@ export class PlanningEngine {
 			this.plannedVias.push(...e.vias);
 			const mark = this.dynamicObstacles.length;
 			if (e.prims.length) this.addRenderedToObstacles(mergePrims(e.prims));
+			// 导入过孔也要入世界：后续网的重解若看不见异网过孔，走线会直接
+			// 压上过孔铜环（拉紧菜单实测 Track to Via 违规的真凶之一）。
+			for (const v of e.vias) this.dynamicObstacles.push(this.viaObstacleOf(v));
 			obsByNet.set(e.name, this.dynamicObstacles.slice(mark));
 		}
 		// 从最短导线组开始拉直：短网纠缠少、先定形，长网在稳定世界上重解
 		const order = [...entries].sort((a, b) => renderedLength(a.prims) - renderedLength(b.prims));
+		let adoptedN = 0, tautenN = 0;
+		const failHist = new Map<string, number>();
 		for (const e of order) {
 			const before = renderedLength(e.prims);
 			let prims = e.prims;
@@ -6154,18 +6206,22 @@ export class PlanningEngine {
 				const own = new Set(obsByNet.get(e.name) ?? []);
 				this.dynamicObstacles = this.dynamicObstacles.filter(o => !own.has(o));
 				this.plannedVias = this.plannedVias.filter(v => v.net !== e.name);
-				// 2) 真拉紧：可视图逐边重解（仅同层网；更短且全量复验通过才采纳）
-				let adopted: RenderedPrim[] | null = null;
+				// 2) 真拉紧：可视图逐边重解（跨层边走过孔换层链；
+				//    更短且全量复验通过才采纳）
+				let adopted: { prims: RenderedPrim[]; vias: PlannedVia[] } | null = null;
 				try {
-					adopted = e.vias.length ? null : await this.resolveImportedNet(e.name);
+					adopted = await this.resolveImportedNet(e.name, e.vias);
 				} catch { adopted = null; }
 				if (adopted) {
-					prims = adopted;
-					vias = [];
+					prims = adopted.prims;
+					vias = adopted.vias;
+					adoptedN++;
 				} else {
 					// 3) 退回隔点拉直（Manhattan 折线删得动的地方有限）
 					this.tautenNet(e.name);
 					prims = this.netRendered.get(e.name) ?? e.prims;
+					tautenN++;
+					failHist.set(this.resolveFail || '异常', (failHist.get(this.resolveFail || '异常') ?? 0) + 1);
 				}
 				// 4) 圆润（拐角切线圆弧）
 				const smoothed = this.smoothCorners(mergePrims(prims), e.name);
@@ -6174,45 +6230,411 @@ export class PlanningEngine {
 			// 5) 登记最终形态为障碍（后续网的拉紧要看到本网的最终位置）
 			this.netRendered.set(e.name, prims);
 			if (prims.length) this.addRenderedToObstacles(mergePrims(prims));
+			for (const v of vias) this.dynamicObstacles.push(this.viaObstacleOf(v));
 			this.plannedVias.push(...vias);
 			out.push({ name: e.name, prims, vias, changed: renderedLength(prims) < before - 0.5 });
+		}
+		this.log(`后处理：真拉紧采纳 ${adoptedN} 网 / 隔点拉直 ${tautenN} 网（共 ${order.length}）`, 'info');
+		this.log(`段级重解：尝试 ${this.runStats.tried} 段 / 采纳 ${this.runStats.adopted} / 近直线跳过 ${this.runStats.skipped} / 无解 ${this.runStats.noPath}`, 'info');
+		if (failHist.size) {
+			this.log(`重解未采纳：${[...failHist.entries()].map(([k, n]) => `${k}×${n}`).join('，')}`, 'info');
 		}
 		return out;
 	}
 
 	/**
 	 * 导入网的可视图重解（真拉紧）：按 MST 逐边在「其它网铜皮」世界求
-	 * 最短路。仅处理无过孔的纯同层网（跨层网保持原几何走隔点拉直）。
-	 * 更短且 validatePrimsAgainst 全量复验通过才采纳，否则返回 null。
+	 * 最短路。同层边中心直连（失败退避焊盘边界出线）；同层堵死且两端
+	 * 都能底层接入时底层重试；跨层边（顶层 SMD ↔ 底层 SMD）走过孔
+	 * 换层链 viaEdgeCandidate——原先带过孔的网整网跳过重解（拉紧菜单
+	 * 「完全没有拉紧」的根源），现在逐边真实重布。更短（计过孔代价）
+	 * 且 validatePrimsAgainst 全量复验通过才采纳，否则返回 null。
+	 * 新落过孔即时入账 plannedVias（同网跨边 Hole to Hole 互查依赖），
+	 * 未采纳在 finally 里整体回滚。
 	 */
-	private async resolveImportedNet(name: string): Promise<RenderedPrim[] | null> {
-		const pads = this.allPads.filter(p => p.net === name);
-		if (pads.length < 2) return null;
+	/** 当前网重解未采纳的原因（resolveImportedNet 写入，诊断用） */
+	private resolveFail = '';
+	/** 段级重解计数（solveViaRuns 累计，诊断用）：近直线跳过/尝试/采纳/无解 */
+	private runStats = { skipped: 0, tried: 0, adopted: 0, noPath: 0 };
+
+	/**
+	 * 带过孔网的真拉紧（逐段重解）：原走线链按过孔断点切成同层段，
+	 * 过孔位置保持不动（不找新槽位——EDA 的过孔本就合法，且槽位搜索
+	 * 在密排区必然失败），逐段在「其它网铜皮 + 本网其它段」世界里重解，
+	 * 更短且复验通过才采纳，任一段失败保留原段——不整网回退。
+	 * 返回 null = 链断裂/分支（调用方落到 MST 全网重解路径）。
+	 */
+	private async solveViaRuns(
+		name: string, orig: RenderedPrim[], origVias: PlannedVia[],
+	): Promise<{ prims: RenderedPrim[]; vias: PlannedVia[] } | null> {
+		const split = this.splitIntoRuns(orig, origVias);
+		if (!split) return null;
+		const { segments, leftover } = split;
+		if (!segments.length) return null;
+		// 世界 = 其它网铜皮（dynamicObstacles，硬校验）。焊盘不走硬障碍：
+		// EDA 画布有存量焊盘违规（硬墙会让违规区整体不可重解），改走
+		// 「违规数不恶化」口径（countPadViolations 新 ≤ 原才采纳）
+		const obsAt = (ly: number) => this.dynamicObstacles.filter(o =>
+			!(o.net && o.net === name) && (o.layer === undefined || o.layer === ly));
+		const temp: RBObstacle[] = [];
+		const addTemp = (prims: RenderedPrim[]): string[] => {
+			const before = new Set<RBObstacle>(this.dynamicObstacles);
+			this.addRenderedToObstacles(prims);
+			const added = this.dynamicObstacles.filter(o => !before.has(o));
+			temp.push(...added);
+			return [...new Set(added.map(o => o.group ?? ''))].filter(g => !!g);
+		};
+		const removeGroups = (groups: string[]): void => {
+			const set = new Set(groups);
+			this.dynamicObstacles = this.dynamicObstacles.filter(o => !set.has(o.group ?? ''));
+		};
+		try {
+			// 原始段全部临时入世界：段间互见（重解段不得压本网其它段/分支残段）
+			if (leftover.length) addTemp(leftover);
+			for (const seg of segments) seg.groups = addTemp(seg.prims);
+			const t0 = Date.now();
+			for (const seg of segments) {
+				if (this.checkCancelled()) break;
+				const straight = Math.hypot(seg.b.x - seg.a.x, seg.b.y - seg.a.y);
+				const oldLen = renderedLength(seg.prims);
+				// 可回收余量不足 25mil（≈0.6mm，视觉可忽略）/ 单网预算耗尽：
+				// 跳过重解。⚠ 用绝对余量而不是比例门限——长段上 160mil 的
+				// 大绕路只占 12%，比例门限会把它跳过（LCD5 注入绕路实测）
+				if (oldLen - straight < 25 || Date.now() - t0 > 10000) { this.runStats.skipped++; continue; }
+				this.runStats.tried++;
+				const origSegPrims = seg.prims;
+				removeGroups(seg.groups);
+				let cand: RenderedPrim[] | null = null;
+				const r = await routeConnection(seg.a, seg.b, obsAt(seg.layer), name,
+					[150, 500], 3000, () => this.checkCancelled());
+				if (r.ok && r.prims.length) {
+					cand = r.prims.map(p => ({ ...(p as RenderedPrim), net: name, layer: seg.layer }));
+				}
+				const __diag = !!(globalThis as any).__RB_TIGHTEN_DIAG__;
+				if (cand && renderedLength(cand) < oldLen - 0.5 &&
+					await validatePrimsAgainst(cand as unknown as RBPrimitive[], obsAt(seg.layer), name) &&
+					this.countPadViolations(cand, name) <= this.countPadViolations(origSegPrims, name)) {
+					seg.prims = cand;
+					this.runStats.adopted++;
+				} else {
+					this.runStats.noPath++;
+					if (__diag) {
+						this.log(`[段诊断] ${name} (${seg.a.x.toFixed(0)},${seg.a.y.toFixed(0)})→(${seg.b.x.toFixed(0)},${seg.b.y.toFixed(0)}) L${seg.layer} 原长${oldLen.toFixed(0)} 直距${straight.toFixed(0)} 新长${cand ? renderedLength(cand).toFixed(0) : '无路'}${cand && renderedLength(cand) >= oldLen - 0.5 ? '(不够短)' : ''}${cand ? ` 焊盘违规${this.countPadViolations(cand, name)}/${this.countPadViolations(origSegPrims, name)}` : ''}`, 'info');
+					}
+				}
+				// 本段当前形态（原始或新）回到世界
+				seg.groups = addTemp(seg.prims);
+			}
+			return {
+				prims: [...segments.flatMap(s => s.prims), ...leftover],
+				vias: origVias.map(v => ({ ...v })),
+			};
+		} finally {
+			// 临时障碍全部摘除：调用方以最终形态重新登记（step 5）
+			const tset = new Set<RBObstacle>(temp);
+			this.dynamicObstacles = this.dynamicObstacles.filter(o => !tset.has(o));
+		}
+	}
+
+	/**
+	 * 原走线按「节点图」切同层段：节点 = 图元端点聚类（0.8mil）；度≠2 的
+	 * 节点与过孔位置为段边界。段 = 两个边界节点之间的图元链。EDA 产物
+	 * 常有分支（T 型接续）——分支臂各自成段，独立重解；环（全度 2）进
+	 * leftover 原样保留。过孔处强制切段（过孔位置保持不动）。
+	 */
+	private splitIntoRuns(
+		prims: RenderedPrim[], vias: PlannedVia[],
+	): { segments: Array<{ prims: RenderedPrim[]; a: { x: number; y: number }; b: { x: number; y: number }; layer: number; groups?: string[] }>; leftover: RenderedPrim[] } {
+		const startOf = (p: RenderedPrim): { x: number; y: number } => p.kind === 'line'
+			? { x: p.x1 ?? 0, y: p.y1 ?? 0 }
+			: { x: (p.cx ?? 0) + (p.r ?? 0) * Math.cos(p.startAngle ?? 0), y: (p.cy ?? 0) + (p.r ?? 0) * Math.sin(p.startAngle ?? 0) };
+		const endOf = (p: RenderedPrim): { x: number; y: number } => p.kind === 'line'
+			? { x: p.x2 ?? 0, y: p.y2 ?? 0 }
+			: { x: (p.cx ?? 0) + (p.r ?? 0) * Math.cos((p.startAngle ?? 0) + (p.sweep ?? 0)), y: (p.cy ?? 0) + (p.r ?? 0) * Math.sin((p.startAngle ?? 0) + (p.sweep ?? 0)) };
+		// 端点聚类（0.8mil 内同节点）
+		const eps: Array<{ x: number; y: number }> = [];
+		const findNode = (p: { x: number; y: number }): number => {
+			for (let i = 0; i < eps.length; i++) {
+				if (Math.hypot(eps[i].x - p.x, eps[i].y - p.y) < 0.8) return i;
+			}
+			eps.push({ x: p.x, y: p.y });
+			return eps.length - 1;
+		};
+		const ends: Array<[number, number]> = prims.map(p =>
+			[findNode(startOf(p)), findNode(endOf(p))] as [number, number]);
+		const deg = new Map<number, number>();
+		for (const [a, b] of ends) {
+			deg.set(a, (deg.get(a) ?? 0) + 1);
+			deg.set(b, (deg.get(b) ?? 0) + 1);
+		}
+		const viaNodes = new Set<number>();
+		for (const v of vias) {
+			let best = -1, bd = 2;
+			for (let i = 0; i < eps.length; i++) {
+				const d = Math.hypot(eps[i].x - v.x, eps[i].y - v.y);
+				if (d < bd) { bd = d; best = i; }
+			}
+			if (best >= 0) viaNodes.add(best);
+		}
+		const isBoundary = (n: number): boolean => (deg.get(n) ?? 0) !== 2 || viaNodes.has(n);
+		const usedPrim = new Set<number>();
+		// 从 prim i 的 node 端向外延伸（每步经度-2 节点接下一根图元），
+		// 返回 [沿途图元, 终止节点]
+		const walkOut = (i: number, node: number): { prims: RenderedPrim[]; end: number } => {
+			const seq: RenderedPrim[] = [];
+			let cur = node;
+			let guard = prims.length + 4;
+			while (!isBoundary(cur) && guard-- > 0) {
+				let found = -1, next = -1;
+				for (let j = 0; j < prims.length; j++) {
+					if (usedPrim.has(j)) continue;
+					const [ja, jb] = ends[j];
+					if (ja === cur) { found = j; next = jb; break; }
+					if (jb === cur) { found = j; next = ja; break; }
+				}
+				if (found < 0) break;
+				usedPrim.add(found);
+				seq.push(prims[found]);
+				cur = next;
+			}
+			return { prims: seq, end: cur };
+		};
+		const segments: Array<{ prims: RenderedPrim[]; a: { x: number; y: number }; b: { x: number; y: number }; layer: number; groups?: string[] }> = [];
+		const leftover: RenderedPrim[] = [];
+		for (let i = 0; i < prims.length; i++) {
+			if (usedPrim.has(i)) continue;
+			usedPrim.add(i);
+			const [pa, pb] = ends[i];
+			const left = walkOut(i, pa);
+			const right = walkOut(i, pb);
+			const seq = [...left.prims, prims[i], ...right.prims];
+			if (left.end === right.end) { leftover.push(...seq); continue; }   // 独立环
+			const na = eps[left.end], nb = eps[right.end];
+			const layer = seq[0].layer;
+			if (seq.some(q => q.layer !== layer)) {
+				// 段内混层只可能经边界节点（过孔已切段）——防御性保留原样
+				leftover.push(...seq);
+				continue;
+			}
+			segments.push({
+				prims: seq,
+				a: { x: na.x, y: na.y },
+				b: { x: nb.x, y: nb.y },
+				layer: layer ?? 1,
+			});
+		}
+		return { segments, leftover };
+	}
+
+	/**
+	 * 图元采样点对异网焊盘（含钻孔）的净距违规计数。「不恶化解」口径：
+	 * EDA 画布常有存量焊盘违规（case9 实测 62 处 SMD Pad to Track），
+	 * 硬把焊盘当墙会让违规区域整体不可重解；改为新段违规数 ≤ 原段即放行
+	 * ——整网级、菜单级都不恶化，而已有违规区里的明显绕路仍能拉直。
+	 */
+	private countPadViolations(prims: RenderedPrim[], netName: string): number {
+		if (!prims.length) return 0;
+		const samples: Array<{ x: number; y: number; layer: number }> = [];
+		for (const p of prims) {
+			if (p.kind === 'line') {
+				const L = Math.hypot((p.x2 ?? 0) - (p.x1 ?? 0), (p.y2 ?? 0) - (p.y1 ?? 0));
+				const n = Math.max(1, Math.ceil(L / 4));
+				for (let k = 0; k <= n; k++) {
+					const t = k / n;
+					samples.push({
+						x: (p.x1 ?? 0) + ((p.x2 ?? 0) - (p.x1 ?? 0)) * t,
+						y: (p.y1 ?? 0) + ((p.y2 ?? 0) - (p.y1 ?? 0)) * t,
+						layer: p.layer ?? 1,
+					});
+				}
+			} else {
+				const n = Math.max(2, Math.ceil(Math.abs(p.sweep ?? 0) / 0.3));
+				for (let k = 0; k <= n; k++) {
+					const a = (p.startAngle ?? 0) + ((p.sweep ?? 0) * k) / n;
+					samples.push({
+						x: (p.cx ?? 0) + (p.r ?? 0) * Math.cos(a),
+						y: (p.cy ?? 0) + (p.r ?? 0) * Math.sin(a),
+						layer: p.layer ?? 1,
+					});
+				}
+			}
+		}
+		const halfW = this.drc.traceWidthMil / 2;
+		let bad = 0;
+		for (const s of samples) {
+			for (const pd of this.allPads) {
+				if (pd.net === netName) continue;
+				const conductive = pd.layer === 12 || pd.padType === 'th' || pd.layer === s.layer;
+				if (!conductive) continue;
+				const d = this.padCopperDistance(pd, s.x, s.y);
+				const needCu = this.drc.trackToPadMil + halfW;
+				let hit = d < needCu;
+				if (!hit && (pd.layer === 12 || pd.padType === 'th')) {
+					// 钻孔禁入（Hole to Track）：孔缘 + 间距 + 半线宽
+					const holeD = Math.max(pd.holeDiameter, 0);
+					if (holeD > 0 && Math.hypot(pd.x - s.x, pd.y - s.y) < holeD / 2 + this.drc.trackToPadMil + halfW) hit = true;
+				}
+				if (hit) { bad++; break; }
+			}
+		}
+		return bad;
+	}
+
+	private async resolveImportedNet(
+		name: string, origVias: PlannedVia[],
+	): Promise<{ prims: RenderedPrim[]; vias: PlannedVia[] } | null> {
+		this.resolveFail = '';
+		const fail = (why: string): null => { this.resolveFail = why; return null; };
+		const orig0 = this.netRendered.get(name);
+		// 带过孔网优先逐段重解（过孔不动、段级采纳/保留）；链断裂才落
+		// MST 全网重解。段级复验已做，这里只看整网是否缩短。
+		if (orig0 && orig0.length && origVias.length) {
+			const runs = await this.solveViaRuns(name, orig0, origVias);
+			if (runs) {
+				if (renderedLength(runs.prims) < renderedLength(orig0) - 0.5) return runs;
+				return fail(`不够短(${(renderedLength(orig0) - renderedLength(runs.prims)).toFixed(0)}mil,孔不变)`);
+			}
+			// null = 断链/分支 → MST 路径
+		}
+		const allP = this.allPads.filter(p => p.net === name);
+		// 同坐标重复 pad（getAllPrimitivesByNet 枚举重复，case9 P02/P22/$1N50156
+		// 实测）：MST 出零长度边，任一边无解即整网 bail 的口径下直接冤死 ——
+		// 按 0.5mil 量化去重
+		const pads: EnginePad[] = [];
+		for (const p of allP) {
+			if (!pads.some(q => Math.abs(q.x - p.x) < 0.5 && Math.abs(q.y - p.y) < 0.5)) pads.push(p);
+		}
+		if (pads.length < 2) return fail('单焊盘');
 		const edges = this.computeMST(pads);
-		const out: RenderedPrim[] = [];
-		for (const [ia, ib] of edges) {
-			const a = pads[ia], b = pads[ib];
-			const layer = getRoutingLayer(a, b);
-			if (bottomCapable(a) !== bottomCapable(b) && layer === 1) return null;   // 跨层网不重解
-			// 该层世界：routeConnection 不自带同网过滤（主管线由调用方
-			// layerObstacles 过滤）——这里必须先剔除本网障碍（自家焊盘/旧迹），
-			// 否则端点落在自家焊盘中心直接判侵入。
-			const obs = this.dynamicObstacles.filter(o =>
-				!(o.net && o.net === name) && (o.layer === undefined || o.layer === layer));
+		// 该层世界：其它网铜皮（dynamicObstacles）。routeConnection 不自带同网
+		// 过滤——这里必须先剔除本网障碍（自家焊盘/旧迹），否则端点落在自家
+		// 焊盘中心直接判侵入。焊盘走「违规数不恶化」口径（见 countPadViolations）
+		const obsAt = (ly: number) => this.dynamicObstacles.filter(o =>
+			!(o.net && o.net === name) && (o.layer === undefined || o.layer === ly));
+		const routeEdgeAt = async (a: EnginePad, b: EnginePad, ly: number): Promise<RenderedPrim[] | null> => {
+			const obs = obsAt(ly);
 			const r = await routeConnection(
 				{ x: a.x, y: a.y }, { x: b.x, y: b.y }, obs, name,
 				[150, 500], 3000, () => this.checkCancelled(),
 			);
-			if (!r.ok || !r.prims.length) return null;
-			for (const p of r.prims) out.push({ ...(p as RenderedPrim), net: name, layer });
+			if (r.ok && r.prims.length) {
+				return r.prims.map(p => ({ ...(p as RenderedPrim), net: name, layer: ly }));
+			}
+			// 密集焊盘排里邻盘净距圈吞没焊盘中心：从焊盘轮廓边界出线退避
+			let prims = await this.candidateEdgeRoute(a, b, name, ly, obs);
+			// 并排焊盘排（连接器/LED 排，0.5mm 间距）：排中焊盘唯一合法出线是
+			// 排法向冲出（主线同款预留；rowInfo 在本入口开头补建）
+			const srcRow = this.rowInfo.get(a.id);
+			if (!prims && srcRow && srcRow.depth > 0.4) {
+				prims = await this.rowEscapeRoute(a, b, srcRow, name, ly);
+			}
+			const dstRow = this.rowInfo.get(b.id);
+			if (!prims && dstRow && dstRow.depth > 0.4) {
+				prims = await this.rowEscapeRoute(b, a, dstRow, name, ly, true);
+			}
+			return prims;
+		};
+		const solveEdge = async (a: EnginePad, b: EnginePad): Promise<{ prims: RenderedPrim[]; vias: PlannedVia[] } | null> => {
+			const layer = getRoutingLayer(a, b);
+			const __diag = !!(globalThis as any).__RB_TIGHTEN_DIAG__;
+			const stages: string[] = [];
+			// 跨层对：一端只能顶层接入、另一端只能底层接入（getRoutingLayer
+			// 恒返 1），任何同层直连在几何上都不存在。含通孔的对不在此列
+			//——通孔可从顶层接入，先试同层，过孔链只作退避
+			const crossLayer = bottomCapable(a) !== bottomCapable(b) && layer === 1 &&
+				a.layer !== 12 && b.layer !== 12;
+			let prims: RenderedPrim[] | null = null;
+			let vias: PlannedVia[] = [];
+			if (!crossLayer) {
+				prims = await routeEdgeAt(a, b, layer);
+				stages.push(`vis${layer}:${prims ? 'OK' : 'x'}`);
+				// 同层堵死且两端都能底层接入 → 底层重试（TH/底层盘无需过孔）
+				if (!prims && layer === 1 && this.hasBottomLayer &&
+					bottomCapable(a) && bottomCapable(b)) {
+					prims = await routeEdgeAt(a, b, 2);
+					stages.push(`vis2:${prims ? 'OK' : 'x'}`);
+				}
+			} else {
+				stages.push('cross');
+			}
+			// 可视图全败 → 网格兜底（焊盘内部多点起步，主管线同款；自带双层与过孔）
+			if (!prims) {
+				let g: { prims: RenderedPrim[]; vias: PlannedVia[] } | null | string = null;
+				try { g = await this.gridFallbackEdge(a, b, name); } catch (e) { g = 'THROW:' + String((e as Error)?.message ?? e).slice(0, 90); }
+				if (g && typeof g !== 'string' && g.prims.length) { prims = g.prims; vias = g.vias; }
+				stages.push(`grid:${typeof g === 'string' ? g : g ? (g.prims.length ? 'OK' : 'x') : 'null'}`);
+			}
+			// 仍无路 → 过孔换层链。viaEdgeCandidate 用完整世界（静态+焊盘+
+			// 其它网铜皮）并自带落点净距校验；拉紧场景世界固定，绝不撕其它网。
+			if (!prims && this.hasBottomLayer) {
+				let vc: { prims: RenderedPrim[]; vias: PlannedVia[]; length: number } | null | string = null;
+				try { vc = await this.viaEdgeCandidate(a, b, name); } catch (e) { vc = 'THROW:' + String(e).slice(0, 60); }
+				if (vc && typeof vc !== 'string') { prims = vc.prims; vias = vc.vias; }
+				stages.push(`via:${typeof vc === 'string' ? vc : vc ? 'OK' : 'x'}`);
+			}
+			if (!prims && __diag) {
+				// 诊断：走廊两侧 25mil 内的异网障碍按类别计数 + 端点邻域障碍数
+				const near = obsAt(layer).filter(o => !o.soft &&
+					pointSegDist(o.x, o.y, a.x, a.y, b.x, b.y) < o.r + 25);
+				const byKind = new Map<string, number>();
+				for (const o of near) {
+					const k = o.group?.startsWith('pad:') ? 'pad'
+						: o.group?.startsWith('via:') ? 'via'
+						: o.group?.startsWith('fill') ? 'fill'
+						: o.group === 'board' ? 'board' : 'trk';
+					byKind.set(k, (byKind.get(k) ?? 0) + 1);
+				}
+				const epNear = (px: number, py: number) =>
+					obsAt(layer).filter(o => !o.soft && Math.hypot(o.x - px, o.y - py) < o.r + 20).length;
+				this.log(`[拉紧诊断] ${name} (${a.x.toFixed(0)},${a.y.toFixed(0)})L${a.layer}→(${b.x.toFixed(0)},${b.y.toFixed(0)})L${b.layer} L${layer} ${stages.join(' ')} 端点邻域 ${epNear(a.x, a.y)}/${epNear(b.x, b.y)} 走廊: ${[...byKind.entries()].map(([k, n]) => `${k}=${n}`).join(' ') || '无'}`, 'info');
+			}
+			return prims ? { prims, vias } : null;
+		};
+		const out: RenderedPrim[] = [];
+		const outVias: PlannedVia[] = [];
+		const savedVias = this.plannedVias;
+		this.plannedVias = savedVias.filter(v => v.net !== name);
+		try {
+			for (const [ia, ib] of edges) {
+				if (this.checkCancelled()) return fail('取消');
+				const pa = pads[ia], pb = pads[ib];
+				if (Math.hypot(pa.x - pb.x, pa.y - pb.y) < 1) continue;   // 重合 pad 退化边
+				const solved = await solveEdge(pa, pb);
+				if (!solved) return fail('边无解');   // 任一边解不出 → 整网回退隔点拉直
+				const prims = solved.prims;
+				const vias = solved.vias;
+				if (prims.some(p => p.layer === undefined)) return fail('无层图元');   // 无层图元防御
+				out.push(...prims);
+				outVias.push(...vias);
+				this.plannedVias.push(...vias);   // 跨边互见（同网 hole-to-hole）
+			}
+			const orig = this.netRendered.get(name);
+			if (!orig || !orig.length) return fail('无原图元');
+			// 采纳门槛计入过孔代价：铜皮缩短必须覆盖过孔数增量（+1 孔 ≈ 150mil），
+			// 既不白加过孔，也允许「多绕铜皮换掉无谓扇出孔」的解
+			const viaCost = Math.max(150, this.drc.traceWidthMil * 22);
+			if (renderedLength(out) + outVias.length * viaCost >=
+				renderedLength(orig) + origVias.length * viaCost - 0.5) {
+				return fail(`不够短(${(renderedLength(orig) - renderedLength(out)).toFixed(0)}mil,孔${outVias.length}/${origVias.length})`);
+			}
+			// 全量复验：走线逐层 + 过孔净距（两层 + 精确口径）。防「重解路径
+			// 合法地压上异网铜皮」——采纳门槛与主管线一致。焊盘走「违规数
+			// 不恶化」口径（存量违规区允许不恶化的重解）
+			for (const ly of this.hasBottomLayer ? [1, 2] : [1]) {
+				const pr = out.filter(p => p.layer === ly);
+				if (!pr.length) continue;
+				if (!await validatePrimsAgainst(pr as unknown as RBPrimitive[], obsAt(ly), name)) return fail(`复验拒L${ly}`);
+			}
+			if (this.countPadViolations(out, name) > this.countPadViolations(orig, name)) {
+				return fail(`焊盘恶化${this.countPadViolations(out, name)}/${this.countPadViolations(orig, name)}`);
+			}
+			for (const v of outVias) {
+				if (!this.viaObstacleClear(v.x, v.y, obsAt(1), v.dia / 2, name) ||
+					!this.viaObstacleClear(v.x, v.y, obsAt(2), v.dia / 2, name)) return fail('过孔净距');
+			}
+			return { prims: out, vias: outVias };
+		} finally {
+			this.plannedVias = savedVias;
 		}
-		const orig = this.netRendered.get(name);
-		if (!orig || !orig.length || renderedLength(out) >= renderedLength(orig) - 0.5) return null;
-		const layer = getRoutingLayer(pads[0], pads[1]);
-		const obs = this.dynamicObstacles.filter(o =>
-			!(o.net && o.net === name) && (o.layer === undefined || o.layer === layer));
-		const valid = await validatePrimsAgainst(out as unknown as RBPrimitive[], obs, name);
-		if (!valid) return null;
-		return out;
 	}
 }

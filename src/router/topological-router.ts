@@ -51,6 +51,29 @@ function breathe(): Promise<void> {
 	return new Promise<void>(resolve => setTimeout(resolve, 0));
 }
 
+/**
+ * 画布弧图元（两点式：startX/startY/endX/endY/arcAngle°）→ 引擎弧
+ *（cx/cy/r/startAngle/sweep）。换算与 collectStaticObstacles 的弧采样同式。
+ * 之前直接读 centerX/cx/sweep——EDA 弧根本没有这些字段，读回全是 undefined，
+ * 拉紧回写后画布圆角全灭（实测 case9 81 弧 → 0）。
+ */
+function canvasArcToPrim(a: any, net: string): RenderedPrim | null {
+	const layer: number = a.layer ?? a.layerId ?? 1;
+	const sx = a.startX, sy = a.startY, ex = a.endX, ey = a.endY;
+	const sweep = (Number(a.arcAngle ?? a.sweep ?? 0) * Math.PI) / 180;
+	if (typeof sx !== 'number' || typeof sy !== 'number' ||
+		typeof ex !== 'number' || typeof ey !== 'number') return null;
+	const L = Math.hypot(ex - sx, ey - sy);
+	if (!sweep || Math.abs(Math.sin(sweep / 2)) < 1e-6 || L < 1e-6) return null;
+	const R = L / (2 * Math.abs(Math.sin(sweep / 2)));
+	const sgn = sweep > 0 ? 1 : -1;
+	const h = sgn * R * Math.cos(sweep / 2);
+	const nx = -(ey - sy) / L, ny = (ex - sx) / L;
+	const cx = (sx + ex) / 2 + h * nx, cy = (sy + ey) / 2 + h * ny;
+	const a0 = Math.atan2(sy - cy, sx - cx);
+	return { kind: 'arc', net, layer, cx, cy, r: R, startAngle: a0, sweep };
+}
+
 export class TopologicalRouter {
 	private onProgress?: ProgressCallback;
 	private onLog?: LogCallback;
@@ -216,7 +239,8 @@ export class TopologicalRouter {
 			const net = String(a.net ?? '');
 			if (!net || !padMap.has(net)) continue;
 			const e = byNet.get(net) ?? { prims: [], vias: [] };
-			e.prims.push({ kind: 'arc', net, layer: a.layer ?? a.layerId ?? 1, cx: a.centerX ?? a.cx, cy: a.centerY ?? a.cy, r: a.radius ?? a.r, startAngle: a.startAngle, sweep: a.sweep });
+			const prim = canvasArcToPrim(a, net);
+			if (prim) e.prims.push(prim);
 			byNet.set(net, e);
 		}
 		for (const v of vias as any[]) {
@@ -232,7 +256,7 @@ export class TopologicalRouter {
 		const staticWorld = await this.collectStaticObstacles(drc);
 		this.onProgress?.({ stage: '拉紧已有布线', percentage: 50, message: '真拉紧（可视图逐边重解）+ 圆润处理中...' });
 		const eng = new PlanningEngine();
-		const optimized = await eng.postProcessImportedNets(entries, drc, Array.from(padMap.values()).flat(), staticWorld);
+		const optimized = await eng.postProcessImportedNets(entries, drc, Array.from(padMap.values()).flat(), staticWorld, (m, l) => this.onLog?.(m, l));
 		this.onProgress?.({ stage: '拉紧已有布线', percentage: 80, message: '回写画布...' });
 		await this.purgeManagedNets(new Set(entries.map(e => e.name)));
 		this.netPrimIds.clear();
@@ -871,7 +895,8 @@ export class TopologicalRouter {
 							const net = String(a.net ?? '');
 							if (!this.routedNames.has(net)) continue;
 							const e = byNet.get(net) ?? { prims: [], vias: [] };
-							e.prims.push({ kind: 'arc', net, layer: a.layer ?? a.layerId ?? 1, cx: a.centerX ?? a.cx, cy: a.centerY ?? a.cy, r: a.radius ?? a.r, startAngle: a.startAngle, sweep: a.sweep });
+							const prim = canvasArcToPrim(a, net);
+							if (prim) e.prims.push(prim);
 							byNet.set(net, e);
 						}
 						for (const v of vias as any[]) {
@@ -888,7 +913,7 @@ export class TopologicalRouter {
 						// 缺了它重解路径会合法地压上这些铜，DRC 违规暴涨）。
 						const staticWorld = await this.collectStaticObstacles(drc);
 						const eng = new PlanningEngine();
-						const optimized = await eng.postProcessImportedNets(entries, drc, networks.flatMap(n => n.pads), staticWorld);
+						const optimized = await eng.postProcessImportedNets(entries, drc, networks.flatMap(n => n.pads), staticWorld, (m, l) => this.onLog?.(m, l));
 						// 回写：整批清掉原几何，逐网写优化结果
 						await this.purgeManagedNets(new Set(entries.map(e => e.name)));
 						this.netPrimIds.clear();
