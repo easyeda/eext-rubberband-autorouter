@@ -6,7 +6,7 @@
  * 这样无需额外文件加载或全局状态，也兼容 EDA 的 IFrame 沙箱。
  */
 
-export type DialogName = 'params' | 'progress';
+export type DialogName = 'params' | 'progress' | 'tighten';
 
 interface DialogHandler {
 	onReady?: (send: (msg: Record<string, unknown>) => void) => void;
@@ -80,7 +80,7 @@ export class DialogBridge {
 			const data = event?.data;
 			if (!data || data.source !== UI_SOURCE) return;
 			const dialog = data.dialog as DialogName;
-			if (dialog !== 'params' && dialog !== 'progress') return;
+			if (dialog !== 'params' && dialog !== 'progress' && dialog !== 'tighten') return;
 
 			if (data.type === 'ready') {
 				if (event.source) this.sources.set(dialog, event.source);

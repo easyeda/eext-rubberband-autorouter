@@ -1,0 +1,209 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>拉紧已有布线</title>
+<style>
+	:root {
+		--bg: #f4f6fb;
+		--card: rgba(255, 255, 255, 0.9);
+		--card-border: rgba(15, 23, 42, 0.08);
+		--text: #0f172a;
+		--muted: #64748b;
+		--faint: #94a3b8;
+		--accent: #4f7cff;
+		--accent2: #8b5cf6;
+		--track: rgba(15, 23, 42, 0.08);
+		--shadow: 0 10px 28px rgba(15, 23, 42, 0.10);
+		--danger: #ef4444;
+		--success: #10b981;
+	}
+	@media (prefers-color-scheme: dark) {
+		:root {
+			--bg: #0b1020;
+			--card: rgba(23, 30, 51, 0.88);
+			--card-border: rgba(148, 163, 184, 0.14);
+			--text: #eef2ff;
+			--muted: #a5b0c6;
+			--faint: #7c89a3;
+			--accent: #6d8dff;
+			--accent2: #a78bfa;
+			--track: rgba(148, 163, 184, 0.18);
+			--shadow: 0 14px 34px rgba(0, 0, 0, 0.45);
+		}
+	}
+	* { box-sizing: border-box; }
+	html, body { height: 100%; margin: 0; }
+	body {
+		font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "Microsoft YaHei", "PingFang SC", sans-serif;
+		color: var(--text);
+		background: var(--bg);
+		overflow: hidden;
+	}
+	.app { height: 100%; display: flex; flex-direction: column; gap: 8px; padding: 12px 14px; }
+
+	.top { display: flex; align-items: center; gap: 8px; }
+	.pulse {
+		width: 10px; height: 10px; border-radius: 50%; flex: none;
+		background: var(--accent);
+		animation: pulse 1.6s ease-out infinite;
+	}
+	.pulse.done { background: var(--success); animation: none; }
+	.pulse.error { background: var(--danger); animation: none; }
+	@keyframes pulse {
+		0% { box-shadow: 0 0 0 0 rgba(79, 124, 255, 0.55); }
+		70% { box-shadow: 0 0 0 8px rgba(79, 124, 255, 0); }
+		100% { box-shadow: 0 0 0 0 rgba(79, 124, 255, 0); }
+	}
+	h1 { margin: 0; font-size: 13.5px; font-weight: 700; flex: 1; }
+	.timer { font-size: 11.5px; font-weight: 700; color: var(--muted); font-variant-numeric: tabular-nums; }
+
+	.progress-card {
+		background: var(--card); border: 1px solid var(--card-border);
+		border-radius: 10px; box-shadow: var(--shadow); padding: 9px 11px;
+	}
+	.head { display: flex; align-items: baseline; justify-content: space-between; margin-bottom: 6px; }
+	.percent {
+		font-size: 19px; font-weight: 800; letter-spacing: -0.4px;
+		background: linear-gradient(135deg, var(--accent), var(--accent2));
+		-webkit-background-clip: text; background-clip: text; color: transparent;
+		font-variant-numeric: tabular-nums;
+	}
+	.stage { font-size: 11px; font-weight: 600; color: var(--muted); }
+	.bar { height: 6px; border-radius: 999px; background: var(--track); overflow: hidden; }
+	.fill {
+		height: 100%; width: 0%; border-radius: 999px;
+		background: linear-gradient(90deg, var(--accent), var(--accent2));
+		transition: width 0.3s cubic-bezier(0.2, 0.8, 0.2, 1);
+	}
+	.msg {
+		margin: 6px 0 0; font-size: 11px; color: var(--muted);
+		white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+	}
+	.stats { display: flex; gap: 14px; font-size: 11px; color: var(--muted); padding: 0 2px; }
+	.stats b { color: var(--text); font-variant-numeric: tabular-nums; }
+	.spacer { flex: 1; }
+	.foot { display: flex; align-items: center; gap: 8px; }
+	.foot .hint { flex: 1; font-size: 10.5px; color: var(--faint); }
+	button {
+		font: inherit; font-size: 11.5px; font-weight: 650;
+		padding: 6px 14px; border-radius: 8px; cursor: pointer;
+		border: 1px solid var(--card-border); background: var(--card); color: var(--text);
+	}
+	button:hover { filter: brightness(0.97); }
+	button.primary {
+		border: none; color: #fff;
+		background: linear-gradient(135deg, var(--accent), var(--accent2));
+	}
+</style>
+</head>
+<body>
+<div class="app">
+	<div class="top">
+		<div class="pulse" id="pulse"></div>
+		<h1>拉紧已有布线</h1>
+		<div class="timer" id="timer">0.0s</div>
+	</div>
+
+	<div class="progress-card">
+		<div class="head">
+			<div class="percent" id="percent">0%</div>
+			<div class="stage" id="stage">准备中</div>
+		</div>
+		<div class="bar"><div class="fill" id="fill"></div></div>
+		<div class="msg" id="msg">正在读取画布与 DRC 规则...</div>
+	</div>
+
+	<div class="stats">
+		<span>已处理 <b id="done">0</b>/<b id="total">0</b> 网</span>
+		<span>缩短 <b id="changed">0</b> 网</span>
+		<span>入库 <b id="adopted">0</b> 段</span>
+	</div>
+
+	<div class="spacer"></div>
+	<div class="foot">
+		<div class="hint" id="hint">关闭窗口将停止拉紧（已写入部分保留）</div>
+		<button class="primary" id="closeBtn">停止</button>
+	</div>
+</div>
+<script>
+	(function () {
+		var startedAt = Date.now();
+		var finished = false;
+		var els = {
+			pulse: document.getElementById('pulse'),
+			timer: document.getElementById('timer'),
+			percent: document.getElementById('percent'),
+			stage: document.getElementById('stage'),
+			fill: document.getElementById('fill'),
+			msg: document.getElementById('msg'),
+			done: document.getElementById('done'),
+			total: document.getElementById('total'),
+			changed: document.getElementById('changed'),
+			adopted: document.getElementById('adopted'),
+			hint: document.getElementById('hint'),
+			closeBtn: document.getElementById('closeBtn'),
+		};
+
+		function send(payload) {
+			try { window.parent.postMessage(Object.assign({ source: 'rb-ui', dialog: 'tighten' }, payload), '*'); } catch (e) { /* ignore */ }
+		}
+
+		function setTimer() {
+			if (finished) return;
+			els.timer.textContent = ((Date.now() - startedAt) / 1000).toFixed(1) + 's';
+		}
+		setInterval(setTimer, 200);
+
+		function setPercent(p) {
+			var v = Math.max(0, Math.min(100, Math.round(p || 0)));
+			els.percent.textContent = v + '%';
+			els.fill.style.width = v + '%';
+		}
+
+		window.addEventListener('message', function (event) {
+			var data = event.data;
+			if (!data || data.source !== 'rb-host') return;
+			if (data.type === 'progress') {
+				setPercent(data.percentage);
+				if (data.stage) els.stage.textContent = data.stage;
+				if (data.message) els.msg.textContent = data.message;
+				if (typeof data.done === 'number') els.done.textContent = data.done;
+				if (typeof data.total === 'number' && data.total) { els.total.textContent = data.total; els.done.textContent = '0'; }
+				if (typeof data.changed === 'number') els.changed.textContent = data.changed;
+				if (typeof data.adopted === 'number') els.adopted.textContent = data.adopted;
+			} else if (data.type === 'done') {
+				finished = true;
+				els.pulse.classList.add('done');
+				setPercent(100);
+				els.stage.textContent = '完成';
+				els.msg.textContent = '拉紧完成：' + (data.changed || 0) + '/' + (data.total || 0) + ' 网有缩短，用时 ' + ((Date.now() - startedAt) / 1000).toFixed(1) + 's';
+				els.hint.textContent = '可以关闭窗口';
+				els.closeBtn.textContent = '关闭';
+				els.closeBtn.classList.remove('primary');
+				els.closeBtn.onclick = function () { send({ type: 'close' }); };
+			} else if (data.type === 'error') {
+				finished = true;
+				els.pulse.classList.add('error');
+				els.stage.textContent = '失败';
+				els.msg.textContent = String(data.message || '拉紧失败');
+				els.hint.textContent = '可以关闭窗口';
+				els.closeBtn.textContent = '关闭';
+				els.closeBtn.onclick = function () { send({ type: 'close' }); };
+			} else if (data.type === 'begin') {
+				startedAt = Date.now();
+				if (typeof data.total === 'number' && data.total) els.total.textContent = data.total;
+			}
+		});
+
+		els.closeBtn.onclick = function () {
+			// 运行中 = 停止；结束后 = 关闭
+			send({ type: 'close' });
+		};
+
+		send({ type: 'ready' });
+	})();
+</script>
+</body>
+</html>

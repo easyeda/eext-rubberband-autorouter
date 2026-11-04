@@ -3,6 +3,8 @@
  */
 import * as extensionConfig from '../extension.json';
 import { AutoRouterFacade } from './auto-router-facade';
+import { DialogBridge } from './ui/dialog-bridge';
+import { showError, showSuccess, showWarning } from './utils/toast';
 
 // eslint-disable-next-line @typescript-eslint/no-unused-vars
 export function activate(_status?: 'onStartupFinished', _arg?: string): void {}
@@ -22,18 +24,73 @@ export async function autoRoute(): Promise<void> {
 	await facade.openSettings();
 }
 
-/** 拉紧已有布线：对当前 PCB 已完成的布线做真拉紧 + 圆弧圆润（独立菜单命令） */
+/** 拉紧菜单：单例状态（进度窗 + 运行中的路由实例） */
+let tightenBridge: DialogBridge | null = null;
+let tightening = false;
+
+/**
+ * 拉紧已有布线：对当前 PCB 已完成的布线做真拉紧 + 圆弧圆润（独立菜单命令）。
+ * 打开一个紧凑进度弹窗（关键信息：进度/当前网/缩短数），运行中关闭弹窗
+ * 即停止拉紧（已写入部分保留）。
+ */
 export async function tightenExisting(): Promise<void> {
+	if (facade?.isBusy()) {
+		showWarning('布线正在进行中，请等待完成后再拉紧');
+		return;
+	}
+	if (tightening) {
+		// 重复点击：把进度窗带到前台
+		await tightenBridge?.focus('tighten');
+		return;
+	}
+	tightening = true;
+	const bridge = tightenBridge ?? new DialogBridge();
+	tightenBridge = bridge;
+
 	const { TopologicalRouter } = await import('./router/topological-router');
 	const router = new TopologicalRouter(
-		() => {},
-		(msg, level) => { console.log(`[Tighten][${level}] ${msg}`); if (level === 'error') eda.sys_Dialog.showErrorMessage(msg); },
-		() => {},
+		(p) => bridge.send('tighten', { type: 'progress', ...p }),
+		(msg, level) => {
+			console.log(`[Tighten][${level}] ${msg}`);
+			if (level === 'error') showError(msg);
+		},
+		() => { /* stats 不用 */ },
 	);
+
 	try {
+		await bridge.open('tighten', '/iframe/tighten.html', 380, 236, '橡皮筋布线器 · 拉紧已有布线', {
+			onReady: (send) => send({ type: 'begin', startedAt: Date.now() }),
+			onMessage: (msg) => {
+				if (msg.type === 'close') {
+					// 运行中关闭 = 停止（协同取消，已写入的网保留）
+					if (tightening) router.cancel();
+					void bridge.close('tighten');
+				}
+			},
+			onBeforeClose: () => {
+				router.cancel();
+				bridge.forget('tighten');
+			},
+		});
+
 		const res = await router.tightenExistingRouting();
-		eda.sys_Dialog.showInformationMessage(`拉紧完成：${res.changed}/${res.nets} 个网络有缩短`);
+		sendDone(bridge, res);
+		if (res.changed > 0) {
+			showSuccess(`拉紧完成：${res.changed}/${res.nets} 个网络有缩短`);
+		} else {
+			showWarning(`拉紧完成：${res.nets} 个网络已是紧凑形态，无需调整`);
+		}
 	} catch (err) {
-		eda.sys_Dialog.showErrorMessage('拉紧失败：' + (err instanceof Error ? err.message : String(err)));
+		const msg = err instanceof Error ? err.message : String(err);
+		bridge.send('tighten', { type: 'error', message: msg });
+		showError('拉紧失败：' + msg);
+	} finally {
+		tightening = false;
+		tightenRouter = null;
 	}
+}
+
+/** 把最终统计推给弹窗（弹窗转「关闭」态） */
+function sendDone(bridge: DialogBridge, res: { nets: number; changed: number }): void {
+	bridge.send('tighten', { type: 'done', total: res.nets, changed: res.changed });
 }

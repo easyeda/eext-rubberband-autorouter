@@ -6142,10 +6142,11 @@ export class PlanningEngine {
 		baseWorld?: RBObstacle[],
 		onLog?: (message: string, level: string) => void,
 		onNet?: (name: string, prims: RenderedPrim[], vias: PlannedVia[]) => void | Promise<void>,
+		isCancelled?: () => boolean,
 	): Promise<Array<{ name: string; prims: RenderedPrim[]; vias: PlannedVia[]; changed: boolean }>> {
 		this.drc = drc;
 		this.allPads = allPads;
-		this.callbacks = { onLog };
+		this.callbacks = { onLog, isCancelled };
 		this.planOptions = { connectivityFirst: true, optimize: false };
 		// 并排焊盘行信息：rowEscapeRoute（排内垂直出线预留）依赖。主线在
 		// 排序期顺带构建，后处理独立补建——否则 0.5mm 排里的重解边全部
@@ -6199,6 +6200,7 @@ export class PlanningEngine {
 		let adoptedN = 0, tautenN = 0;
 		const failHist = new Map<string, number>();
 		for (const e of order) {
+			if (this.checkCancelled()) break;
 			const before = renderedLength(e.prims);
 			let prims = e.prims;
 			let vias = e.vias;

@@ -17,7 +17,7 @@ import { DRCRules, fetchDRCRules, applyRouterOptionsToDRC } from './drc-rules';
 import {
 	PlanningEngine, PlanningInput, PlanningResult,
 	RenderedPrim, PlannedVia, PadShape, EnginePad,
-	mergePrims, isGroundNetName, isPowerNetName,
+	mergePrims, isGroundNetName, isPowerNetName, renderedLength,
 } from './planning-engine';
 import { createPlanningWorker } from './worker-source';
 import { parsePolygonPath } from './polygon-parse';
@@ -80,6 +80,8 @@ export class TopologicalRouter {
 	private onStats?: StatsCallback;
 
 	private isRouting = false;
+	/** 拉紧已有布线进行中（独立菜单，不占 isRouting） */
+	private tightening = false;
 	private shouldCancel = false;
 
 	/** 焊盘原始形状缓存（按位置键，含 pad 与 hole 与 rotation） */
@@ -239,7 +241,10 @@ export class TopologicalRouter {
 	 * 单独查看/使用橡皮筋优化效果（含另外两个引擎的产物）。
 	 */
 	public async tightenExistingRouting(): Promise<{ nets: number; changed: number }> {
-		this.onProgress?.({ stage: '拉紧已有布线', percentage: 5, message: '正在读取 DRC 规则与画布几何...' });
+		this.shouldCancel = false;
+		this.tightening = true;
+		try {
+		this.onProgress?.({ stage: '读取规则', percentage: 5, message: '正在读取 DRC 规则与画布几何...' });
 		const drcBase = await fetchDRCRules(this.onLog);
 		const drc = applyRouterOptionsToDRC(drcBase, normalizeRouterOptions({}));
 		await this.cachePadShapes();   // 焊盘形状：违规计数/过孔校验的精度前提
@@ -273,13 +278,15 @@ export class TopologicalRouter {
 		}
 		const entries = [...byNet.entries()].map(([name, e]) => ({ name, ...e })).filter(e => e.prims.length);
 		if (!entries.length) throw new Error('画布上没有可拉紧的走线');
-		this.onProgress?.({ stage: '拉紧已有布线', percentage: 30, message: `收集静态世界与 ${entries.length} 个网络的走线...` });
+		this.onProgress?.({ stage: '收集世界', percentage: 30, message: `收集静态世界与 ${entries.length} 个网络的走线...` });
 		const staticWorld = await this.collectStaticObstacles(drc);
-		this.onProgress?.({ stage: '拉紧已有布线', percentage: 50, message: '真拉紧（可视图逐段重解）+ 圆润处理中...' });
+		this.onProgress?.({ stage: '真拉紧', percentage: 45, message: `逐段重解与圆润（共 ${entries.length} 网）...`, total: entries.length, done: 0, changed: 0, adopted: 0 });
 		const eng = new PlanningEngine();
 		// 逐网实时上画布：每算完一个网立即替换该网几何（动态可见，不再
 		// 全算完才一次性重放——用户实测「画布没有动态渲染拉紧过程」）
+		const beforeLen = new Map(entries.map(e => [e.name, renderedLength(e.prims)]));
 		let done = 0;
+		let changedN = 0;
 		const optimized = await eng.postProcessImportedNets(
 			entries, drc, Array.from(padMap.values()).flat(), staticWorld,
 			(m, l) => this.onLog?.(m, l),
@@ -288,17 +295,30 @@ export class TopologicalRouter {
 				this.netPrimIds.delete(name);
 				if (prims.length) await this.writeNet(name, prims, vias, true);
 				done++;
+				if (renderedLength(prims) < (beforeLen.get(name) ?? 0) - 0.5) changedN++;
 				this.onProgress?.({
-					stage: '拉紧已有布线', percentage: 50 + Math.round((done / entries.length) * 45),
+					stage: '真拉紧', percentage: 45 + Math.round((done / entries.length) * 50),
 					message: `拉紧 ${done}/${entries.length}：${name}`,
+					done, total: entries.length, changed: changedN,
 				});
 			},
+			() => this.shouldCancel,
 		);
 		this.netPrimIds.clear();
 		const changed = optimized.filter(e => e.changed).length;
+		const cancelled = this.shouldCancel;
 		this.onLog?.(`拉紧完成：${optimized.length} 网（${changed} 网有缩短）`, 'success');
-		this.onProgress?.({ stage: '完成', percentage: 100, message: `拉紧完成：${changed}/${optimized.length} 网有缩短` });
+		this.onProgress?.({
+			stage: cancelled ? '已停止' : '完成', percentage: 100,
+			message: cancelled
+				? `拉紧已停止：已处理 ${optimized.length} 网（${changed} 网有缩短）`
+				: `拉紧完成：${changed}/${optimized.length} 网有缩短`,
+			done: optimized.length, total: entries.length, changed,
+		});
 		return { nets: optimized.length, changed };
+		} finally {
+			this.tightening = false;
+		}
 	}
 
 	private async collectPads(): Promise<{
@@ -1802,7 +1822,11 @@ export class TopologicalRouter {
 	}
 
 	cancel(): void {
-		if (!this.isRouting) return;
+		// 拉紧进行中（isRouting 为 false）：同样走协同取消，已写入部分保留
+		if (!this.isRouting) {
+			if (this.tightening) { this.shouldCancel = true; this.onLog?.('拉紧已停止', 'warn'); }
+			return;
+		}
 		this.shouldCancel = true;
 		// 停止语义（用户拍板）：点击停止 = 立刻杀掉 worker（几十 ms）、画布保留
 		// 已写入内容、此后不再有任何写入。旧实现依赖引擎在 checkCancelled
