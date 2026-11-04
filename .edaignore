@@ -28,3 +28,8 @@ debug.log
 AGENTS.md
 /case/
 /tmp/
+
+/dist/tsconfig.tsbuildinfo
+*.tsbuildinfo
+# EDA headless 会话掉在根目录的 SQLite 垃圾（32 位十六进制文件名，被进程锁定时删不掉，打包排除）
+/0819f05c4eef4c71ace90d822a990e87
