@@ -208,6 +208,9 @@ export class AutoRouterFacade {
 						if (msg.type === 'cancel') {
 							this.cancel();
 						} else if (msg.type === 'close') {
+							// 关闭窗口 = 同步停止布线（安全停止，已写入走线保留）；
+							// 否则布线会在无 UI 的后台继续跑（用户实测反馈）
+							if (this.busy) this.cancel();
 							this.progressVisible = false;
 							void this.bridge.close(PROGRESS_ID);
 						} else if (msg.type === 'rerun') {
