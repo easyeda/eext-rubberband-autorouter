@@ -6270,6 +6270,101 @@ export class PlanningEngine {
 	/** 段级重解计数（solveViaRuns 累计，诊断用）：近直线跳过/尝试/采纳/无解/修复 */
 	private runStats = { skipped: 0, tried: 0, adopted: 0, noPath: 0, repaired: 0 };
 
+	// ── 按段拉紧的公开接口（topological-router 逐段增量处理用） ──
+
+	/** 初始化拉紧世界（全画布静态铜 + 焊盘形状上下文） */
+	public initTightenWorld(
+		drc: DRCRules, allPads: EnginePad[], baseWorld: RBObstacle[],
+		padShapes?: Record<string, PadShape>,
+	): void {
+		this.drc = drc;
+		this.allPads = allPads;
+		this.padShapes = padShapes ?? {};
+		this.callbacks = {};
+		this.planOptions = { connectivityFirst: true, optimize: false };
+		this.padObstacleCache.clear();
+		this.padExtentCache.clear();
+		this.rowInfo.clear();
+		const byNetPads = new Map<string, EnginePad[]>();
+		for (const p of allPads) {
+			const arr = byNetPads.get(p.net);
+			if (arr) arr.push(p); else byNetPads.set(p.net, [p]);
+		}
+		this.prioritizeRowInteriorPads(
+			[...byNetPads.values()].map(ps => ({ net: { name: ps[0].net, pads: ps }, tier: 1 })));
+		this.dynamicObstacles = baseWorld.filter(o =>
+			!!o && Number.isFinite(o.x) && Number.isFinite(o.y) && Number.isFinite(o.r));
+	}
+
+	/** 把一段铜皮登记进世界，返回其障碍组（撤销用） */
+	public addRunToWorld(prims: RenderedPrim[]): string[] {
+		const before = new Set<RBObstacle>(this.dynamicObstacles);
+		this.addRenderedToObstacles(mergePrims(prims));
+		const added = this.dynamicObstacles.filter(o => !before.has(o));
+		return [...new Set(added.map(o => o.group ?? ''))].filter(g => !!g);
+	}
+
+	/** 登记过孔障碍 */
+	public addViaToWorld(v: PlannedVia): void {
+		this.dynamicObstacles.push(this.viaObstacleOf(v));
+	}
+
+	/** 撤销障碍组 */
+	public removeWorldGroups(groups: string[]): void {
+		if (!groups.length) return;
+		const set = new Set(groups);
+		this.dynamicObstacles = this.dynamicObstacles.filter(o => !set.has(o.group ?? ''));
+	}
+
+	/** 原走线按节点图切「连续导线段」（分支/过孔为边界） */
+	public splitRunsForTighten(
+		prims: RenderedPrim[], vias: PlannedVia[],
+	): Array<{ prims: RenderedPrim[]; a: { x: number; y: number }; b: { x: number; y: number }; layer: number }> {
+		const split = this.splitIntoRuns(prims, vias);
+		return split.segments.map(s => ({ prims: s.prims, a: s.a, b: s.b, layer: s.layer }));
+	}
+
+	/** 单段求解：tier-1 焊盘为墙，tier-2 无墙（由调用方做焊盘零违规门） */
+	public async solveRunSegment(
+		a: { x: number; y: number }, b: { x: number; y: number }, layer: number, netName: string,
+	): Promise<RenderedPrim[] | null> {
+		const obsAt = (ly: number) => this.dynamicObstacles.filter(o =>
+			!(o.net && o.net === netName) && (o.layer === undefined || o.layer === ly));
+		const run = async (obs: RBObstacle[]): Promise<RenderedPrim[] | null> => {
+			const r = await routeConnection(a, b, obs, netName, [150, 500], 3000, () => false);
+			if (!r.ok || !r.prims.length) return null;
+			return r.prims.map(p => ({ ...(p as RenderedPrim), net: netName, layer }));
+		};
+		const padWalls = this.padObstacles(this.allPads, netName).filter(o =>
+			o.layer === undefined || o.layer === layer);
+		const t1 = await run([...padWalls, ...obsAt(layer)]);
+		if (t1) return t1;
+		return await run(obsAt(layer));
+	}
+
+	/** 焊盘违规计数（公开包装） */
+	public padViolations(prims: RenderedPrim[], netName: string): number {
+		return this.countPadViolations(prims, netName);
+	}
+
+	/** 外网铜皮校验（公开包装） */
+	public async primsClearOfOthers(prims: RenderedPrim[], netName: string): Promise<boolean> {
+		const layers = new Set(prims.map(p => p.layer ?? 1));
+		for (const ly of layers) {
+			const pr = prims.filter(p => (p.layer ?? 1) === ly);
+			if (!pr.length) continue;
+			const obs = this.dynamicObstacles.filter(o =>
+				!(o.net && o.net === netName) && (o.layer === undefined || o.layer === ly));
+			if (!await validatePrimsAgainst(pr as unknown as RBPrimitive[], obs, netName)) return false;
+		}
+		return true;
+	}
+
+	/** 拐角圆弧圆润（公开包装） */
+	public smoothRun(prims: RenderedPrim[], netName: string): RenderedPrim[] {
+		return this.smoothCorners(mergePrims(prims), netName);
+	}
+
 	/**
 	 * 带过孔网的真拉紧（逐段重解）：原走线链按过孔断点切成同层段，
 	 * 过孔位置保持不动（不找新槽位——EDA 的过孔本就合法，且槽位搜索
