@@ -22,7 +22,7 @@ import {
 import { createPlanningWorker } from './worker-source';
 import { parsePolygonPath } from './polygon-parse';
 import {
-	RouterUiOptions, RouteStats, RouteSummary, BoardInspection,
+	RouterUiOptions, RouteStats, RouteSummary, BoardInspection, normalizeRouterOptions,
 } from '../types/router-params';
 import { RoutingProgress } from '../types';
 
@@ -188,6 +188,63 @@ export class TopologicalRouter {
 	}
 
 	// ── 0. 收集焊盘与静态障碍 ────────────────────
+
+	/**
+	 * 拉紧已有布线（独立菜单命令）：对当前 PCB 上所有已布网络做
+	 * 真拉紧（可视图逐边重解）+ 切线圆角圆润，然后回写画布。
+	 * 复用 J/H 引擎结果的形态优化管线——让用户无需完整布线即可
+	 * 单独查看/使用橡皮筋优化效果（含另外两个引擎的产物）。
+	 */
+	public async tightenExistingRouting(): Promise<{ nets: number; changed: number }> {
+		this.onProgress?.({ stage: '拉紧已有布线', percentage: 5, message: '正在读取 DRC 规则与画布几何...' });
+		const drcBase = await fetchDRCRules(this.onLog);
+		const drc = applyRouterOptionsToDRC(drcBase, normalizeRouterOptions({}));
+		const { padMap, allPads } = await this.collectPads();
+		if (!padMap.size) throw new Error('当前 PCB 没有网络');
+		const lines = (await eda.pcb_PrimitiveLine.getAll()) ?? [];
+		const arcs = (await eda.pcb_PrimitiveArc.getAll()) ?? [];
+		const vias = (await eda.pcb_PrimitiveVia.getAll()) ?? [];
+		const byNet = new Map<string, { prims: RenderedPrim[]; vias: PlannedVia[] }>();
+		for (const l of lines as any[]) {
+			const net = String(l.net ?? '');
+			if (!net || !padMap.has(net)) continue;
+			const e = byNet.get(net) ?? { prims: [], vias: [] };
+			e.prims.push({ kind: 'line', net, layer: l.layer ?? l.layerId ?? 1, x1: l.startX ?? l.x, y1: l.startY ?? l.y, x2: l.endX, y2: l.endY });
+			byNet.set(net, e);
+		}
+		for (const a of arcs as any[]) {
+			const net = String(a.net ?? '');
+			if (!net || !padMap.has(net)) continue;
+			const e = byNet.get(net) ?? { prims: [], vias: [] };
+			e.prims.push({ kind: 'arc', net, layer: a.layer ?? a.layerId ?? 1, cx: a.centerX ?? a.cx, cy: a.centerY ?? a.cy, r: a.radius ?? a.r, startAngle: a.startAngle, sweep: a.sweep });
+			byNet.set(net, e);
+		}
+		for (const v of vias as any[]) {
+			const net = String(v.net ?? '');
+			if (!net || !padMap.has(net)) continue;
+			const e = byNet.get(net) ?? { prims: [], vias: [] };
+			e.vias.push({ net, x: v.x, y: v.y, dia: v.viaDiameter ?? 24, hole: v.holeDiameter ?? 12 });
+			byNet.set(net, e);
+		}
+		const entries = [...byNet.entries()].map(([name, e]) => ({ name, ...e })).filter(e => e.prims.length);
+		if (!entries.length) throw new Error('画布上没有可拉紧的走线');
+		this.onProgress?.({ stage: '拉紧已有布线', percentage: 30, message: `收集静态世界与 ${entries.length} 个网络的走线...` });
+		const staticWorld = await this.collectStaticObstacles(drc);
+		this.onProgress?.({ stage: '拉紧已有布线', percentage: 50, message: '真拉紧（可视图逐边重解）+ 圆润处理中...' });
+		const eng = new PlanningEngine();
+		const optimized = await eng.postProcessImportedNets(entries, drc, Array.from(padMap.values()).flat(), staticWorld);
+		this.onProgress?.({ stage: '拉紧已有布线', percentage: 80, message: '回写画布...' });
+		await this.purgeManagedNets(new Set(entries.map(e => e.name)));
+		this.netPrimIds.clear();
+		for (const e of optimized) {
+			if (!e.prims.length) continue;
+			await this.writeNet(e.name, e.prims, e.vias, true);
+		}
+		const changed = optimized.filter(e => e.changed).length;
+		this.onLog?.(`拉紧完成：${optimized.length} 网（${changed} 网有缩短）`, 'success');
+		this.onProgress?.({ stage: '完成', percentage: 100, message: `拉紧完成：${changed}/${optimized.length} 网有缩短` });
+		return { nets: optimized.length, changed };
+	}
 
 	private async collectPads(): Promise<{
 		padMap: Map<string, EnginePad[]>;

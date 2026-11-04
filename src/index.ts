@@ -21,3 +21,19 @@ export async function autoRoute(): Promise<void> {
 	if (!facade) facade = new AutoRouterFacade();
 	await facade.openSettings();
 }
+
+/** 拉紧已有布线：对当前 PCB 已完成的布线做真拉紧 + 圆弧圆润（独立菜单命令） */
+export async function tightenExisting(): Promise<void> {
+	const { TopologicalRouter } = await import('./router/topological-router');
+	const router = new TopologicalRouter(
+		() => {},
+		(msg, level) => { console.log(`[Tighten][${level}] ${msg}`); if (level === 'error') eda.sys_Dialog.showErrorMessage(msg); },
+		() => {},
+	);
+	try {
+		const res = await router.tightenExistingRouting();
+		eda.sys_Dialog.showInformationMessage(`拉紧完成：${res.changed}/${res.nets} 个网络有缩短`);
+	} catch (err) {
+		eda.sys_Dialog.showErrorMessage('拉紧失败：' + (err instanceof Error ? err.message : String(err)));
+	}
+}
