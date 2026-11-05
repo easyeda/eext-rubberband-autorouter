@@ -432,6 +432,10 @@ export class TopologicalRouter {
 							pending.add(p);
 							void p.finally(() => pending.delete(p));
 						} else if (m.type === 'tightenDone') {
+							this.onLog?.(
+								`重解阶段：尝试 ${m.solveAttempts ?? 0} 段，采纳 ${m.solved ?? 0} 段，耗时 ${m.solveMs ?? 0}ms`,
+								'info',
+							);
 							// 等所有写入落盘再收尾，保证统计与画布一致
 							void Promise.all([...pending]).then(() => {
 								this.tightenWorker = null;
@@ -468,7 +472,8 @@ export class TopologicalRouter {
 					let newLen = oldLen;
 					// 1) 拉直 + 圆润（便宜，对所有段）：string-pulling 后把拐角换弧
 					const pulled = eng.tautenRun(r.prims, r.net);
-					const base = renderedLength(pulled) < oldLen - 0.1 ? pulled : r.prims;
+					const pulledLen = renderedLength(pulled);
+					const base = pulledLen < oldLen - 0.1 ? pulled : r.prims;
 					const sm = eng.smoothRun(base, r.net);
 					const candidate = renderedLength(sm) < renderedLength(base) - 0.1 ? sm : base;
 					const candLen = renderedLength(candidate);
@@ -481,10 +486,12 @@ export class TopologicalRouter {
 						eng.padViolations(candidate, r.net) <= origPad) {
 						next = candidate; newLen = candLen;
 					}
-					// 2) 拆线重布（A*）：仅「便宜拉直没跑动 + 明显绕路」的段；
-					//    primsClearOfOthers 已含焊盘，候选不会压焊盘 → 不产 DRC 错误。
+					// 2) 拆线重布（A*）：拉直没把拓扑改短的明显绕路段（不能用 !next：
+					//    第 1 阶段几乎每段都能加出圆角，会让 A* 永远不跑）。
 					const straight = Math.hypot(r.b.x - r.a.x, r.b.y - r.a.y);
-					if (!next && straight > 5 && oldLen - straight >= 25) {
+					const detour = oldLen - straight;
+					const stillDetoured = candLen > straight + Math.max(15, straight * 0.08);
+					if (detour >= 25 && straight > 5 && stillDetoured) {
 						const sc = await eng.solveRunSegment(r.a, r.b, r.layer, r.net);
 						if (sc) {
 							const sm2 = eng.smoothRun(sc, r.net);
@@ -493,7 +500,8 @@ export class TopologicalRouter {
 							const tp = eng.padViolations(tryCand, r.net);
 							const okShort = tl < oldLen - 0.5 && tp === 0;
 							const okRepair = tp === 0 && origPad > 0;
-							if ((okShort || okRepair) && await eng.primsClearOfOthers(tryCand, r.net)) {
+							const better = !next || tl < newLen - 2;
+							if (better && (okShort || okRepair) && await eng.primsClearOfOthers(tryCand, r.net)) {
 								next = tryCand; newLen = tl;
 							}
 						}

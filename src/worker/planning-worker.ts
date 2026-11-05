@@ -75,7 +75,11 @@ async function runTighten(msg: TightenMessage): Promise<void> {
 	for (const v of msg.vias) engine.addViaToWorld(v);
 
 	const total = runs.length;
-	let adopted = 0, saved = 0, rounded = 0;
+	let adopted = 0, saved = 0, rounded = 0, solved = 0;
+	/** A* 重解总预算：整板需 10 分钟内完成，重解只占其中一部分（其余是写画布/刷新） */
+	const SOLVE_BUDGET_MS = 180_000;
+	const SOLVE_MAX_ATTEMPTS = 600;
+	let solveSpent = 0, solveCount = 0;
 	for (const r of runs) {
 		if (cancelled) break;
 		const oldLen = renderedLength(r.prims);
@@ -91,7 +95,8 @@ async function runTighten(msg: TightenMessage): Promise<void> {
 		//    0.1~0.2mil，会被误拒（实测 70 个可圆的内点因此没动）。只要「圆弧
 		//    数增加」或「长度变短」且不变长，就采纳。
 		const pulled = engine.tautenRun(r.prims, r.net);
-		const base = renderedLength(pulled) < oldLen - 0.1 ? pulled : r.prims;
+		const pulledLen = renderedLength(pulled);
+		const base = pulledLen < oldLen - 0.1 ? pulled : r.prims;
 		const sm = engine.smoothRun(base, r.net);
 		const candidate = renderedLength(sm) < renderedLength(base) - 0.1 ? sm : base;
 		const candLen = renderedLength(candidate);
@@ -110,12 +115,22 @@ async function runTighten(msg: TightenMessage): Promise<void> {
 			kind = 'smooth';
 		}
 
-		// 2) 拆线重布（可视图 A*）：只对「便宜拉直没跑动 + 明显绕路」的段。
+		// 2) 拆线重布（可视图 A*）：只对「便宜拉直没把拓扑改短 + 明显绕路」的段。
+		//    ⚠ 触发条件不能用 `!next`：第 1 阶段几乎每段都能加出圆角（= next
+		//    非空），于是 A* 永远不跑，整板只剩「钝角处加个圆弧」而不改走线
+		//    （用户实测：一段明显绕行的走线只被圆了角）。也不能只看「拉直省了
+		//    多少」——实测 500mil 绕路拉直到 356.8mil（仍比直线 300mil 长 19%），
+		//    这时 A* 还能压到 300mil。要看「候选还比直线长多少」。
 		//    primsClearOfOthers 现已纳入焊盘，候选不会压焊盘 → 不产 DRC 错误。
-		//    数量少（被邻线/焊盘挡死的段），800ms×2 也在预算内。
 		const straight = Math.hypot(r.b.x - r.a.x, r.b.y - r.a.y);
-		if (!next && straight > 5 && oldLen - straight >= 25) {
+		const detour = oldLen - straight;
+		const stillDetoured = candLen > straight + Math.max(15, straight * 0.08);
+		if (detour >= 25 && straight > 5 && stillDetoured &&
+			solveCount < SOLVE_MAX_ATTEMPTS && solveSpent < SOLVE_BUDGET_MS) {
+			const tSolve = Date.now();
 			const sc = await engine.solveRunSegment(r.a, r.b, r.layer, r.net);
+			solveSpent += Date.now() - tSolve;
+			solveCount++;
 			if (sc) {
 				const sm2 = engine.smoothRun(sc, r.net);
 				const tryCand = sm2.length && renderedLength(sm2) <= renderedLength(sc) + 0.5 ? sm2 : sc;
@@ -123,7 +138,9 @@ async function runTighten(msg: TightenMessage): Promise<void> {
 				const tp = engine.padViolations(tryCand, r.net);
 				const okShort = tl < oldLen - 0.5 && tp === 0;
 				const okRepair = tp === 0 && origPad > 0;
-				if ((okShort || okRepair) && await engine.primsClearOfOthers(tryCand, r.net)) {
+				// 与第 1 阶段候选择优：重解至少要再短 2mil 才值得改写画布
+				const better = !next || tl < newLen - 2;
+				if (better && (okShort || okRepair) && await engine.primsClearOfOthers(tryCand, r.net)) {
 					next = tryCand;
 					newLen = tl;
 					kind = 'solve';
@@ -137,6 +154,7 @@ async function runTighten(msg: TightenMessage): Promise<void> {
 			adopted++;
 			saved += Math.max(0, oldLen - newLen);
 			if (kind === 'smooth') rounded++;
+			if (kind === 'solve') solved++;
 		}
 		ctx.postMessage({
 			type: 'tightenRun',
@@ -149,7 +167,10 @@ async function runTighten(msg: TightenMessage): Promise<void> {
 		});
 		if ((adopted & 7) === 0) await new Promise(res => setTimeout(res, 0));
 	}
-	ctx.postMessage({ type: 'tightenDone', total, adopted, saved, rounded });
+	ctx.postMessage({
+		type: 'tightenDone', total, adopted, saved, rounded, solved,
+		solveAttempts: solveCount, solveMs: Math.round(solveSpent),
+	});
 }
 
 ctx.onmessage = async (event: MessageEvent<IncomingMessage>) => {
