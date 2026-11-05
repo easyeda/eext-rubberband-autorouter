@@ -79,40 +79,55 @@ async function runTighten(msg: TightenMessage): Promise<void> {
 	for (const r of runs) {
 		if (cancelled) break;
 		const oldLen = renderedLength(r.prims);
-		const slack = oldLen - Math.hypot(r.b.x - r.a.x, r.b.y - r.a.y);
 		const origPad = engine.padViolations(r.prims, r.net);
 		let next: RenderedPrim[] | null = null;
 		let newLen = oldLen;
 		let kind: 'solve' | 'smooth' | null = null;
 
-		// 1) 真拉紧：可视图重解（焊盘墙优先），更短且零焊盘违规才采纳
-		if (slack >= 5) {
-			const cand = await engine.solveRunSegment(r.a, r.b, r.layer, r.net);
-			if (cand) {
-				const smoothed = engine.smoothRun(cand, r.net);
-				const tryCand = smoothed.length && renderedLength(smoothed) <= renderedLength(cand) + 0.5 ? smoothed : cand;
-				const candLen = renderedLength(tryCand);
-				const candPad = engine.padViolations(tryCand, r.net);
-				const okShort = candLen < oldLen - 0.5 && candPad === 0;
-				const okRepair = candPad === 0 && origPad > 0;
+		// 1) 拉直 + 圆润（纯几何、便宜，对所有段常开）
+		//    先 string-pulling：两两导线段之间求最短距离，隔点直连清晰就删中间
+		//    顶点，把 45° 楼梯拉成最紧折线；再把剩余拐角换成切线弧。
+		//    ⚠ 采纳闸门不能只卡「长度缩短≥0.3mil」：短腿 45° 角的小圆角只省
+		//    0.1~0.2mil，会被误拒（实测 70 个可圆的内点因此没动）。只要「圆弧
+		//    数增加」或「长度变短」且不变长，就采纳。
+		const pulled = engine.tautenRun(r.prims, r.net);
+		const base = renderedLength(pulled) < oldLen - 0.1 ? pulled : r.prims;
+		const sm = engine.smoothRun(base, r.net);
+		const candidate = renderedLength(sm) < renderedLength(base) - 0.1 ? sm : base;
+		const candLen = renderedLength(candidate);
+		const origArcN = r.prims.filter(p => p.kind === 'arc').length;
+		const candArcN = candidate.filter(p => p.kind === 'arc').length;
+		const improved = candArcN > origArcN || candLen < oldLen - 0.1;
+		// ⚠ 不要再对整条 run 做 primsClearOfOthers：run 里只要有一处贴着焊盘
+		//（原本 DRC 干净、未改动的段被 0.3mil 余量判越界），整条 run 被拒，
+		// 连同一 run 里开阔处的可圆角也跟着不圆（实测 40/61 个角周围有
+		// 16~80mil 空地却被挡）。圆角/拉直本身已逐弧 arcClear、逐线 segClear
+		// 过了净距，这里只做「焊盘违规不恶化」，足够安全。
+		if (improved && candLen <= oldLen + 0.5 &&
+			engine.padViolations(candidate, r.net) <= origPad) {
+			next = candidate;
+			newLen = candLen;
+			kind = 'smooth';
+		}
+
+		// 2) 拆线重布（可视图 A*）：只对「便宜拉直没跑动 + 明显绕路」的段。
+		//    primsClearOfOthers 现已纳入焊盘，候选不会压焊盘 → 不产 DRC 错误。
+		//    数量少（被邻线/焊盘挡死的段），800ms×2 也在预算内。
+		const straight = Math.hypot(r.b.x - r.a.x, r.b.y - r.a.y);
+		if (!next && straight > 5 && oldLen - straight >= 25) {
+			const sc = await engine.solveRunSegment(r.a, r.b, r.layer, r.net);
+			if (sc) {
+				const sm2 = engine.smoothRun(sc, r.net);
+				const tryCand = sm2.length && renderedLength(sm2) <= renderedLength(sc) + 0.5 ? sm2 : sc;
+				const tl = renderedLength(tryCand);
+				const tp = engine.padViolations(tryCand, r.net);
+				const okShort = tl < oldLen - 0.5 && tp === 0;
+				const okRepair = tp === 0 && origPad > 0;
 				if ((okShort || okRepair) && await engine.primsClearOfOthers(tryCand, r.net)) {
 					next = tryCand;
-					newLen = candLen;
+					newLen = tl;
 					kind = 'solve';
 				}
-			}
-		}
-		// 2) 退而求其次：只做拐角圆润（几何不动，只把尖角换成切线弧）
-		if (!next) {
-			const sm = engine.smoothRun(r.prims, r.net);
-			const smLen = renderedLength(sm);
-			if (sm.length && smLen < oldLen - 0.5 &&
-				engine.padViolations(sm, r.net) <= origPad &&
-				await engine.primsClearOfOthers(sm, r.net)) {
-				next = sm;
-				newLen = smLen;
-				kind = 'smooth';
-				rounded++;
 			}
 		}
 
@@ -121,6 +136,7 @@ async function runTighten(msg: TightenMessage): Promise<void> {
 			groupsById.set(r.id, engine.addRunToWorld(next));
 			adopted++;
 			saved += Math.max(0, oldLen - newLen);
+			if (kind === 'smooth') rounded++;
 		}
 		ctx.postMessage({
 			type: 'tightenRun',

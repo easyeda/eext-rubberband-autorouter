@@ -320,7 +320,7 @@ export class TopologicalRouter {
 			if (!entries.length) throw new Error('画布上没有可拉紧的走线');
 
 			this.onProgress?.({ stage: '收集世界', percentage: 25, message: `收集静态世界与 ${entries.length} 个网络的走线...` });
-			const staticWorld = await this.collectStaticObstacles(drc);
+			const staticWorld = await this.collectStaticObstacles(drc, true);
 
 			// ── 切成「连续导线段」（分支点/过孔为边界）──
 			const splitEngine = new PlanningEngine();
@@ -463,27 +463,39 @@ export class TopologicalRouter {
 				for (const r of sorted) {
 					if (this.shouldCancel) break;
 					const oldLen = r.oldLen;
+					const origPad = eng.padViolations(r.prims, r.net);
 					let next: RenderedPrim[] | null = null;
 					let newLen = oldLen;
-					if (oldLen - Math.hypot(r.b.x - r.a.x, r.b.y - r.a.y) >= 5) {
-						const cand = await eng.solveRunSegment(r.a, r.b, r.layer, r.net);
-						if (cand) {
-							const sm = eng.smoothRun(cand, r.net);
-							const tryCand = sm.length && renderedLength(sm) <= renderedLength(cand) + 0.5 ? sm : cand;
-							const candLen = renderedLength(tryCand);
-							if (candLen < oldLen - 0.5 && eng.padViolations(tryCand, r.net) === 0 &&
-								await eng.primsClearOfOthers(tryCand, r.net)) {
-								next = tryCand; newLen = candLen;
-							}
-						}
+					// 1) 拉直 + 圆润（便宜，对所有段）：string-pulling 后把拐角换弧
+					const pulled = eng.tautenRun(r.prims, r.net);
+					const base = renderedLength(pulled) < oldLen - 0.1 ? pulled : r.prims;
+					const sm = eng.smoothRun(base, r.net);
+					const candidate = renderedLength(sm) < renderedLength(base) - 0.1 ? sm : base;
+					const candLen = renderedLength(candidate);
+					const origArcN = r.prims.filter(p => p.kind === 'arc').length;
+					const candArcN = candidate.filter(p => p.kind === 'arc').length;
+					const improved = candArcN > origArcN || candLen < oldLen - 0.1;
+					// 不做整条 run 的 primsClearOfOthers（见 worker 同处注释）：
+					// 圆角/拉直已逐弧/逐线过了净距，只卡焊盘违规不恶化。
+					if (improved && candLen <= oldLen + 0.5 &&
+						eng.padViolations(candidate, r.net) <= origPad) {
+						next = candidate; newLen = candLen;
 					}
-					if (!next) {
-						const sm = eng.smoothRun(r.prims, r.net);
-						const smLen = renderedLength(sm);
-						if (sm.length && smLen < oldLen - 0.5 &&
-							eng.padViolations(sm, r.net) <= eng.padViolations(r.prims, r.net) &&
-							await eng.primsClearOfOthers(sm, r.net)) {
-							next = sm; newLen = smLen;
+					// 2) 拆线重布（A*）：仅「便宜拉直没跑动 + 明显绕路」的段；
+					//    primsClearOfOthers 已含焊盘，候选不会压焊盘 → 不产 DRC 错误。
+					const straight = Math.hypot(r.b.x - r.a.x, r.b.y - r.a.y);
+					if (!next && straight > 5 && oldLen - straight >= 25) {
+						const sc = await eng.solveRunSegment(r.a, r.b, r.layer, r.net);
+						if (sc) {
+							const sm2 = eng.smoothRun(sc, r.net);
+							const tryCand = sm2.length && renderedLength(sm2) <= renderedLength(sc) + 0.5 ? sm2 : sc;
+							const tl = renderedLength(tryCand);
+							const tp = eng.padViolations(tryCand, r.net);
+							const okShort = tl < oldLen - 0.5 && tp === 0;
+							const okRepair = tp === 0 && origPad > 0;
+							if ((okShort || okRepair) && await eng.primsClearOfOthers(tryCand, r.net)) {
+								next = tryCand; newLen = tl;
+							}
 						}
 					}
 					if (next) {
@@ -800,9 +812,14 @@ export class TopologicalRouter {
 	}
 
 	/** 收集静态铜层障碍（折线/线条/填充/板框），不含焊盘 */
-	private async collectStaticObstacles(drc: DRCRules): Promise<RBObstacle[]> {
+	private async collectStaticObstacles(drc: DRCRules, tighten = false): Promise<RBObstacle[]> {
 		const obstacles: RBObstacle[] = [];
 		const parsePath = parsePolygonPath;
+		// 拉紧口径：圆角弧严格内切于原折角，比原铜皮更远离外部障碍；用 trackToTrack
+		// 正确间距 + 极薄余量，避免布线口径的「trackToLine 下限 8 + 2mil 余量」把
+		// 本来 DRC 干净的圆角弧误判为越界（实测 262 尖角只圆出 4 个的根因）。
+		const lineClear = tighten ? drc.trackToTrackMil : Math.max(drc.trackToLineMil, 8);
+		const copperMargin = tighten ? 0.5 : 2;
 
 		// 折线（含无网络走线与板框）：拐点圆可绕行 + 沿线阻挡圆
 		const polylines = await eda.pcb_PrimitivePolyline.getAll();
@@ -822,8 +839,7 @@ export class TopologicalRouter {
 				continue;
 			}
 			if (layer !== 1 && layer !== 2 && layer !== 12) continue;
-			const lineClear = Math.max(drc.trackToLineMil, 8);
-			const r = lw / 2 + lineClear + drc.traceWidthMil / 2 + 2;
+			const r = lw / 2 + lineClear + drc.traceWidthMil / 2 + copperMargin;
 			const pts = parsePath(p.polygon?.polygon ?? p.polygon ?? []);
 			if (pts.length >= 2) {
 				obstacles.push(...buildPolylineObstacle(pts, r, net || undefined, layer, `poly:${pts[0]?.x},${pts[0]?.y}`));
@@ -850,8 +866,7 @@ export class TopologicalRouter {
 			}
 			if (layer !== 1 && layer !== 2 && layer !== 12) continue;
 			const lw = l.lineWidth ?? 10;
-			const lineClear = Math.max(drc.trackToLineMil, 8);
-			const r = lw / 2 + lineClear + drc.traceWidthMil / 2 + 2;
+			const r = lw / 2 + lineClear + drc.traceWidthMil / 2 + copperMargin;
 			obstacles.push(...buildPolylineObstacle(
 				[{ x: l.startX ?? 0, y: l.startY ?? 0 }, { x: l.endX ?? 0, y: l.endY ?? 0 }],
 				r, net || undefined, layer, `line:${l.primitiveId ?? ''}`,
@@ -887,8 +902,7 @@ export class TopologicalRouter {
 				const r = lw / 2 + drc.trackToBoardMil + drc.traceWidthMil / 2;
 				obstacles.push(...buildPolylineObstacle(pts, r, undefined, undefined, 'board', true));
 			} else if (layer === 1 || layer === 2 || layer === 12) {
-				const lineClear = Math.max(drc.trackToLineMil, 8);
-				const r = lw / 2 + lineClear + drc.traceWidthMil / 2 + 2;
+				const r = lw / 2 + lineClear + drc.traceWidthMil / 2 + copperMargin;
 				obstacles.push(...buildPolylineObstacle(pts, r, net || undefined, layer, `arc:${sx.toFixed(0)},${sy.toFixed(0)}`));
 			}
 		}

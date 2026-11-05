@@ -273,6 +273,46 @@ export function renderedLength(prims: RenderedPrim[]): number {
 	return total;
 }
 
+/** 反转图元方向（线交换端点；弧交换起终角并取反扫角） */
+function reversePrim(p: RenderedPrim): RenderedPrim {
+	if (p.kind === 'line') return { ...p, x1: p.x2, y1: p.y2, x2: p.x1, y2: p.y1 };
+	return { ...p, startAngle: (p.startAngle ?? 0) + (p.sweep ?? 0), sweep: -(p.sweep ?? 0) };
+}
+
+/**
+ * 把一段链图元按「起点→终点」定向为连续头尾相接。
+ * splitIntoRuns 的 walkOut 左侧返回「邻接→远端」序（与中段相接的排最前），
+ * 且 EDA 图元方向可能混向；smoothCorners 依赖 cur.x2≈nxt.x1 才能圆角，
+ * 故统一从起点沿连通性重排并逐根定向，否则圆角会被整段跳过。
+ */
+function orderRunChain(seq: RenderedPrim[], sx: number, sy: number): RenderedPrim[] {
+	const sOf = (p: RenderedPrim) => p.kind === 'line'
+		? { x: p.x1 ?? 0, y: p.y1 ?? 0 }
+		: { x: (p.cx ?? 0) + (p.r ?? 0) * Math.cos(p.startAngle ?? 0), y: (p.cy ?? 0) + (p.r ?? 0) * Math.sin(p.startAngle ?? 0) };
+	const eOf = (p: RenderedPrim) => p.kind === 'line'
+		? { x: p.x2 ?? 0, y: p.y2 ?? 0 }
+		: { x: (p.cx ?? 0) + (p.r ?? 0) * Math.cos((p.startAngle ?? 0) + (p.sweep ?? 0)), y: (p.cy ?? 0) + (p.r ?? 0) * Math.sin((p.startAngle ?? 0) + (p.sweep ?? 0)) };
+	const out: RenderedPrim[] = [];
+	const rest = new Set<number>(seq.map((_, i) => i));
+	let cx = sx, cy = sy;
+	while (rest.size) {
+		let pick = -1, fromStart = true;
+		for (const i of rest) {
+			const p = seq[i];
+			if (Math.hypot(sOf(p).x - cx, sOf(p).y - cy) < 0.8) { pick = i; fromStart = true; break; }
+			if (Math.hypot(eOf(p).x - cx, eOf(p).y - cy) < 0.8) { pick = i; fromStart = false; break; }
+		}
+		if (pick < 0) break;
+		rest.delete(pick);
+		const ori = fromStart ? seq[pick] : reversePrim(seq[pick]);
+		out.push(ori);
+		const e = eOf(ori);
+		cx = e.x; cy = e.y;
+	}
+	for (const i of rest) out.push(seq[i]);
+	return out;
+}
+
 /** 两段图元序列是否几何一致（容差 1e-6；只用于判断「圆角化是否真的改了几何」） */
 function primsSeqEqual(a: RenderedPrim[], b: RenderedPrim[]): boolean {
 	if (a.length !== b.length) return false;
@@ -306,6 +346,8 @@ export class PlanningEngine {
 	private padObstacleCache = new Map<string, RBObstacle[]>();
 	/** padHalfExtent 记忆化（按 allPads 下标；焊盘静态，整轮有效） */
 	private padExtentCache = new Map<number, number>();
+	/** 焊盘违规计数的空间网格（键 = 排除网络名；cell=256，避免每采样点扫全部焊盘） */
+	private padViolationGrid = new Map<string, Map<string, EnginePad[]>>();
 	/** 并排焊盘行信息（键 = 焊盘 id）：排向单位向量 + 中位间距 + 排内深度（0 端点 → 1 中心） */
 	private rowInfo = new Map<string, { dx: number; dy: number; gap: number; depth: number }>();
 	/** 全盘焊盘空间网格（加速过孔落点的近邻净距查询） */
@@ -410,6 +452,7 @@ export class PlanningEngine {
 			}
 		}
 		this.padObstacleCache.clear();
+		this.padViolationGrid.clear();
 		this.padExtentCache.clear();
 		this.rowInfo.clear();
 		this.callbacks = callbacks;
@@ -2722,10 +2765,35 @@ export class PlanningEngine {
 		const obsFor = (layer: number): RBObstacle[] => {
 			let o = obsCache.get(layer);
 			if (!o) {
-				o = this.layerObstacles(netName, layer, true);
+				// 焊盘从圆近似里剔除，改用精确形状距离（arcPadClear）：
+				// 圆比实际矩形角外扩约 6mil，会误杀 DRC 干净的圆角弧。
+				o = this.layerObstacles(netName, layer, true).filter(ob => !(ob.group?.startsWith('pad:')));
 				obsCache.set(layer, o);
 			}
 			return o;
+		};
+		// 焊盘精确净距：按真实形状（矩形/椭圆/旋转）算弧到铜皮的有符号距离，
+		// 不用外包圆（圆在矩形角部外扩，误杀）。needCu = 间距 + 半线宽。
+		const arcPadClear = (cx: number, cy: number, r: number, a0: number, sw: number, layer: number): boolean => {
+			const needCu = this.drc.trackToPadMil + this.drc.traceWidthMil / 2;
+			const near = this.allPads.filter(pd =>
+				pd.net !== netName &&
+				(pd.layer === 12 || pd.padType === 'th' || pd.layer === layer) &&
+				Math.hypot(pd.x - cx, pd.y - cy) < r + 150);
+			if (!near.length) return true;
+			const steps = Math.max(3, Math.ceil(Math.abs(sw) / (Math.PI / 12)));
+			for (let k = 0; k <= steps; k++) {
+				const a = a0 + (sw * k) / steps;
+				const px = cx + r * Math.cos(a), py = cy + r * Math.sin(a);
+				for (const pd of near) {
+					if (this.padCopperDistance(pd, px, py) < needCu) return false;
+					if (pd.layer === 12 || pd.padType === 'th') {
+						const holeD = Math.max(pd.holeDiameter, 0);
+						if (holeD > 0 && Math.hypot(pd.x - px, pd.y - py) < holeD / 2 + needCu) return false;
+					}
+				}
+			}
+			return true;
 		};
 		// 圆弧净距检查（只查圆角邻域内的障碍，包围盒快拒）
 		const arcClear = (cx: number, cy: number, r: number, a0: number, sw: number, layer: number): boolean => {
@@ -2738,7 +2806,7 @@ export class PlanningEngine {
 					if (o.soft) continue;
 					if (o.net && o.net === netName) continue;
 					if (o.layer !== undefined && o.layer !== layer) continue;
-					const rr = o.r + 0.3;
+					const rr = o.r;
 					if (Math.abs(o.x - px) > rr + 1 || Math.abs(o.y - py) > rr + 1) continue;
 					if (Math.hypot(o.x - px, o.y - py) < rr) return false;
 				}
@@ -2746,16 +2814,21 @@ export class PlanningEngine {
 			return true;
 		};
 		const out: RenderedPrim[] = [];
+		const seq = [...prims];   // 圆角会改写下一段头，先复制避免动到调用方数组
 		// 受保护转角：焊盘/过孔中心不圆角化。fanoutFillet 不知道焊盘存在，
 		// 圆角弧会把 pad 所在的角点从铜皮上切掉（弧与腿的切点间不再覆盖
 		// pad 中心）—— pad 悬空的又一来源（P02 的 B 焊盘嫌疑路径）。
 		const prot = new Set<string>();
 		const kOf = (x: number, y: number) => `${Math.round(x * 2)}|${Math.round(y * 2)}`;
 		for (const v of this.plannedVias) if (v.net === netName) prot.add(kOf(v.x, v.y));
-		for (const pd of this.allPads) if (pd.net === netName) prot.add(kOf(pd.x, pd.y));
-		for (let i = 0; i < prims.length; i++) {
-			const cur = prims[i];
-			const nxt = prims[i + 1];
+		// 焊盘不进 prot：大焊盘中心有被铜皮盖住的隐藏硬角（实测剩 7 个 59~81mil
+		// 焊盘中心）。改为圆角时按「切点仍在焊盘铜皮内」判定——小半径时切点落在
+		// 焊盘上，圆过焊盘不断连，还能消掉隐藏硬角。
+		const padAt = new Map<string, { radius: number; bodyRadius: number }>();
+		for (const pd of this.allPads) if (pd.net === netName) padAt.set(kOf(pd.x, pd.y), { radius: pd.radius ?? 0, bodyRadius: pd.bodyRadius ?? 0 });
+		for (let i = 0; i < seq.length; i++) {
+			const cur = seq[i];
+			const nxt = seq[i + 1];
 			if (!nxt || cur.kind !== 'line' || nxt.kind !== 'line' || cur.layer !== nxt.layer) {
 				out.push(cur);
 				continue;
@@ -2766,35 +2839,47 @@ export class PlanningEngine {
 				continue;
 			}
 			if (prot.has(kOf(cur.x2!, cur.y2!))) { out.push(cur); continue; }
-			const f = fanoutFillet(
-				{ x1: cur.x1!, y1: cur.y1!, x2: cur.x2!, y2: cur.y2! },
-				{ x1: nxt.x1!, y1: nxt.y1!, x2: nxt.x2!, y2: nxt.y2! },
-				rMax,
-			);
-			if (!f || f.prims.length < 3) {
+			// 圆角半径从 rMax 递减重试：贴焊盘/邻线时用更小的弧（凸出量按 R 线性
+			// 减小），不挪线也能塞进去——消除最后 0.36~0.4mil 差值的办法。
+			let picked: ReturnType<typeof fanoutFillet> = null;
+			const padHere = padAt.get(kOf(cur.x2!, cur.y2!));
+			for (const rr of [rMax, rMax * 0.7, rMax * 0.5, rMax * 0.35, rMax * 0.25, 8, 5, 3]) {
+				const ff = fanoutFillet(
+					{ x1: cur.x1!, y1: cur.y1!, x2: cur.x2!, y2: cur.y2! },
+					{ x1: nxt.x1!, y1: nxt.y1!, x2: nxt.x2!, y2: nxt.y2! },
+					rr,
+				);
+				if (!ff || ff.prims.length < 3) continue;
+				const aa = ff.prims[1];
+				if (aa.kind !== 'arc') continue;
+				const sw = Math.abs((aa.sweep ?? 0) * 180) / Math.PI;
+				// 小折角（<12°）不值得 / 大角度折返（>120°）和小半径（<3mil）不做
+				if (sw < 12 || sw > 120 || (aa.r ?? 0) < 3) continue;
+				// 焊盘中心角：切点(距角 t=R·tan(半角))必须仍落在焊盘铜皮内，否则断连
+				if (padHere) {
+					const t = (aa.r ?? 0) * Math.tan(Math.abs(aa.sweep ?? 0) / 2);
+					if (t > Math.min(padHere.radius, padHere.bodyRadius) - 1) continue;
+				}
+				if (!arcClear(aa.cx!, aa.cy!, aa.r!, aa.startAngle!, aa.sweep!, cur.layer)) continue;
+				if (!arcPadClear(aa.cx!, aa.cy!, aa.r!, aa.startAngle!, aa.sweep!, cur.layer)) continue;
+				picked = ff;
+				break;
+			}
+			if (!picked) {
 				out.push(cur);
 				continue;
 			}
+			const f = picked;
 			const arc = f.prims[1];
-			if (arc.kind !== 'arc') { out.push(cur); continue; }
-			// 小折角（<20°）不值得插圆弧：视觉无差别且多一个接缝
-			const swDeg = Math.abs((arc.sweep ?? 0) * 180) / Math.PI;
-			if (swDeg < 12) { out.push(cur); continue; }
-			// 大角度折返（>120°）和小半径（<3mil）不要圆角：180° 附近是
-			// 「到焊盘再折回」的必经形态，切线圆角会做出 r≈1mil 的小圆环
-			//（实测 GND 上 1418/1646 一带的 120°/r1 微小圆弧），比硬折角更难看。
-			if (swDeg > 120 || (arc.r ?? 0) < 3) { out.push(cur); continue; }
-			if (!arcClear(arc.cx!, arc.cy!, arc.r!, arc.startAngle!, arc.sweep!, cur.layer)) {
-				out.push(cur);
-				continue;
-			}
-			// 替换本段尾 + 下一段头：push 三段并跳过下一段
+			// 替换本段尾 + 下一段头：本段尾截断 + 弧入列，下一段头换成截断后的
+			// 剩余段，继续与再下一段圆角（链式）——否则长阶梯只圆角隔一个拐角，
+			// 实测 45° 楼梯会剩一半硬折角。
 			out.push(
 				{ ...f.prims[0], net: netName, layer: cur.layer } as RenderedPrim,
 				{ ...arc, net: netName, layer: cur.layer } as RenderedPrim,
-				{ ...f.prims[2], net: netName, layer: cur.layer } as RenderedPrim,
 			);
-			i++;   // 下一段已被圆弧替换
+			seq[i + 1] = { ...f.prims[2], net: netName, layer: cur.layer } as RenderedPrim;
+			// 下一轮 cur = 截断后的下一段（其尾仍是原接点），nxt = 再下一段
 		}
 		return out;
 	}
@@ -6283,6 +6368,7 @@ export class PlanningEngine {
 		this.callbacks = {};
 		this.planOptions = { connectivityFirst: true, optimize: false };
 		this.padObstacleCache.clear();
+		this.padViolationGrid.clear();
 		this.padExtentCache.clear();
 		this.rowInfo.clear();
 		const byNetPads = new Map<string, EnginePad[]>();
@@ -6331,7 +6417,7 @@ export class PlanningEngine {
 		const obsAt = (ly: number) => this.dynamicObstacles.filter(o =>
 			!(o.net && o.net === netName) && (o.layer === undefined || o.layer === ly));
 		const run = async (obs: RBObstacle[]): Promise<RenderedPrim[] | null> => {
-			const r = await routeConnection(a, b, obs, netName, [150, 500], 3000, () => false);
+			const r = await routeConnection(a, b, obs, netName, [60, 150], 300, () => false);
 			if (!r.ok || !r.prims.length) return null;
 			return r.prims.map(p => ({ ...(p as RenderedPrim), net: netName, layer }));
 		};
@@ -6350,11 +6436,17 @@ export class PlanningEngine {
 	/** 外网铜皮校验（公开包装） */
 	public async primsClearOfOthers(prims: RenderedPrim[], netName: string): Promise<boolean> {
 		const layers = new Set(prims.map(p => p.layer ?? 1));
+		// 焊盘也纳入——之前只查 dynamicObstacles（走线/过孔）不含焊盘，A\* 重解
+		// 候选压到焊盘会过闸、再产出真 DRC 错误（用户实测）。
+		const padObs = this.padObstacles(this.allPads, netName);
 		for (const ly of layers) {
 			const pr = prims.filter(p => (p.layer ?? 1) === ly);
 			if (!pr.length) continue;
-			const obs = this.dynamicObstacles.filter(o =>
-				!(o.net && o.net === netName) && (o.layer === undefined || o.layer === ly));
+			const obs = [
+				...this.dynamicObstacles.filter(o =>
+					!(o.net && o.net === netName) && (o.layer === undefined || o.layer === ly)),
+				...padObs.filter(o => o.layer === undefined || o.layer === ly),
+			];
 			if (!await validatePrimsAgainst(pr as unknown as RBPrimitive[], obs, netName)) return false;
 		}
 		return true;
@@ -6363,6 +6455,111 @@ export class PlanningEngine {
 	/** 拐角圆弧圆润（公开包装） */
 	public smoothRun(prims: RenderedPrim[], netName: string): RenderedPrim[] {
 		return this.smoothCorners(mergePrims(prims), netName);
+	}
+
+	/**
+	 * 段内橡皮筋拉紧（string-pulling）：同层连续直线链上，若「隔点直连」不侵入
+	 * 任何障碍，就删掉中间顶点——45° 楼梯、兜底小折弯被拉成最紧折线。只删顶点、
+	 * 不动端点与受保护顶点（焊盘/过孔/分支点），逐段净距复核，不产生 DRC 违规。
+	 * 这是「两两导线段之间求最短距离」的几何实现；与 tautenNet 同构，只是
+	 * 作用在任意一段 prims 上并返回结果（拉紧菜单逐段调用）。
+	 */
+	public tautenRun(prims: RenderedPrim[], netName: string): RenderedPrim[] {
+		if (prims.length < 3) return prims;
+		const obsCache = new Map<number, RBObstacle[]>();
+		const obsFor = (layer: number): RBObstacle[] => {
+			let o = obsCache.get(layer);
+			if (!o) {
+				o = this.layerObstacles(netName, layer, true);
+				obsCache.set(layer, o);
+			}
+			return o;
+		};
+		const segClear = (x1: number, y1: number, x2: number, y2: number, layer: number): boolean => {
+			const minx = Math.min(x1, x2), maxx = Math.max(x1, x2);
+			const miny = Math.min(y1, y2), maxy = Math.max(y1, y2);
+			for (const o of obsFor(layer)) {
+				if (o.soft) continue;
+				if (o.net && o.net === netName) continue;
+				if (o.layer !== undefined && o.layer !== layer) continue;
+				const rr = o.r + 0.2;
+				if (o.x + rr < minx || o.x - rr > maxx || o.y + rr < miny || o.y - rr > maxy) continue;
+				if (o.kind === 'circle') {
+					if (pointSegDist(o.x, o.y, x1, y1, x2, y2) < rr) return false;
+				} else {
+					const ox1 = o.x1 ?? o.x, oy1 = o.y1 ?? o.y;
+					const ox2 = o.x2 ?? ox1, oy2 = o.y2 ?? oy1;
+					const steps = Math.min(64, Math.max(1, Math.ceil(Math.hypot(ox2 - ox1, oy2 - oy1) / Math.max(0.9 * o.r, 0.5))));
+					for (let s = 0; s <= steps; s++) {
+						const t = s / steps;
+						if (pointSegDist(ox1 + (ox2 - ox1) * t, oy1 + (oy2 - oy1) * t, x1, y1, x2, y2) < rr) return false;
+					}
+				}
+			}
+			return true;
+		};
+		const merged = mergePrims(prims);
+		// 受保护顶点：焊盘中心 / 过孔中心 / 分支点（≥3 段共享端点）
+		const prot = new Set<string>();
+		const kOf = (x: number, y: number) => `${Math.round(x * 2)}|${Math.round(y * 2)}`;
+		for (const v of this.plannedVias) if (v.net === netName) prot.add(kOf(v.x, v.y));
+		for (const pd of this.allPads) if (pd.net === netName) prot.add(kOf(pd.x, pd.y));
+		const endCount = new Map<string, number>();
+		for (const p of merged) {
+			if (p.kind !== 'line') continue;
+			const a = kOf(p.x1!, p.y1!), b = kOf(p.x2!, p.y2!);
+			endCount.set(a, (endCount.get(a) ?? 0) + 1);
+			endCount.set(b, (endCount.get(b) ?? 0) + 1);
+		}
+		for (const [k, c] of endCount) if (c >= 3) prot.add(k);
+		const out: RenderedPrim[] = [];
+		let i = 0;
+		let changed = false;
+		while (i < merged.length) {
+			const cur = merged[i];
+			if (cur.kind !== 'line') { out.push(cur); i++; continue; }
+			const chain: RenderedPrim[] = [cur];
+			let j = i + 1;
+			while (j < merged.length) {
+				const nxt = merged[j];
+				if (nxt.kind !== 'line' || nxt.layer !== cur.layer) break;
+				const tail = chain[chain.length - 1];
+				if (Math.hypot((tail.x2 ?? 0) - (nxt.x1 ?? 0), (tail.y2 ?? 0) - (nxt.y1 ?? 0)) > 0.6) break;
+				chain.push(nxt);
+				j++;
+			}
+			if (chain.length >= 2) {
+				const pts: Array<{ x: number; y: number }> = [{ x: chain[0].x1!, y: chain[0].y1! }];
+				for (const c of chain) pts.push({ x: c.x2!, y: c.y2! });
+				for (let pass = 0; pass < 4; pass++) {
+					let removed = false;
+					for (let k = 1; k < pts.length - 1; k++) {
+						if (prot.has(kOf(pts[k].x, pts[k].y))) continue;
+						if (segClear(pts[k - 1].x, pts[k - 1].y, pts[k + 1].x, pts[k + 1].y, cur.layer)) {
+							pts.splice(k, 1);
+							removed = true;
+							changed = true;
+							k--;
+						}
+					}
+					if (!removed) break;
+				}
+				const dedup: Array<{ x: number; y: number }> = [pts[0]];
+				for (const q of pts) {
+					const l = dedup[dedup.length - 1];
+					if (Math.hypot(q.x - l.x, q.y - l.y) > 0.05) dedup.push(q);
+				}
+				for (let k = 1; k < dedup.length; k++) {
+					out.push({ kind: 'line', net: netName, layer: cur.layer, x1: dedup[k - 1].x, y1: dedup[k - 1].y, x2: dedup[k].x, y2: dedup[k].y });
+				}
+			} else {
+				out.push(cur);
+			}
+			i = j;
+		}
+		if (!changed) return prims;
+		if (renderedLength(out) >= renderedLength(merged) - 0.5) return prims;
+		return out;
 	}
 
 	/**
@@ -6536,16 +6733,43 @@ export class PlanningEngine {
 			const left = walkOut(i, pa);
 			const right = walkOut(i, pb);
 			const seq = [...left.prims, prims[i], ...right.prims];
-			if (left.end === right.end) { leftover.push(...seq); continue; }   // 独立环
+			if (left.end === right.end) {
+				// 独立环：也纳入拉紧（a≈b；worker 对 a≈b 跳过重解，只做拉直+圆润）。
+				// 之前整环丢进 leftover 原样保留——GND 这类带环的网 52/84 段没动。
+				const ln = eps[left.end];
+				const loopLayer = seq[0].layer ?? 1;
+				segments.push({ prims: orderRunChain(seq, ln.x, ln.y), a: { x: ln.x, y: ln.y }, b: { x: ln.x, y: ln.y }, layer: loopLayer });
+				continue;
+			}
 			const na = eps[left.end], nb = eps[right.end];
 			const layer = seq[0].layer;
-			if (seq.some(q => q.layer !== layer)) {
-				// 段内混层只可能经边界节点（过孔已切段）——防御性保留原样
-				leftover.push(...seq);
+			const ordered = orderRunChain(seq, na.x, na.y);
+			if (ordered.some(q => q.layer !== ordered[0].layer)) {
+				// 混层链（经 TH 焊盘换层、无 via 图元）：按层切段分别处理。
+				// 之前整条丢 leftover —— P10/NET_45/P1 这类 100% 不拉紧。
+				let curLayer = ordered[0].layer ?? 1;
+				let grp: RenderedPrim[] = [];
+				const flush = (): void => {
+					if (!grp.length) return;
+					const s = grp[0], e0 = grp[grp.length - 1];
+					const sPt = s.kind === 'line'
+						? { x: s.x1!, y: s.y1! }
+						: { x: s.cx! + s.r! * Math.cos(s.startAngle!), y: s.cy! + s.r! * Math.sin(s.startAngle!) };
+					const ePt = e0.kind === 'line'
+						? { x: e0.x2!, y: e0.y2! }
+						: { x: e0.cx! + e0.r! * Math.cos(e0.startAngle! + e0.sweep!), y: e0.cy! + e0.r! * Math.sin(e0.startAngle! + e0.sweep!) };
+					segments.push({ prims: grp, a: sPt, b: ePt, layer: curLayer });
+					grp = [];
+				};
+				for (const q of ordered) {
+					if ((q.layer ?? 1) !== curLayer) { flush(); curLayer = q.layer ?? 1; }
+					grp.push(q);
+				}
+				flush();
 				continue;
 			}
 			segments.push({
-				prims: seq,
+				prims: ordered,
 				a: { x: na.x, y: na.y },
 				b: { x: nb.x, y: nb.y },
 				layer: layer ?? 1,
@@ -6587,22 +6811,42 @@ export class PlanningEngine {
 			}
 		}
 		const halfW = this.drc.traceWidthMil / 2;
-		let bad = 0;
-		for (const s of samples) {
+		const needCu = this.drc.trackToPadMil + halfW;
+		// 焊盘空间网格：原实现每个采样点都要遍历全部焊盘做形状距离（264 个焊盘 ×
+		// 上千采样点，实测单次 ~100ms，整板 38s）。cell=256 + 3×3 邻域足够覆盖
+		// 最大焊盘（187mil）的角距影响（~142mil）。网格按排除网络名缓存。
+		const CELL = 256;
+		let grid = this.padViolationGrid.get(netName);
+		if (!grid) {
+			grid = new Map<string, EnginePad[]>();
 			for (const pd of this.allPads) {
 				if (pd.net === netName) continue;
-				const conductive = pd.layer === 12 || pd.padType === 'th' || pd.layer === s.layer;
-				if (!conductive) continue;
-				const d = this.padCopperDistance(pd, s.x, s.y);
-				const needCu = this.drc.trackToPadMil + halfW;
-				let hit = d < needCu;
-				if (!hit && (pd.layer === 12 || pd.padType === 'th')) {
-					// 钻孔禁入（Hole to Track）：孔缘 + 间距 + 半线宽
-					const holeD = Math.max(pd.holeDiameter, 0);
-					if (holeD > 0 && Math.hypot(pd.x - s.x, pd.y - s.y) < holeD / 2 + this.drc.trackToPadMil + halfW) hit = true;
-				}
-				if (hit) { bad++; break; }
+				const k = `${Math.floor(pd.x / CELL)}|${Math.floor(pd.y / CELL)}`;
+				const arr = grid.get(k);
+				if (arr) arr.push(pd); else grid.set(k, [pd]);
 			}
+			this.padViolationGrid.set(netName, grid);
+		}
+		let bad = 0;
+		for (const s of samples) {
+			const gx = Math.floor(s.x / CELL), gy = Math.floor(s.y / CELL);
+			let hit = false;
+			for (let dx = -1; dx <= 1 && !hit; dx++) {
+				for (let dy = -1; dy <= 1 && !hit; dy++) {
+					const arr = grid.get(`${gx + dx}|${gy + dy}`);
+					if (!arr) continue;
+					for (const pd of arr) {
+						const conductive = pd.layer === 12 || pd.padType === 'th' || pd.layer === s.layer;
+						if (!conductive) continue;
+						if (this.padCopperDistance(pd, s.x, s.y) < needCu) { hit = true; break; }
+						if (pd.layer === 12 || pd.padType === 'th') {
+							const holeD = Math.max(pd.holeDiameter, 0);
+							if (holeD > 0 && Math.hypot(pd.x - s.x, pd.y - s.y) < holeD / 2 + needCu) { hit = true; break; }
+						}
+					}
+				}
+			}
+			if (hit) bad++;
 		}
 		return bad;
 	}
