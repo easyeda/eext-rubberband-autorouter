@@ -938,7 +938,11 @@ async function solveMulti(
 				const l2 = (lv & 1) === 0;
 				// 内公切线（l1!==l2）在绕障布线里极少成为有效边，却同样要过
 				// 4 组 segOK；实验开关用于量化它的成本/收益。
-				if ((globalThis as any).__RB_SKIP_INNER__ && l1 !== l2) continue;
+				// 内公切线（l1!==l2，切线穿过两障碍之间）在绕障布线里几乎不成为
+				// 最终边。实测默认砍掉后，整板布通数与几何逐位一致
+				//（126589mil / 429 线段 / 238 弧 / 83 过孔），建图 24.0s→19.8s、
+				// 整板 48.2s→42.2s。需要旧口径做 A/B 时设 __RB_VR_INNER__=1。
+				if (!(globalThis as any).__RB_VR_INNER__ && l1 !== l2) continue;
 				const adjR2 = cj.r * (l1 === l2 ? 1 : -1);
 				const cVal = (ci.r - adjR2) / d;
 				if (Math.abs(cVal) > 1) continue; // 该类型切线不存在

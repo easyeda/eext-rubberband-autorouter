@@ -144,10 +144,38 @@ class MinHeap {
 }
 
 /**
+ * 网格求解统计（离线基准 / 现场日志共用）：
+ * calls=调用次数，ok=成功，ms=总耗时，cells=累计格数（nx·ny·层），
+ * maxCellsSeen=单次最大格数，capped=因越过 maxCells 被迫放大 cell 的次数。
+ */
+export const gridStats = {
+	calls: 0, ok: 0, ms: 0, cells: 0, maxCellsSeen: 0, capped: 0,
+	rasterMs: 0, astarMs: 0,
+	byCell: {} as Record<number, number>,
+};
+export function gridStatsReset(): void {
+	gridStats.calls = 0; gridStats.ok = 0; gridStats.ms = 0; gridStats.cells = 0;
+	gridStats.maxCellsSeen = 0; gridStats.capped = 0; gridStats.rasterMs = 0; gridStats.astarMs = 0;
+	gridStats.byCell = {};
+}
+
+/**
  * 在给定层集合上求解 src→dst 的网格最短路。
  * 失败返回 { ok: false }（调用方回退到其它策略）。
  */
 export async function gridRoute(req: GridRouteRequest): Promise<GridRouteResult> {
+	const __t0 = Date.now();
+	try {
+		const res = await gridRouteInner(req);
+		gridStats.calls++;
+		if (res.ok) gridStats.ok++;
+		return res;
+	} finally {
+		gridStats.ms += Date.now() - __t0;
+	}
+}
+
+async function gridRouteInner(req: GridRouteRequest): Promise<GridRouteResult> {
 	const fail: GridRouteResult = { ok: false, prims: [], vias: [], cell: req.cell ?? 8 };
 	if (!req.layers.length) return fail;
 	const { src, dst } = req;
@@ -165,11 +193,13 @@ export async function gridRoute(req: GridRouteRequest): Promise<GridRouteResult>
 	const maxCells = req.maxCells ?? 1_200_000;
 	// 单元尺寸自适应：保证每层网格 ≤ maxCells
 	let cell = Math.max(4, req.cell ?? 8);
+	let grew = false;
 	for (;;) {
 		const nx = Math.ceil((x1 - x0) / cell) + 1;
 		const ny = Math.ceil((y1 - y0) / cell) + 1;
 		if (nx * ny <= maxCells) break;
 		cell *= 1.35;
+		grew = true;
 		if (cell > 60) return fail;
 	}
 	const nx = Math.ceil((x1 - x0) / cell) + 1;
@@ -177,12 +207,17 @@ export async function gridRoute(req: GridRouteRequest): Promise<GridRouteResult>
 	const nLayers = req.layers.length;
 	const stride = nx * ny;
 	const total = stride * nLayers;
+	gridStats.cells += total;
+	if (total > gridStats.maxCellsSeen) gridStats.maxCellsSeen = total;
+	gridStats.byCell[cell] = (gridStats.byCell[cell] ?? 0) + 1;
+	if (grew) gridStats.capped++;
 	const deadline = Date.now() + (req.budgetMs ?? 4000);
 	const cancelled = (): boolean => {
 		try { return req.isCancelled?.() === true; } catch { return false; }
 	};
 
 	// ── 光栅化 ──
+	const __tRaster = Date.now();
 	// 半单元外扩：保证相邻自由格中心之间的线段不切进障碍圆
 	const inflate = cell * 0.5;
 	const blocked = new Uint8Array(total);
@@ -412,6 +447,8 @@ export async function gridRoute(req: GridRouteRequest): Promise<GridRouteResult>
 		j: Math.max(0, Math.min(ny - 1, Math.round((p.y - y0) / cell))),
 	});
 	const s = toCell(src), d = toCell(dst);
+	gridStats.rasterMs += Date.now() - __tRaster;
+	const __tAstar = Date.now();
 
 	// ── A* ──
 	const gScore = new Float64Array(total).fill(Infinity);
@@ -781,6 +818,7 @@ export async function gridRoute(req: GridRouteRequest): Promise<GridRouteResult>
 		}
 		crossed = [...cs];
 	}
+	gridStats.astarMs += Date.now() - __tAstar;
 	return { ok: prims.length > 0, prims, vias, cell, crossed };
 }
 
