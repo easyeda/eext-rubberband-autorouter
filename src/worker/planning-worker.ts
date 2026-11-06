@@ -71,7 +71,11 @@ async function runTighten(msg: TightenMessage): Promise<void> {
 		return sq - sp;
 	});
 	const groupsById = new Map<number, string[]>();
-	for (const r of runs) groupsById.set(r.id, engine.addRunToWorld(r.prims));
+	const currentById = new Map<number, RenderedPrim[]>();
+	for (const r of runs) {
+		groupsById.set(r.id, engine.addRunToWorld(r.prims));
+		currentById.set(r.id, r.prims);
+	}
 	for (const v of msg.vias) engine.addViaToWorld(v);
 
 	const total = runs.length;
@@ -151,6 +155,7 @@ async function runTighten(msg: TightenMessage): Promise<void> {
 		if (next) {
 			engine.removeWorldGroups(groupsById.get(r.id) ?? []);
 			groupsById.set(r.id, engine.addRunToWorld(next));
+			currentById.set(r.id, next);
 			adopted++;
 			saved += Math.max(0, oldLen - newLen);
 			if (kind === 'smooth') rounded++;
@@ -167,8 +172,40 @@ async function runTighten(msg: TightenMessage): Promise<void> {
 		});
 		if ((adopted & 7) === 0) await new Promise(res => setTimeout(res, 0));
 	}
+	// ── 整网拆线重布（MST 焊盘对）──
+	// 逐段拉直只能删「段内」顶点：网里一旦有 T 型分支，绕路就横跨多个 run，
+	// 单段求解永远够不到（用户实测：两焊盘网被布成大兜圈，拉紧后只在钝角
+	// 处加了圆弧）。这里按「两两最近焊盘」整网重布，明显更短才采纳。
+	let rewritten = 0;
+	const viasByNet = new Set(msg.vias.map(v => v.net));
+	const byNet = new Map<string, TightenRunInput[]>();
+	for (const r of runs) {
+		const arr = byNet.get(r.net);
+		if (arr) arr.push(r); else byNet.set(r.net, [r]);
+	}
+	for (const [net, rs] of byNet) {
+		if (cancelled) break;
+		if (viasByNet.has(net)) continue;                 // 跨层网交给逐段处理
+		const layer = rs[0].layer;
+		if (rs.some(q => q.layer !== layer)) continue;
+		const oldLen = rs.reduce((s, q) => s + renderedLength(currentById.get(q.id) ?? q.prims), 0);
+		if (oldLen <= 0) continue;
+		const cand = await engine.rerouteNetMST(net, layer);
+		if (!cand) continue;
+		const newLen = renderedLength(cand);
+		// 至少短 8% 且 ≥10mil 才整网改写（避免来回翻腾）
+		if (newLen > oldLen - Math.max(10, oldLen * 0.08)) continue;
+		if (engine.padViolations(cand, net) > 0) continue;
+		if (!await engine.primsClearOfOthers(cand, net)) continue;
+		for (const q of rs) engine.removeWorldGroups(groupsById.get(q.id) ?? []);
+		engine.addRunToWorld(cand);
+		rewritten++;
+		saved += oldLen - newLen;
+		ctx.postMessage({ type: 'netRewrite', net, prims: cand, oldLen, newLen });
+	}
+
 	ctx.postMessage({
-		type: 'tightenDone', total, adopted, saved, rounded, solved,
+		type: 'tightenDone', total, adopted, saved, rounded, solved, rewritten,
 		solveAttempts: solveCount, solveMs: Math.round(solveSpent),
 	});
 }

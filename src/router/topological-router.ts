@@ -431,9 +431,26 @@ export class TopologicalRouter {
 							const p = onRun(m).catch(() => { /* 单段失败不影响继续 */ }).then(() => breathe());
 							pending.add(p);
 							void p.finally(() => pending.delete(p));
+						} else if (m.type === 'netRewrite') {
+							// 整网拆线重布：等该网逐段写入落盘后，删掉全部旧段、写入新链路
+							const p = Promise.all([...pending]).then(async () => {
+								const rs = runs.filter(r => r.net === m.net);
+								if (!rs.length || !m.prims?.length) return;
+								for (const r of rs) await deleteRun(r);
+								await writeRun(rs[0], m.prims);
+								adopted++;
+								savedMil += Math.max(0, (m.oldLen ?? 0) - (m.newLen ?? 0));
+								this.onProgress?.({
+									stage: '逐段拉紧', percentage: 30 + Math.round((done / total) * 65),
+									message: `整网重布 ${m.net}：${Number(m.oldLen ?? 0).toFixed(0)} → ${Number(m.newLen ?? 0).toFixed(0)}mil`,
+									done, total, changed: adopted, savedMil,
+								});
+							}).catch(() => { /* 单网失败不影响继续 */ }).then(() => breathe());
+							pending.add(p);
+							void p.finally(() => pending.delete(p));
 						} else if (m.type === 'tightenDone') {
 							this.onLog?.(
-								`重解阶段：尝试 ${m.solveAttempts ?? 0} 段，采纳 ${m.solved ?? 0} 段，耗时 ${m.solveMs ?? 0}ms`,
+								`重解阶段：尝试 ${m.solveAttempts ?? 0} 段，采纳 ${m.solved ?? 0} 段，整网重布 ${m.rewritten ?? 0} 网，耗时 ${m.solveMs ?? 0}ms`,
 								'info',
 							);
 							// 等所有写入落盘再收尾，保证统计与画布一致
@@ -460,7 +477,11 @@ export class TopologicalRouter {
 				const eng = new PlanningEngine();
 				eng.initTightenWorld(drc, allPads, staticWorld, Object.fromEntries(this.padShapeCache));
 				const groupsById = new Map<number, string[]>();
-				for (const r of runs) groupsById.set(r.id, eng.addRunToWorld(r.prims));
+				const currentById = new Map<number, RenderedPrim[]>();
+				for (const r of runs) {
+					groupsById.set(r.id, eng.addRunToWorld(r.prims));
+					currentById.set(r.id, r.prims);
+				}
 				for (const e of entries) for (const v of e.vias) eng.addViaToWorld(v);
 				const sorted = [...runs].sort((p, q) =>
 					(q.oldLen - Math.hypot(q.b.x - q.a.x, q.b.y - q.a.y)) - (p.oldLen - Math.hypot(p.b.x - p.a.x, p.b.y - p.a.y)));
@@ -509,8 +530,45 @@ export class TopologicalRouter {
 					if (next) {
 						eng.removeWorldGroups(groupsById.get(r.id) ?? []);
 						groupsById.set(r.id, eng.addRunToWorld(next));
+						currentById.set(r.id, next);
 					}
 					await onRun({ id: r.id, prims: next, oldLen, newLen });
+					await breathe();
+				}
+
+				// ── 整网拆线重布（MST 焊盘对）：解释见 worker 同处 ──
+				const viasByNet = new Set(entries.flatMap(e => e.vias).map(v => v.net));
+				const byNetRuns = new Map<string, RunUnit[]>();
+				for (const r of runs) {
+					const arr = byNetRuns.get(r.net);
+					if (arr) arr.push(r); else byNetRuns.set(r.net, [r]);
+				}
+				for (const [net, rs] of byNetRuns) {
+					if (this.shouldCancel) break;
+					if (viasByNet.has(net)) continue;
+					const layer = rs[0].layer;
+					if (rs.some(q => q.layer !== layer)) continue;
+					const oldLen = rs.reduce((s, q) => s + renderedLength(currentById.get(q.id) ?? q.prims), 0);
+					if (oldLen <= 0) continue;
+					const cand = await eng.rerouteNetMST(net, layer);
+					if (!cand) continue;
+					const newLen = renderedLength(cand);
+					if (newLen > oldLen - Math.max(10, oldLen * 0.08)) continue;
+					if (eng.padViolations(cand, net) > 0) continue;
+					if (!await eng.primsClearOfOthers(cand, net)) continue;
+					for (const q of rs) {
+						eng.removeWorldGroups(groupsById.get(q.id) ?? []);
+						await deleteRun(q);
+					}
+					eng.addRunToWorld(cand);
+					await writeRun(rs[0], cand);
+					adopted++;
+					savedMil += oldLen - newLen;
+					this.onProgress?.({
+						stage: '逐段拉紧', percentage: 30 + Math.round((done / total) * 65),
+						message: `整网重布 ${net}：${oldLen.toFixed(0)} → ${newLen.toFixed(0)}mil`,
+						done, total, changed: adopted, savedMil,
+					});
 					await breathe();
 				}
 			}
@@ -1493,10 +1551,16 @@ export class TopologicalRouter {
 					'warn',
 				);
 			}
+			// 终态百分比 = 布通网络数 / 总网络数（有失败网时不再显示 100%）
+			const doneNets = result.routedNets?.length ?? 0;
+			const allNets = Math.max(1, this.totalNets || doneNets + (result.failed?.length ?? 0));
+			const donePct = Math.min(100, Math.floor((doneNets / allNets) * 100));
 			this.onProgress?.({
 				stage: this.shouldCancel ? '已停止' : '完成',
-				percentage: 100,
-				message: this.shouldCancel ? '布线已停止' : '布线完成',
+				percentage: this.shouldCancel ? Math.min(99, donePct) : donePct,
+				message: this.shouldCancel
+					? `布线已停止：${doneNets}/${allNets} 网布通`
+					: `布线完成：${doneNets}/${allNets} 网布通`,
 			});
 
 			return {

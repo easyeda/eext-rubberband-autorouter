@@ -357,6 +357,13 @@ export class PlanningEngine {
 	private netRendered = new Map<string, RenderedPrim[]>();
 	/** 每个网络已完成的 MST 连接（键 = 两个焊盘 id），用于部分连通后继续重试 */
 	private routedEdges = new Map<string, Set<string>>();
+	/**
+	 * 单边求解结果缓存（只存无过孔的方案）：撕毁重布轮会把同一对焊盘反复
+	 * 重解（网格 10~300ms + 可视图 ~100ms/次）。命中后先按当前世界复验净距，
+	 * 仍合法就直接复用，省掉整次求解。
+	 */
+	private edgeSoloCache = new Map<string, RenderedPrim[]>();
+	private edgeCacheStats = { hit: 0, stale: 0 };
 	/** 已布网络顺序 */
 	private routedOrder: string[] = [];
 	/** 规划的过孔 */
@@ -471,6 +478,8 @@ export class PlanningEngine {
 		this.planDeadline = Number.POSITIVE_INFINITY;
 		this.netRendered.clear();
 		this.routedEdges.clear();
+		this.edgeSoloCache.clear();
+		this.edgeCacheStats = { hit: 0, stale: 0 };
 		this.routedOrder = [];
 		this.plannedVias = [];
 		this.logs = [];
@@ -592,8 +601,10 @@ export class PlanningEngine {
 				break;
 			}
 			const net = networks[ni];
-			const pct = 20 + Math.floor((ni / networks.length) * 55);
-			this.progress(pct, `布线网络 ${ni + 1}/${networks.length}: ${net.name}`);
+			this.progress(
+				this.routedPct(networks),
+				`布线网络 ${ni + 1}/${networks.length}: ${net.name}（已布通 ${this.routedOrder.length}/${networks.length}）`,
+			);
 			// 第一遍·线段级快扫：先把「一布就通」的边全部收割（不追求单网
 			// 完整再下一网）；有剩余边的网进入撕毁重布/兜底轮做全链收尾
 			const ok = await this.routeNetEdges(net, 'quick');
@@ -907,6 +918,7 @@ export class PlanningEngine {
 			const routedAfter = this.routedOrder.length;
 			const partialAfter = pendingNets.filter(n => (this.netRendered.get(n.name) ?? []).length > 0).length;
 			this.log(`第 ${pass + 1} 轮结束：布通 ${routedBefore} → ${routedAfter}，部分走线网 ${partialBefore} → ${partialAfter}（${Math.round((Date.now() - roundStart) / 1000)}s）`, 'info');
+			this.progress(this.routedPct(networks), `撕毁重布第 ${pass + 1} 轮：已布通 ${routedAfter}/${networks.length}`);
 			if (routedAfter === routedBefore && partialAfter <= partialBefore) {
 				this.log('本轮无任何进展，提前结束撕毁重布（剩余网转交成组重布/过孔兜底）', 'warn');
 				break;
@@ -1227,6 +1239,10 @@ export class PlanningEngine {
 		// 校验），最后统一复验并拆除违规过孔（详见 repairViaClearance 注释）。
 		// final=true：此时已没有重布阶段，拆除后不连通也保留剩余部分走线。
 		this.repairViaClearance(true);
+
+		if (this.edgeCacheStats.hit || this.edgeCacheStats.stale) {
+			this.log(`单边复用缓存：命中 ${this.edgeCacheStats.hit} 次，失效 ${this.edgeCacheStats.stale} 次`, 'info');
+		}
 
 		// 收尾剪枝：删掉不接任何焊盘的悬空碎片（部分布通留下的孤岛）
 		this.pruneDanglingFragments();
@@ -1644,6 +1660,16 @@ export class PlanningEngine {
 
 	private progress(percentage: number, message: string): void {
 		this.callbacks.onProgress?.(percentage, message);
+	}
+
+	/**
+	 * 进度百分比口径：**已整网布通的网络数 / 总网络数**。
+	 * 旧实现按「处理到第几个网」算（20 + index/total×55），处理完快扫后
+	 * 无论布通多少都显示到 75%，用户看到画布上大量飞线却显示 88%。
+	 */
+	private routedPct(networks: Array<{ name: string }>): number {
+		const total = Math.max(1, networks.length);
+		return Math.min(99, Math.floor((this.routedOrder.length / total) * 100));
 	}
 
 	private isGroundNet(name: string): boolean {
@@ -2198,6 +2224,21 @@ export class PlanningEngine {
 			let rendered: RenderedPrim[] | null = null;
 			const edgeVias: PlannedVia[] = [];
 
+			// 单边结果缓存（只缓存无过孔方案）：撕毁重布轮会把同一对焊盘
+			// 反复重解。命中后先按「当前世界」复验净距，仍合法就直接复用。
+			const cacheKey = `${net.name}|${src.id}|${dst.id}|${routingLayer}`;
+			if (!crossLayerSmd) {
+				const hit = this.edgeSoloCache.get(cacheKey);
+				if (hit) {
+					if (this.countPadViolations(hit, net.name) === 0 && this.primsClearOfDynamic(hit, net.name)) {
+						rendered = hit.map(p => ({ ...p }));
+						this.edgeCacheStats.hit++;
+					} else {
+						this.edgeCacheStats.stale++;
+					}
+				}
+			}
+			if (!rendered) {
 			if (mode === 'quick') {
 				// 快扫只求直连；跨层 SMD 对必须过孔换层（无单层路径），留给收尾轮
 				if (crossLayerSmd && !this.allowViaInPad) continue;
@@ -2340,6 +2381,7 @@ export class PlanningEngine {
 				}
 				}
 			}
+			}
 
 			// 网格兜底：可视图失败后接管。重试次数不限 —— 实测收益正来自
 			// 「每轮盘面变化后再试」（限 3 次时基准板 9/14→7/14）；总代价由
@@ -2363,6 +2405,11 @@ export class PlanningEngine {
 			if (!this.primsClearOfDynamic(rendered, net.name)) {
 				this.log(`网络 ${net.name}: ${src.id}→${dst.id} 提交互检发现间距违规，弃用本边`, 'warn');
 				continue;
+			}
+
+			// 入缓存（只存无过孔方案）：后续撕毁轮重解同一对焊盘时可直接复用
+			if (!edgeVias.length && rendered.length <= 64) {
+				this.edgeSoloCache.set(cacheKey, rendered.map(p => ({ ...p })));
 			}
 
 			attemptRendered.push(...rendered);
@@ -6251,10 +6298,19 @@ export class PlanningEngine {
 			const net = networks.find(n => n.name === name);
 			if (!net) continue;
 
-			this.progress(80 + Math.floor((i / Math.max(1, names.length)) * 18), `优化网络 ${i + 1}/${names.length}: ${name}`);
+			this.progress(
+				this.routedPct(networks),
+				`优化网络 ${i + 1}/${names.length}: ${name}（已布通 ${this.routedOrder.length}/${networks.length}）`,
+			);
 			const savedPrims = [...(this.netRendered.get(name) ?? [])];
 			const savedVias = this.plannedVias.filter(v => v.net === name);
 			const savedLen = renderedLength(savedPrims);
+
+			// 快筛：已经贴着几何下界（MST 直线和）的网，重布不可能再短 2%
+			//（采纳门槛也是 ≥2% 且 ≥8mil），直接跳过整网「撕毁 + 重解」。
+			// 实测最终优化 11s 里大部分是这类零收益重布。
+			const optLb = this.netLowerBound(net);
+			if (optLb > 0 && savedLen <= optLb * 1.02 + 8) continue;
 
 			this.ripupNetInternal(name, false);
 			this.planOptions = { ...prevOptions, connectivityFirst: false, optimize: false };
@@ -6289,7 +6345,7 @@ export class PlanningEngine {
 				this.callbacks.onNetUpdate?.(name, mergePrims(savedPrims), savedVias, true, this.padProgress(net));
 			}
 		}
-		this.progress(98, '优化完成');
+		this.progress(this.routedPct(networks), `优化完成：已布通 ${this.routedOrder.length}/${networks.length}`);
 	}
 
 	/**
@@ -6491,13 +6547,14 @@ export class PlanningEngine {
 	}
 
 	/** 单段求解：tier-1 焊盘为墙，tier-2 无墙（由调用方做焊盘零违规门） */
-	public async solveRunSegment(
-		a: { x: number; y: number }, b: { x: number; y: number }, layer: number, netName: string,
+	public async solveRunSegment(		a: { x: number; y: number }, b: { x: number; y: number }, layer: number, netName: string,
 	): Promise<RenderedPrim[] | null> {
 		const obsAt = (ly: number) => this.dynamicObstacles.filter(o =>
 			!(o.net && o.net === netName) && (o.layer === undefined || o.layer === ly));
 		const run = async (obs: RBObstacle[]): Promise<RenderedPrim[] | null> => {
-			const r = await routeConnection(a, b, obs, netName, [60, 150], 300, () => false);
+			// 走廊级别与预算：拉紧是「允许 10 分钟」的离线任务，300ms/60-150mil
+			// 对真正绕路的段太紧（超时即无解 → 画布上表现为「拉紧没作用」）。
+			const r = await routeConnection(a, b, obs, netName, [150, 500], 1200, () => false);
 			if (!r.ok || !r.prims.length) return null;
 			return r.prims.map(p => ({ ...(p as RenderedPrim), net: netName, layer }));
 		};
@@ -6506,6 +6563,34 @@ export class PlanningEngine {
 		const t1 = await run([...padWalls, ...obsAt(layer)]);
 		if (t1) return t1;
 		return await run(obsAt(layer));
+	}
+
+	/**
+	 * 整网拆线重布（拉紧菜单用）：按 MST 取焊盘对，逐边可视图重解。
+	 *
+	 * 逐「连续导线段」拉直只能删段内顶点——只要网里有一个 T 型分支，绕路
+	 * 就横跨多个 run，单段求解永远够不到（用户实测：两个焊盘的网被布成
+	 * 大兜圈，拉紧后只在钝角处加了圆弧）。整网按「两两最近焊盘」重布才能
+	 * 把这个兜圈换成直连。
+	 *
+	 * 只处理「整网都在同一层、且所有焊盘都能落在该层」的网；有跨层焊盘
+	 * 或已有过孔的网由调用方跳过（换层拓扑不在本函数职责内）。
+	 */
+	public async rerouteNetMST(netName: string, layer: number): Promise<RenderedPrim[] | null> {
+		const all = this.allPads.filter(p => p.net === netName);
+		if (all.length < 2) return null;
+		const usable = all.filter(p => p.layer === 12 || p.padType === 'th' || p.layer === layer);
+		if (usable.length !== all.length) return null;
+		const edges = this.computeMST(usable);
+		const out: RenderedPrim[] = [];
+		for (const [i, j] of edges) {
+			const seg = await this.solveRunSegment(usable[i], usable[j], layer, netName);
+			if (!seg) return null;
+			const merged = mergePrims(seg);
+			const sm = this.smoothCorners(merged, netName);
+			out.push(...(sm.length ? sm : merged));
+		}
+		return out.length ? out : null;
 	}
 
 	/** 焊盘违规计数（公开包装） */
