@@ -14,6 +14,13 @@ import {
 	buildPolylineObstacle, buildPolygonObstacle,
 } from './rubberband-engine';
 import { DRCRules, fetchDRCRules, applyRouterOptionsToDRC } from './drc-rules';
+import { runTightenJob } from './tighten-job';
+import {
+	Pt, WbRunState, WritebackApi, TightenWriteback, SerialQueue, splitRunByWidth,
+	RepresentedSet, isRepresentedExactly, lineEndpointsUsable, formatTightenReport, startWorkerSession,
+	widthOrDefault, mergeIssues,
+	CopperIssue, StaticCopper, arcFromChord, canvasArcToRendered, isNetPadEntry,
+} from './tighten-writeback';
 import {
 	PlanningEngine, PlanningInput, PlanningResult,
 	RenderedPrim, PlannedVia, PadShape, EnginePad,
@@ -22,9 +29,20 @@ import {
 import { createPlanningWorker, isWorkerSupported } from './worker-source';
 import { parsePolygonPath } from './polygon-parse';
 import {
-	RouterUiOptions, RouteStats, RouteSummary, BoardInspection, normalizeRouterOptions,
+	RouterUiOptions, RouteStats, RouteSummary, BoardInspection,
 } from '../types/router-params';
 import { RoutingProgress } from '../types';
+
+/** 拉紧：随消息发给 Worker 的「不属于任何 run 的带网络走线」 */
+interface TightenTrack { net: string; layer: number; width: number; prim: RenderedPrim }
+
+/** 拉紧：一个连续导线段（回写单元，线宽一致） */
+interface TightenRunUnit extends WbRunState {
+	a: Pt;
+	b: Pt;
+	/** 原图元 id（只用于判断哪些图元已归入 run；回写从不按 id 删） */
+	ids: string[];
+}
 
 export type ProgressCallback = (progress: RoutingProgress) => void;
 export type LogCallback = (message: string, level: string) => void;
@@ -60,18 +78,10 @@ function breathe(): Promise<void> {
 function canvasArcToPrim(a: any, net: string): RenderedPrim | null {
 	const layer: number = a.layer ?? a.layerId ?? 1;
 	const sx = a.startX, sy = a.startY, ex = a.endX, ey = a.endY;
-	const sweep = (Number(a.arcAngle ?? a.sweep ?? 0) * Math.PI) / 180;
 	if (typeof sx !== 'number' || typeof sy !== 'number' ||
 		typeof ex !== 'number' || typeof ey !== 'number') return null;
-	const L = Math.hypot(ex - sx, ey - sy);
-	if (!sweep || Math.abs(Math.sin(sweep / 2)) < 1e-6 || L < 1e-6) return null;
-	const R = L / (2 * Math.abs(Math.sin(sweep / 2)));
-	const sgn = sweep > 0 ? 1 : -1;
-	const h = sgn * R * Math.cos(sweep / 2);
-	const nx = -(ey - sy) / L, ny = (ex - sx) / L;
-	const cx = (sx + ex) / 2 + h * nx, cy = (sy + ey) / 2 + h * ny;
-	const a0 = Math.atan2(sy - cy, sx - cx);
-	return { kind: 'arc', net, layer, cx, cy, r: R, startAngle: a0, sweep };
+	// 换算与拉紧回写共用（tighten-writeback.arcFromChord）；扫角为 0 时返回 null（布线后处理口径不变）
+	return arcFromChord(net, layer, sx, sy, ex, ey, Number(a.arcAngle ?? a.sweep ?? 0));
 }
 
 /**
@@ -271,141 +281,178 @@ export class TopologicalRouter {
 	 * 复用 J/H 引擎结果的形态优化管线——让用户无需完整布线即可
 	 * 单独查看/使用橡皮筋优化效果（含另外两个引擎的产物）。
 	 */
-	public async tightenExistingRouting(): Promise<{ nets: number; changed: number; savedMil: number }> {
+	public async tightenExistingRouting(): Promise<{
+		nets: number; changed: number; savedMil: number; total: number;
+		/** 回写失败的段数 */
+		failed: number;
+		/** 因回写失败而中止 */
+		aborted: boolean;
+		/** 写后现读校验通过的段数 */
+		verified: number;
+		/** 失败后未能恢复的差异 + 结束核对发现的画布与模型差异（缺铜/多余铜，各带一个坐标） */
+		issues: CopperIssue[];
+		/** 终态汇报文案（已按「段」口径如实汇报） */
+		message: string;
+		/** 用户取消（停止）；中止（aborted）优先于取消 */
+		cancelled: boolean;
+	}> {
 		this.shouldCancel = false;
 		this.tightening = true;
 		try {
 			this.onProgress?.({ stage: '读取规则', percentage: 5, message: '正在读取 DRC 规则与画布几何...' });
-			const drcBase = await fetchDRCRules(this.onLog);
-			const drc = applyRouterOptionsToDRC(drcBase, normalizeRouterOptions({}));
+			// 用板子真实规则；每段回写用其真实线宽（见 splitRunByWidth），不再强制 10mil
+			const drc = await fetchDRCRules(this.onLog);
 			await this.cachePadShapes();
 			const { padMap, allPads } = await this.collectPads();
 			if (!padMap.size) throw new Error('当前 PCB 没有网络');
 
 			const lines = (await eda.pcb_PrimitiveLine.getAll()) ?? [];
 			const arcs = (await eda.pcb_PrimitiveArc.getAll()) ?? [];
-			const vias = (await eda.pcb_PrimitiveVia.getAll()) ?? [];
+			const viaPrims = (await eda.pcb_PrimitiveVia.getAll()) ?? [];
+			// 只有铜层（1/2）上带网络的线/弧才是「走线」；其余层不拉紧
+			const isCu = (ly: number): boolean => ly === 1 || ly === 2;
 			const byNet = new Map<string, { prims: RenderedPrim[]; vias: PlannedVia[] }>();
+			// 已转成 run / track 精确表示的画布图元 id；只有这些才从静态世界里排除
+			const represented = new RepresentedSet();
+			// 带网络但不属于任何 run 的走线（网络没有焊盘/被跳过），作为 tracks 随消息发给 Worker
+			const looseTracks: TightenTrack[] = [];
+			const toTrack = (net: string, layer: number, width: number, prim: RenderedPrim): TightenTrack =>
+				({ net, layer, width, prim });
+			// 线宽统一口径（与回写现读 readNetCopper 相同）：lineWidth 读成 0/缺失时取 drc.traceWidthMil
+			const trackWidth = (raw: unknown): number => widthOrDefault(raw, drc.traceWidthMil);
 			for (const l of lines as any[]) {
 				const net = String(l.net ?? '');
-				if (!net || !padMap.has(net)) continue;
-				const e = byNet.get(net) ?? { prims: [], vias: [] };
-				e.prims.push({
-					kind: 'line', net, layer: l.layer ?? l.layerId ?? 1,
+				const layer: number = l.layer ?? l.layerId ?? 1;
+				if (!net || !isCu(layer)) continue;
+				// 坐标无效的线转不成引擎图元：不登记为「已精确表示」，留在 baseWorld 里当障碍
+				if (!lineEndpointsUsable(l)) continue;
+				const prim = {
+					kind: 'line', net, layer,
 					x1: l.startX ?? l.x, y1: l.startY ?? l.y, x2: l.endX, y2: l.endY,
-					__id: String(l.primitiveId ?? ''), __width: Number(l.lineWidth) || undefined,
-				} as RenderedPrim);
+				} as RenderedPrim;
+				represented.add('line', l.primitiveId);
+				if (!padMap.has(net)) { looseTracks.push(toTrack(net, layer, trackWidth(l.lineWidth), prim)); continue; }
+				const e = byNet.get(net) ?? { prims: [], vias: [] };
+				(prim as any).__id = String(l.primitiveId ?? '');
+				(prim as any).__width = trackWidth(l.lineWidth);
+				e.prims.push(prim);
 				byNet.set(net, e);
 			}
 			for (const a of arcs as any[]) {
 				const net = String(a.net ?? '');
-				if (!net || !padMap.has(net)) continue;
+				const layer: number = a.layer ?? a.layerId ?? 1;
+				if (!net || !isCu(layer)) continue;
+				// 读回扫角为 0 的弧（真机 |arcAngle| < 0.05° 读回即 0）按端点间直线处理，不能从 run 链上丢掉
+				const prim = canvasArcToRendered(a, net);
+				// 转换失败的弧不登记：留在 baseWorld 里当静态障碍（不能从世界里消失）
+				if (!prim) continue;
+				represented.add('arc', a.primitiveId);
+				if (!padMap.has(net)) { looseTracks.push(toTrack(net, layer, trackWidth(a.lineWidth), prim)); continue; }
 				const e = byNet.get(net) ?? { prims: [], vias: [] };
-				const prim = canvasArcToPrim(a, net);
-				if (prim) {
-					(prim as any).__id = String(a.primitiveId ?? '');
-					(prim as any).__width = Number(a.lineWidth) || undefined;
-					e.prims.push(prim);
-				}
+				(prim as any).__id = String(a.primitiveId ?? '');
+				(prim as any).__width = trackWidth(a.lineWidth);
+				e.prims.push(prim);
 				byNet.set(net, e);
 			}
-			for (const v of vias as any[]) {
+			// 全板过孔（含无网络/网络被跳过的）：静态世界不再收过孔，统一经 vias 字段发送
+			const allVias: PlannedVia[] = [];
+			for (const v of viaPrims as any[]) {
+				const x = v.x ?? v.center?.x, y = v.y ?? v.center?.y;
+				if (typeof x !== 'number' || typeof y !== 'number') continue;
 				const net = String(v.net ?? '');
-				if (!net || !padMap.has(net)) continue;
-				const e = byNet.get(net) ?? { prims: [], vias: [] };
-				e.vias.push({ net, x: v.x, y: v.y, dia: v.viaDiameter ?? 24, hole: v.holeDiameter ?? 12 });
-				byNet.set(net, e);
+				const via: PlannedVia = {
+					net, x, y,
+					dia: Number(v.diameter ?? v.viaDiameter) || 24,
+					hole: Number(v.holeDiameter) || 12,
+				};
+				allVias.push(via);
+				if (net && padMap.has(net)) {
+					const e = byNet.get(net) ?? { prims: [], vias: [] };
+					e.vias.push(via);
+					byNet.set(net, e);
+				}
 			}
 			const entries = [...byNet.entries()].map(([name, e]) => ({ name, ...e })).filter(e => e.prims.length);
 			if (!entries.length) throw new Error('画布上没有可拉紧的走线');
 
 			this.onProgress?.({ stage: '收集世界', percentage: 25, message: `收集静态世界与 ${entries.length} 个网络的走线...` });
-			const staticWorld = await this.collectStaticObstacles(drc, true);
+			// 静态世界不含「已精确表示」的带网络铜层走线（run / tracks 字段）与过孔；
+			// 没转换成功的图元（无效弧/线、折线不足两点等）仍留在 baseWorld 里当障碍
+			looseTracks.push(...(await this.collectPolylineTracks(drc, represented)));
+			const baseWorld = await this.collectStaticObstacles(drc, true, represented);
 
-			// ── 切成「连续导线段」（分支点/过孔为边界）──
+			// ── 切成「连续导线段」（分支点/过孔为边界），再按线宽变化处拆开 ──
 			const splitEngine = new PlanningEngine();
 			splitEngine.initTightenWorld(drc, allPads, [], Object.fromEntries(this.padShapeCache));
-			interface RunUnit {
-				id: number; net: string; layer: number; width: number;
-				prims: RenderedPrim[]; a: { x: number; y: number }; b: { x: number; y: number };
-				ids: Array<{ kind: 'line' | 'arc'; id: string }>;
-				oldLen: number;
-			}
-			const runs: RunUnit[] = [];
+			const runs: TightenRunUnit[] = [];
+			const widthOf = (p: RenderedPrim): number => trackWidth((p as any).__width);
 			for (const e of entries) {
 				for (const seg of splitEngine.splitRunsForTighten(e.prims, e.vias)) {
-					const ids = seg.prims
-						.map(p => ({ kind: p.kind as 'line' | 'arc', id: String((p as any).__id ?? '') }))
-						.filter(x => !!x.id);
-					const width = Number((seg.prims[0] as any).__width) || drc.traceWidthMil;
-					runs.push({
-						id: runs.length, net: e.name, layer: seg.layer, width,
-						prims: seg.prims, a: seg.a, b: seg.b, ids,
-						oldLen: renderedLength(seg.prims),
-					});
+					for (const piece of splitRunByWidth(seg, widthOf)) {
+						const ids = piece.prims.map(p => String((p as any).__id ?? '')).filter(x => !!x);
+						runs.push({
+							id: runs.length, net: e.name, layer: piece.layer, width: piece.width,
+							prims: piece.prims, a: piece.a, b: piece.b, ids,
+							origLen: renderedLength(piece.prims),
+						});
+					}
 				}
 			}
 			if (!runs.length) throw new Error('没有可拉紧的连续导线段');
-			const byId = new Map(runs.map(r => [r.id, r]));
-			const total = runs.length;
-			let done = 0, adopted = 0, savedMil = 0;
-
-			const deleteRun = async (r: RunUnit): Promise<void> => {
-				const lineIds = r.ids.filter(x => x.kind === 'line').map(x => x.id);
-				const arcIds = r.ids.filter(x => x.kind === 'arc').map(x => x.id);
-				try { if (lineIds.length) await eda.pcb_PrimitiveLine.delete(lineIds); } catch { /* ignore */ }
-				try { if (arcIds.length) await eda.pcb_PrimitiveArc.delete(arcIds); } catch { /* ignore */ }
-			};
-			const writeRun = async (r: RunUnit, prims: RenderedPrim[]): Promise<void> => {
-				let last: { x: number; y: number } | null = null;
-				const newIds: Array<{ kind: 'line' | 'arc'; id: string }> = [];
-				for (const pr of prims) {
-					try {
-						if (pr.kind === 'line') {
-							let sx = pr.x1!, sy = pr.y1!;
-							const ex = pr.x2!, ey = pr.y2!;
-							if (last && Math.hypot(sx - last.x, sy - last.y) < 0.5) { sx = last.x; sy = last.y; }
-							const created = await eda.pcb_PrimitiveLine.create(r.net, pr.layer ?? r.layer, sx, sy, ex, ey, r.width, false);
-							last = { x: ex, y: ey };
-							const id = primitiveIdOf(created);
-							if (id) newIds.push({ kind: 'line', id });
-						} else {
-							const deg = (pr.sweep ?? 0) * 180 / Math.PI;
-							const sx = pr.cx! + pr.r! * Math.cos(pr.startAngle!);
-							const sy = pr.cy! + pr.r! * Math.sin(pr.startAngle!);
-							const ex = pr.cx! + pr.r! * Math.cos(pr.startAngle! + (pr.sweep ?? 0));
-							const ey = pr.cy! + pr.r! * Math.sin(pr.startAngle! + (pr.sweep ?? 0));
-							if (Math.abs(deg) < 0.05) {
-								const created = await eda.pcb_PrimitiveLine.create(r.net, pr.layer ?? r.layer, sx, sy, ex, ey, r.width, false);
-								const id = primitiveIdOf(created);
-								if (id) newIds.push({ kind: 'line', id });
-							} else {
-								const created = await eda.pcb_PrimitiveArc.create(r.net, pr.layer ?? r.layer, sx, sy, ex, ey, deg, r.width);
-								const id = primitiveIdOf(created);
-								if (id) newIds.push({ kind: 'arc', id });
-							}
-							last = { x: ex, y: ey };
-						}
-					} catch (err) {
-						console.warn('[Tighten] 写入图元失败:', err);
+			// 兜底：切段若丢了某些带 id 的图元，它们既不在 run 也不在静态世界里，
+			// 会从世界中凭空消失；改作只读 tracks 发给 Worker
+			const runIds = new Set(runs.flatMap(r => r.ids));
+			// 有 run 的网里不属于任何 run 的线/弧：回写时作为该网的只读模型铜（必须保住、核对时计入）
+			const statics: StaticCopper[] = [];
+			for (const e of entries) {
+				for (const p of e.prims) {
+					const id = String((p as any).__id ?? '');
+					if (id && !runIds.has(id)) {
+						const w = trackWidth((p as any).__width);
+						looseTracks.push(toTrack(e.name, p.layer, w, p));
+						statics.push({ net: e.name, layer: p.layer, width: w, prim: p });
 					}
 				}
-				r.ids = newIds;
-			};
+			}
+			const total = runs.length;
 
-			const onRun = async (msg: { id: number; prims: RenderedPrim[] | null; oldLen: number; newLen: number }): Promise<void> => {
-				const r = byId.get(msg.id);
-				done++;
-				if (r && msg.prims && msg.prims.length) {
-					await deleteRun(r);
-					await writeRun(r, msg.prims);
-					adopted++;
-					savedMil += Math.max(0, msg.oldLen - msg.newLen);
-				}
+			// ── 回写：现读按几何匹配 → 先删旧 → 建新 → 现读校验，失败恢复原走线；消息严格按到达顺序串行处理 ──
+			// 【仅测试用】故障注入钩子（bench/tighten-e2e 真机端到端用来验证失败恢复）：
+			// 设置 (globalThis as any).__RB_TIGHTEN_FAULT__ = { createFailAt: n } 时，本次拉紧的第 n 次 create 调用
+			// （从 1 计，含恢复原走线时的创建）抛 Error('fault injection')。生产环境不会设置该全局，未设置时无任何影响；
+			// 项目没有可用的构建期开关（esbuild 配置未定义 define 标志），所以只在这里注明，不做编译期裁剪。
+			let createCount = 0;
+			const faultCheck = (): void => {
+				createCount++;
+				const fault = (globalThis as any).__RB_TIGHTEN_FAULT__;
+				if (fault && Number(fault.createFailAt) === createCount) throw new Error('fault injection');
+			};
+			const api: WritebackApi = {
+				createLine: async (net, layer, sx, sy, ex, ey, width) => {
+					faultCheck();
+					return primitiveIdOf(await eda.pcb_PrimitiveLine.create(net, layer, sx, sy, ex, ey, width, false));
+				},
+				createArc: async (net, layer, sx, sy, ex, ey, deg, width) => {
+					faultCheck();
+					return primitiveIdOf(await eda.pcb_PrimitiveArc.create(net, layer, sx, sy, ex, ey, deg, width));
+				},
+				deleteLines: (ids) => eda.pcb_PrimitiveLine.delete(ids),
+				deleteArcs: (ids) => eda.pcb_PrimitiveArc.delete(ids),
+				// getAll(net) 按网过滤：真机 4.1.99 上观察到的行为（e2e 按网读、得到的就是该网图元，≈14ms），非文档保证；
+				// readNetCopper 会再按 net 字段过滤一遍兜底（客户端若忽略参数返回全板，结果仍正确，只是更慢）
+				listLines: async (net) => ((await eda.pcb_PrimitiveLine.getAll(net)) ?? []).filter((x: any) => String(x?.net ?? '') === net),
+				listArcs: async (net) => ((await eda.pcb_PrimitiveArc.getAll(net)) ?? []).filter((x: any) => String(x?.net ?? '') === net),
+			};
+			// 第一次回写失败即中止整个拉紧（见 TightenWriteback）：终止 Worker / 让回退任务退出
+			let session: { halt(): void } | null = null;
+			const wb = new TightenWriteback(api, runs.map((r): WbRunState => ({
+				id: r.id, net: r.net, layer: r.layer, width: r.width, prims: r.prims, origLen: r.origLen,
+			})), this.onLog, () => { session?.halt(); }, statics, drc.traceWidthMil);
+			const queue = new SerialQueue();
+			const reportProgress = (message: string): void => {
 				this.onProgress?.({
-					stage: '逐段拉紧', percentage: 30 + Math.round((done / total) * 65),
-					message: `${r ? r.net : ''} ${done}/${total}（${(msg.newLen ?? msg.oldLen).toFixed(0)}mil）`,
-					done, total, changed: adopted, savedMil,
+					stage: '逐段拉紧', percentage: 30 + Math.round((wb.done / total) * 65),
+					message, done: wb.done, total, changed: wb.adopted, savedMil: wb.savedMil,
 				});
 			};
 
@@ -415,177 +462,110 @@ export class TopologicalRouter {
 				done: 0, total, changed: 0, savedMil: 0,
 			});
 
-			// ── 求解在 Worker（不卡主线程）；主线程只做删除/写入/刷新 ──
+			const jobMsg = {
+				type: 'tighten' as const, drc, allPads, baseWorld,
+				padShapes: Object.fromEntries(this.padShapeCache),
+				vias: allVias, tracks: looseTracks,
+				runs: runs.map(r => ({ id: r.id, net: r.net, layer: r.layer, width: r.width, a: r.a, b: r.b, prims: r.prims })),
+			};
+
+			/** 处理一条 Worker / 回退任务的事件；入串行队列，保证按到达顺序逐条回写 */
+			const handle = (m: any): void => {
+				if (!m) return;
+				if (m.type === 'tightenRun') {
+					if (wb.halted) return;   // 已中止：不再入队
+					void queue.push(async () => {
+						const out = await wb.applyRun(m);
+						if (out.ignored) return;
+						const name = runs[m.id]?.net ?? '';
+						reportProgress(`${name} ${wb.done}/${total}（${Number(m.newLen ?? m.oldLen ?? 0).toFixed(0)}mil${out.rolledBack ? '，回写失败' : ''}）`);
+						if (!wb.halted) await breathe();
+					});
+				} else if (m.type === 'netRewrite') {
+					if (wb.halted) return;
+					void queue.push(async () => {
+						const out = await wb.applyNetRewrite(m);
+						if (out.ignored) return;
+						if (out.applied) {
+							reportProgress(`整网重布 ${m.net}：${Number(m.oldLen ?? 0).toFixed(0)} → ${Number(m.newLen ?? 0).toFixed(0)}mil`);
+						}
+						if (!wb.halted) await breathe();
+					});
+				} else if (m.type === 'tightenDone') {
+					this.onLog?.(
+						`重解阶段：尝试 ${m.solveAttempts ?? 0} 段，采纳 ${m.solved ?? 0} 段，整网重布 ${m.rewritten ?? 0} 网，耗时 ${m.solveMs ?? 0}ms`,
+						'info',
+					);
+					// 收尾由 startWorkerSession 排在所有已到达消息之后
+				}
+			};
+
+			// ── 求解在 Worker（不卡主线程）；主线程只做写入/刷新 ──
 			const worker = isWorkerSupported() ? createPlanningWorker() : null;
 			if (worker) {
 				this.tightenWorker = worker;
-				await new Promise<void>((resolve, reject) => {
-					const w = worker;
-					const pending = new Set<Promise<void>>();
-					let settled = false;
-					this.tightenCancel = () => { if (!settled) { settled = true; resolve(); } };
-					w.onmessage = (ev: MessageEvent) => {
-						const m = ev.data;
-						if (!m) return;
-						if (m.type === 'tightenRun') {
-							const p = onRun(m).catch(() => { /* 单段失败不影响继续 */ }).then(() => breathe());
-							pending.add(p);
-							void p.finally(() => pending.delete(p));
-						} else if (m.type === 'netRewrite') {
-							// 整网拆线重布：等该网逐段写入落盘后，删掉全部旧段、写入新链路
-							const p = Promise.all([...pending]).then(async () => {
-								const rs = runs.filter(r => r.net === m.net);
-								if (!rs.length || !m.prims?.length) return;
-								for (const r of rs) await deleteRun(r);
-								await writeRun(rs[0], m.prims);
-								adopted++;
-								savedMil += Math.max(0, (m.oldLen ?? 0) - (m.newLen ?? 0));
-								this.onProgress?.({
-									stage: '逐段拉紧', percentage: 30 + Math.round((done / total) * 65),
-									message: `整网重布 ${m.net}：${Number(m.oldLen ?? 0).toFixed(0)} → ${Number(m.newLen ?? 0).toFixed(0)}mil`,
-									done, total, changed: adopted, savedMil,
-								});
-							}).catch(() => { /* 单网失败不影响继续 */ }).then(() => breathe());
-							pending.add(p);
-							void p.finally(() => pending.delete(p));
-						} else if (m.type === 'tightenDone') {
-							this.onLog?.(
-								`重解阶段：尝试 ${m.solveAttempts ?? 0} 段，采纳 ${m.solved ?? 0} 段，整网重布 ${m.rewritten ?? 0} 网，耗时 ${m.solveMs ?? 0}ms`,
-								'info',
-							);
-							// 等所有写入落盘再收尾，保证统计与画布一致
-							void Promise.all([...pending]).then(() => {
-								this.tightenWorker = null;
-								this.tightenCancel = null;
-								try { w.terminate(); } catch { /* ignore */ }
-								if (!settled) { settled = true; resolve(); }
-							});
-						} else if (m.type === 'error') {
-							if (!settled) { settled = true; reject(new Error(String(m.message ?? 'worker error'))); }
-						}
-					};
-					w.onerror = (e: any) => reject(new Error(String(e?.message ?? 'worker error')));
-					w.postMessage({
-						type: 'tighten', drc, allPads, baseWorld: staticWorld,
-						padShapes: Object.fromEntries(this.padShapeCache),
-						vias: entries.flatMap(e => e.vias),
-						runs: runs.map(r => ({ id: r.id, net: r.net, layer: r.layer, a: r.a, b: r.b, prims: r.prims })),
-					});
+				const ws = startWorkerSession(worker as any, queue, jobMsg, handle, {
+					onTerminate: () => { this.tightenWorker = null; this.tightenCancel = null; },
 				});
+				session = ws;
+				// 取消：Worker 已被 cancel() 终止；等已入队的回写落盘再返回
+				this.tightenCancel = () => ws.cancel();
+				// Worker 出错：startWorkerSession 等写入队列排空后才 reject，
+				// 保证本方法返回（tightening 复位）时画布已不再被写
+				await ws.done;
 			} else {
-				// 主线程回退（无 Worker 环境）
-				const eng = new PlanningEngine();
-				eng.initTightenWorld(drc, allPads, staticWorld, Object.fromEntries(this.padShapeCache));
-				const groupsById = new Map<number, string[]>();
-				const currentById = new Map<number, RenderedPrim[]>();
-				for (const r of runs) {
-					groupsById.set(r.id, eng.addRunToWorld(r.prims));
-					currentById.set(r.id, r.prims);
-				}
-				for (const e of entries) for (const v of e.vias) eng.addViaToWorld(v);
-				const sorted = [...runs].sort((p, q) =>
-					(q.oldLen - Math.hypot(q.b.x - q.a.x, q.b.y - q.a.y)) - (p.oldLen - Math.hypot(p.b.x - p.a.x, p.b.y - p.a.y)));
-				for (const r of sorted) {
-					if (this.shouldCancel) break;
-					const oldLen = r.oldLen;
-					const origPad = eng.padViolations(r.prims, r.net);
-					let next: RenderedPrim[] | null = null;
-					let newLen = oldLen;
-					// 1) 拉直 + 圆润（便宜，对所有段）：string-pulling 后把拐角换弧
-					const pulled = eng.tautenRun(r.prims, r.net);
-					const pulledLen = renderedLength(pulled);
-					const base = pulledLen < oldLen - 0.1 ? pulled : r.prims;
-					const sm = eng.smoothRun(base, r.net);
-					const candidate = renderedLength(sm) < renderedLength(base) - 0.1 ? sm : base;
-					const candLen = renderedLength(candidate);
-					const origArcN = r.prims.filter(p => p.kind === 'arc').length;
-					const candArcN = candidate.filter(p => p.kind === 'arc').length;
-					const improved = candArcN > origArcN || candLen < oldLen - 0.1;
-					// 不做整条 run 的 primsClearOfOthers（见 worker 同处注释）：
-					// 圆角/拉直已逐弧/逐线过了净距，只卡焊盘违规不恶化。
-					if (improved && candLen <= oldLen + 0.5 &&
-						eng.padViolations(candidate, r.net) <= origPad) {
-						next = candidate; newLen = candLen;
-					}
-					// 2) 拆线重布（A*）：拉直没把拓扑改短的明显绕路段（不能用 !next：
-					//    第 1 阶段几乎每段都能加出圆角，会让 A* 永远不跑）。
-					const straight = Math.hypot(r.b.x - r.a.x, r.b.y - r.a.y);
-					const detour = oldLen - straight;
-					const stillDetoured = candLen > straight + Math.max(15, straight * 0.08);
-					if (detour >= 25 && straight > 5 && stillDetoured) {
-						const sc = await eng.solveRunSegment(r.a, r.b, r.layer, r.net);
-						if (sc) {
-							const sm2 = eng.smoothRun(sc, r.net);
-							const tryCand = sm2.length && renderedLength(sm2) <= renderedLength(sc) + 0.5 ? sm2 : sc;
-							const tl = renderedLength(tryCand);
-							const tp = eng.padViolations(tryCand, r.net);
-							const okShort = tl < oldLen - 0.5 && tp === 0;
-							const okRepair = tp === 0 && origPad > 0;
-							const better = !next || tl < newLen - 2;
-							if (better && (okShort || okRepair) && await eng.primsClearOfOthers(tryCand, r.net)) {
-								next = tryCand; newLen = tl;
-							}
-						}
-					}
-					if (next) {
-						eng.removeWorldGroups(groupsById.get(r.id) ?? []);
-						groupsById.set(r.id, eng.addRunToWorld(next));
-						currentById.set(r.id, next);
-					}
-					await onRun({ id: r.id, prims: next, oldLen, newLen });
-					await breathe();
-				}
-
-				// ── 整网拆线重布（MST 焊盘对）：解释见 worker 同处 ──
-				const viasByNet = new Set(entries.flatMap(e => e.vias).map(v => v.net));
-				const byNetRuns = new Map<string, RunUnit[]>();
-				for (const r of runs) {
-					const arr = byNetRuns.get(r.net);
-					if (arr) arr.push(r); else byNetRuns.set(r.net, [r]);
-				}
-				for (const [net, rs] of byNetRuns) {
-					if (this.shouldCancel) break;
-					if (viasByNet.has(net)) continue;
-					const layer = rs[0].layer;
-					if (rs.some(q => q.layer !== layer)) continue;
-					const oldLen = rs.reduce((s, q) => s + renderedLength(currentById.get(q.id) ?? q.prims), 0);
-					if (oldLen <= 0) continue;
-					const cand = await eng.rerouteNetMST(net, layer);
-					if (!cand) continue;
-					const newLen = renderedLength(cand);
-					if (newLen > oldLen - Math.max(10, oldLen * 0.08)) continue;
-					if (eng.padViolations(cand, net) > 0) continue;
-					if (!await eng.primsClearOfOthers(cand, net)) continue;
-					for (const q of rs) {
-						eng.removeWorldGroups(groupsById.get(q.id) ?? []);
-						await deleteRun(q);
-					}
-					eng.addRunToWorld(cand);
-					await writeRun(rs[0], cand);
-					adopted++;
-					savedMil += oldLen - newLen;
-					this.onProgress?.({
-						stage: '逐段拉紧', percentage: 30 + Math.round((done / total) * 65),
-						message: `整网重布 ${net}：${oldLen.toFixed(0)} → ${newLen.toFixed(0)}mil`,
-						done, total, changed: adopted, savedMil,
-					});
-					await breathe();
-				}
+				// 主线程回退（无 Worker 环境）：与 Worker 共用同一个任务函数，并传入新引擎以获得同样的可选重解阶段
+				await runTightenJob(jobMsg, handle, () => this.shouldCancel || wb.halted, new PlanningEngine());
+				await queue.idle();
 			}
+			await queue.idle();
 
+			// 结束核对：写过的每个网现读一次，画布 ≠ 模型的地方（缺铜/多余铜）如实上报
+			this.onProgress?.({ stage: '核对画布', percentage: 97, message: `核对 ${wb.touchedNets().length} 个已写入网络...` });
+			const auditIssues = await wb.audit();
 			const cancelled = this.shouldCancel;
-			this.onLog?.(`拉紧完成：${total} 段（采纳 ${adopted} 段，共省 ${savedMil.toFixed(0)}mil）`, 'success');
+			const sum = wb.summary();
+			const report = formatTightenReport(sum, cancelled);
+			if (sum.rollbacks) this.onLog?.(`有 ${sum.rollbacks} 次回写失败（失败段保持旧走线原样）`, 'warn');
+			this.onLog?.(report.message, report.level);
 			this.onProgress?.({
-				stage: cancelled ? '已停止' : '完成', percentage: 100,
-				message: cancelled
-					? `拉紧已停止：已处理 ${done}/${total} 段`
-					: `拉紧完成：${adopted}/${total} 段有改善，共省 ${savedMil.toFixed(0)}mil`,
-				done, total, changed: adopted, savedMil,
+				stage: report.stage, percentage: 100, message: report.message,
+				done: sum.done, total: sum.total, changed: sum.adopted, savedMil: sum.savedMil,
 			});
-			return { nets: entries.length, changed: adopted, savedMil };
+			return {
+				nets: entries.length, changed: sum.adopted, savedMil: sum.savedMil, total: sum.total,
+				failed: sum.failed, aborted: sum.halted, verified: sum.verified,
+				// 未恢复差异与结束核对常指同一处：去重后再汇报（中止时其它网的核对差异照常保留）
+				issues: mergeIssues(sum.unrestored, auditIssues), message: report.message,
+				cancelled,
+			};
 		} finally {
 			this.tightening = false;
 		}
+	}
+
+	/** 带网络的折线走线（铜层 1/2）→ tracks 条目（逐段一条线），静态世界不再收它们 */
+	private async collectPolylineTracks(drc: DRCRules, represented: RepresentedSet): Promise<TightenTrack[]> {
+		const out: TightenTrack[] = [];
+		try {
+			const polylines = (await eda.pcb_PrimitivePolyline.getAll()) ?? [];
+			for (const pl of polylines as any[]) {
+				const layer: number = pl.layerId ?? pl.layer ?? 1;
+				const net: string = pl.net ?? '';
+				if (!net || (layer !== 1 && layer !== 2)) continue;
+				const width = Number(pl.lineWidth) || drc.traceWidthMil;
+				const pts = parsePolygonPath(pl.polygon?.polygon ?? pl.polygon ?? []);
+				// 至少发出一条 track 才登记为「已精确表示」；不足两点的留在 baseWorld
+				if (pts.length >= 2) represented.add('polyline', pl.primitiveId);
+				for (let i = 0; i + 1 < pts.length; i++) {
+					out.push({
+						net, layer, width,
+						prim: { kind: 'line', net, layer, x1: pts[i].x, y1: pts[i].y, x2: pts[i + 1].x, y2: pts[i + 1].y },
+					});
+				}
+			}
+		} catch { /* 折线读取失败：少一批只读障碍，不阻断拉紧 */ }
+		return out;
 	}
 
 	private async collectPads(): Promise<{
@@ -622,7 +602,9 @@ export class TopologicalRouter {
 					const p = prim as any;
 					// type: 1 = SMD 焊盘，2 = 通孔焊盘（旧实现只收 1，TH 焊盘对路由器隐形 ——
 					// 实测走线穿过 RST 通孔焊盘 0.2mil，EDA DRC 报 TH Pad to Track）
-					if (p.type !== undefined && p.type !== 1 && p.type !== 2) continue;
+					// getAllPrimitivesByNet 还会返回本网走线/弧/过孔（pcbItemPrimitiveType = Track/ArcTrack/Via，
+					// 线的 type 为 undefined），旧过滤让它们全变成幻影焊盘——只收真正的焊盘
+					if (!isNetPadEntry(p)) continue;
 					const x: number = p.center?.x ?? p.x ?? p.startX ?? 0;
 					const y: number = p.center?.y ?? p.y ?? p.startY ?? 0;
 					if (x === 0 && y === 0 && !p.center) continue;
@@ -877,8 +859,16 @@ export class TopologicalRouter {
 		return { layers, nets };
 	}
 
-	/** 收集静态铜层障碍（折线/线条/填充/板框），不含焊盘 */
-	private async collectStaticObstacles(drc: DRCRules, tighten = false): Promise<RBObstacle[]> {
+	/**
+	 * 收集静态铜层障碍（折线/线条/填充/板框），不含焊盘。
+	 * represented（拉紧专用；null = 布线口径，行为与旧版完全一致）：已经以 runs/tracks
+	 * 精确表示的带网络铜层(1/2)折线/线/弧（按图元 id 登记）不再收，且不收既有过孔
+	 * （它们由拉紧消息的 vias 字段单独发送）——否则被拉紧的走线会以自己的膨胀副本挡住自己。
+	 * 没登记的（转换失败的弧/线、不足两点的折线等）照旧留作静态障碍，不会从世界里消失。
+	 */
+	private async collectStaticObstacles(
+		drc: DRCRules, tighten = false, represented: RepresentedSet | null = null,
+	): Promise<RBObstacle[]> {
 		const obstacles: RBObstacle[] = [];
 		const parsePath = parsePolygonPath;
 		// 拉紧口径：圆角弧严格内切于原折角，比原铜皮更远离外部障碍；用 trackToTrack
@@ -905,6 +895,7 @@ export class TopologicalRouter {
 				continue;
 			}
 			if (layer !== 1 && layer !== 2 && layer !== 12) continue;
+			if (isRepresentedExactly(represented, 'polyline', net, layer, p.primitiveId)) continue;
 			const r = lw / 2 + lineClear + drc.traceWidthMil / 2 + copperMargin;
 			const pts = parsePath(p.polygon?.polygon ?? p.polygon ?? []);
 			if (pts.length >= 2) {
@@ -931,6 +922,7 @@ export class TopologicalRouter {
 				continue;
 			}
 			if (layer !== 1 && layer !== 2 && layer !== 12) continue;
+			if (isRepresentedExactly(represented, 'line', net, layer, l.primitiveId)) continue;
 			const lw = l.lineWidth ?? 10;
 			const r = lw / 2 + lineClear + drc.traceWidthMil / 2 + copperMargin;
 			obstacles.push(...buildPolylineObstacle(
@@ -968,6 +960,7 @@ export class TopologicalRouter {
 				const r = lw / 2 + drc.trackToBoardMil + drc.traceWidthMil / 2;
 				obstacles.push(...buildPolylineObstacle(pts, r, undefined, undefined, 'board', true));
 			} else if (layer === 1 || layer === 2 || layer === 12) {
+				if (isRepresentedExactly(represented, 'arc', net, layer, o.primitiveId)) continue;
 				const r = lw / 2 + lineClear + drc.traceWidthMil / 2 + copperMargin;
 				obstacles.push(...buildPolylineObstacle(pts, r, net || undefined, layer, `arc:${sx.toFixed(0)},${sy.toFixed(0)}`));
 			}
@@ -994,7 +987,7 @@ export class TopologicalRouter {
 		// 旧实现完全没收集——实测 39 个既有过孔对路由器隐形，走线直接压过
 		// （EDA DRC 报 Hole to Track / SMD Pad to Via）。
 		// 注：clearExistingTraces 会先删除待布网络的过孔，故此处只剩真正需要避让的。
-		const viaPrims = await eda.pcb_PrimitiveVia.getAll();
+		const viaPrims = represented ? [] : await eda.pcb_PrimitiveVia.getAll();
 		const viaClear = Math.max(drc.trackToTrackMil, drc.trackToPadMil);
 		for (const v of viaPrims ?? []) {
 			const vp = v as any;

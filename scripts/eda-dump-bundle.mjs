@@ -1,5 +1,94 @@
 const __edaShim = (globalThis.eda ?? null);
 
+// src/router/polygon-parse.ts
+function parsePolygonPath(polygon) {
+  if (!Array.isArray(polygon) || polygon.length < 3)
+    return [];
+  const head = typeof polygon[0] === "string" ? String(polygon[0]).toUpperCase() : "";
+  if (head === "R" && polygon.length >= 5) {
+    const X = Number(polygon[1]), Y = Number(polygon[2]);
+    const w = Number(polygon[3]), h = Number(polygon[4]);
+    const rot = (Number(polygon[5]) || 0) * Math.PI / 180;
+    const c = Math.cos(rot), s = Math.sin(rot);
+    const toWorld = (dx, dy) => ({ x: X + dx * c - dy * s, y: Y + dx * s + dy * c });
+    const pts2 = [toWorld(0, 0), toWorld(w, 0), toWorld(w, -h), toWorld(0, -h)];
+    pts2.push({ ...pts2[0] });
+    return pts2;
+  }
+  if (head === "CIRCLE" && polygon.length >= 4) {
+    const cx = Number(polygon[1]), cy = Number(polygon[2]), r = Number(polygon[3]);
+    const pts2 = [];
+    for (let k = 0; k <= 24; k++) {
+      const a = k / 24 * Math.PI * 2;
+      pts2.push({ x: cx + r * Math.cos(a), y: cy + r * Math.sin(a) });
+    }
+    return pts2;
+  }
+  const pts = [];
+  const ARC_STEP = Math.PI / 12;
+  let i = 0;
+  let curX = 0, curY = 0;
+  while (i < polygon.length) {
+    const tok = polygon[i];
+    if (typeof tok === "number" && typeof polygon[i + 1] === "number") {
+      curX = tok;
+      curY = polygon[i + 1];
+      pts.push({ x: curX, y: curY });
+      i += 2;
+      continue;
+    }
+    const kind = typeof tok === "string" ? tok.toUpperCase() : "";
+    if (kind === "L") {
+      i += 1;
+      continue;
+    }
+    if (kind === "C") {
+      const c1x = Number(polygon[i + 1]), c1y = Number(polygon[i + 2]);
+      const c2x = Number(polygon[i + 3]), c2y = Number(polygon[i + 4]);
+      const ex = Number(polygon[i + 5]), ey = Number(polygon[i + 6]);
+      const sx = curX, sy = curY;
+      for (let k = 1; k <= 8; k++) {
+        const t = k / 8, u = 1 - t;
+        pts.push({
+          x: u * u * u * sx + 3 * u * u * t * c1x + 3 * u * t * t * c2x + t * t * t * ex,
+          y: u * u * u * sy + 3 * u * u * t * c1y + 3 * u * t * t * c2y + t * t * t * ey
+        });
+      }
+      curX = ex;
+      curY = ey;
+      i += 7;
+      continue;
+    }
+    if (kind === "ARC" || kind === "CARC") {
+      const angle = (Number(polygon[i + 1]) || 0) * Math.PI / 180;
+      const ex = Number(polygon[i + 2]), ey = Number(polygon[i + 3]);
+      const sx = curX, sy = curY;
+      const chord = Math.hypot(ex - sx, ey - sy);
+      if (chord > 1e-6 && Math.abs(Math.sin(angle / 2)) > 1e-6) {
+        const R = chord / (2 * Math.abs(Math.sin(angle / 2)));
+        const sgn = angle > 0 ? 1 : -1;
+        const hh = sgn * R * Math.cos(angle / 2);
+        const nx = -(ey - sy) / chord, ny = (ex - sx) / chord;
+        const ccx = (sx + ex) / 2 + hh * nx, ccy = (sy + ey) / 2 + hh * ny;
+        const a0 = Math.atan2(sy - ccy, sx - ccx);
+        const steps = Math.max(2, Math.ceil(Math.abs(angle) / ARC_STEP));
+        for (let k = 1; k <= steps; k++) {
+          const a = a0 + angle * k / steps;
+          pts.push({ x: ccx + R * Math.cos(a), y: ccy + R * Math.sin(a) });
+        }
+      } else {
+        pts.push({ x: ex, y: ey });
+      }
+      curX = ex;
+      curY = ey;
+      i += 4;
+      continue;
+    }
+    i += 1;
+  }
+  return pts;
+}
+
 // src/router/rubberband-engine.ts
 function capsuleToCircles(x1, y1, x2, y2, r) {
   const len = Math.hypot(x2 - x1, y2 - y1);
@@ -81,7 +170,9 @@ var FALLBACK_DRC_RULES = {
   trackToLineMil: FALLBACK_CLEARANCE_MIL,
   trackToBoardMil: 12,
   trackToPadMil: FALLBACK_CLEARANCE_MIL,
-  trackToFillMil: FALLBACK_CLEARANCE_MIL
+  trackToFillMil: FALLBACK_CLEARANCE_MIL,
+  holeToHoleMil: 12
+  // JLC 标准钻孔边距 0.3mm ≈ 11.8mil，取整 12
 };
 function ruleValueToMil(value, unit) {
   switch (String(unit ?? "mm").toLowerCase()) {
@@ -145,6 +236,15 @@ async function fetchDRCRules(onLog) {
         traceWidthMm = tw;
       trackUnit = trackRules[defaultKey]?.unit;
     }
+    let holeToHoleMm = 0.3;
+    {
+      const other = cfg?.Spacing?.["Other Spacing"];
+      const ocKey = other ? Object.keys(other).find((k) => other[k]?.isSetDefault) ?? Object.keys(other)[0] : void 0;
+      const oc = ocKey ? other[ocKey] : void 0;
+      const v = oc?.form?.hole2Hole;
+      if (typeof v === "number" && v > 0)
+        holeToHoleMm = v;
+    }
     const rules = {
       traceWidthMil: ruleValueToMil(traceWidthMm, trackUnit),
       clearanceMil: Math.max(
@@ -155,7 +255,8 @@ async function fetchDRCRules(onLog) {
       trackToLineMil: ruleValueToMil(trackToLineMm, spacingUnit),
       trackToBoardMil: ruleValueToMil(trackToBoardMm, spacingUnit),
       trackToPadMil: ruleValueToMil(trackToPadMm, spacingUnit),
-      trackToFillMil: ruleValueToMil(trackToFillMm, spacingUnit)
+      trackToFillMil: ruleValueToMil(trackToFillMm, spacingUnit),
+      holeToHoleMil: ruleValueToMil(holeToHoleMm, "mm")
     };
     onLog?.(
       `DRC \u89C4\u5219\uFF1A\u7EBF\u5BBD ${rules.traceWidthMil.toFixed(2)}mil\uFF0CTrack \u95F4\u8DDD ${rules.trackToTrackMil.toFixed(2)}mil\uFF0CPad \u95F4\u8DDD ${rules.trackToPadMil.toFixed(2)}mil\uFF0C\u677F\u6846\u95F4\u8DDD ${rules.trackToBoardMil.toFixed(2)}mil`,
@@ -223,30 +324,7 @@ async function ensurePcbTab(timeoutMs = 6e4) {
     await sleep(500);
   }
 }
-function parsePath(polygon) {
-  if (!polygon || polygon.length < 3)
-    return [];
-  if (polygon[0] === "R" && polygon.length >= 5) {
-    const x = polygon[1], y = polygon[2], w = polygon[3], h = polygon[4];
-    return [
-      { x, y: y - h },
-      { x: x + w, y: y - h },
-      { x: x + w, y },
-      { x, y },
-      { x, y: y - h }
-    ];
-  }
-  const pts = [];
-  let i = 0;
-  while (i < polygon.length) {
-    if (typeof polygon[i] === "number" && typeof polygon[i + 1] === "number") {
-      pts.push({ x: polygon[i], y: polygon[i + 1] });
-      i += 2;
-    } else
-      i++;
-  }
-  return pts;
-}
+var parsePath = parsePolygonPath;
 async function dumpInput(opts = {}) {
   const eda2 = globalThis.eda;
   const drc = await fetchDRCRules();
@@ -277,7 +355,7 @@ async function dumpInput(opts = {}) {
       const netPads = [];
       for (const prim of primitives) {
         const p = prim;
-        if (p.type !== void 0 && p.type !== 1)
+        if (p.type !== void 0 && p.type !== 1 && p.type !== 2)
           continue;
         const x = p.center?.x ?? p.x ?? p.startX ?? 0;
         const y = p.center?.y ?? p.y ?? p.startY ?? 0;
@@ -292,6 +370,26 @@ async function dumpInput(opts = {}) {
         }
         const hole = p.hole ?? p.holeAspect ?? [];
         const holeMil = Array.isArray(hole) && hole.length >= 2 ? hole[1] ?? 0 : 0;
+        if (wMil === 0 && hMil === 0) {
+          const cached = padShapes[`${x.toFixed(2)},${y.toFixed(2)}`];
+          let shape = cached?.pad;
+          if (!Array.isArray(shape)) {
+            let best = null, bd = 2;
+            for (const k of Object.keys(padShapes)) {
+              const [kx, ky] = k.split(",").map(Number);
+              const dd = Math.hypot(kx - x, ky - y);
+              if (dd < bd) {
+                bd = dd;
+                best = padShapes[k].pad;
+              }
+            }
+            shape = best;
+          }
+          if (Array.isArray(shape) && shape.length >= 3) {
+            wMil = shape[1] ?? 0;
+            hMil = shape[2] ?? 0;
+          }
+        }
         if (wMil === 0 && hMil === 0) {
           wMil = 32;
           hMil = 34;
@@ -354,6 +452,19 @@ async function dumpInput(opts = {}) {
     const l = line;
     const net = l.net ?? "";
     const layer = l.layerId ?? l.layer ?? 1;
+    if (layer === 11) {
+      const lw2 = l.lineWidth ?? 10;
+      const r2 = lw2 / 2 + drc.trackToBoardMil + drc.traceWidthMil / 2;
+      obstacles.push(...buildPolylineObstacle(
+        [{ x: l.startX ?? 0, y: l.startY ?? 0 }, { x: l.endX ?? 0, y: l.endY ?? 0 }],
+        r2,
+        void 0,
+        void 0,
+        "board",
+        true
+      ));
+      continue;
+    }
     if (layer !== 1 && layer !== 2 && layer !== 12)
       continue;
     const lw = l.lineWidth ?? 10;
@@ -365,6 +476,38 @@ async function dumpInput(opts = {}) {
       layer,
       `line:${l.primitiveId ?? ""}`
     ));
+  }
+  const arcs = await eda2.pcb_PrimitiveArc.getAll();
+  for (const arc of arcs ?? []) {
+    const o = arc;
+    const net = o.net ?? "";
+    const layer = o.layerId ?? o.layer ?? 1;
+    const lw = o.lineWidth ?? 10;
+    const sx = o.startX ?? 0, sy = o.startY ?? 0;
+    const ex = o.endX ?? 0, ey = o.endY ?? 0;
+    const sweep = (o.arcAngle ?? 0) * Math.PI / 180;
+    const L = Math.hypot(ex - sx, ey - sy);
+    if (!sweep || Math.abs(Math.sin(sweep / 2)) < 1e-6 || L < 1e-6)
+      continue;
+    const R = L / (2 * Math.abs(Math.sin(sweep / 2)));
+    const sgn = sweep > 0 ? 1 : -1;
+    const h = sgn * R * Math.cos(sweep / 2);
+    const nx = -(ey - sy) / L, ny = (ex - sx) / L;
+    const cx = (sx + ex) / 2 + h * nx, cy = (sy + ey) / 2 + h * ny;
+    const a0 = Math.atan2(sy - cy, sx - cx);
+    const pts = [];
+    const steps = Math.max(6, Math.ceil(Math.abs(sweep) / (Math.PI / 12)));
+    for (let k = 0; k <= steps; k++) {
+      const ang = a0 + Math.abs(sweep) * k / steps * sgn;
+      pts.push({ x: cx + R * Math.cos(ang), y: cy + R * Math.sin(ang) });
+    }
+    if (layer === 11) {
+      const r = lw / 2 + drc.trackToBoardMil + drc.traceWidthMil / 2;
+      obstacles.push(...buildPolylineObstacle(pts, r, void 0, void 0, "board", true));
+    } else if (layer === 1 || layer === 2 || layer === 12) {
+      const r = lw / 2 + lineClear + drc.traceWidthMil / 2 + 2;
+      obstacles.push(...buildPolylineObstacle(pts, r, net || void 0, layer, `arc:${sx.toFixed(0)},${sy.toFixed(0)}`));
+    }
   }
   const fills = await eda2.pcb_PrimitiveFill.getAll();
   for (const fill of fills ?? []) {
@@ -380,6 +523,27 @@ async function dumpInput(opts = {}) {
     if (pts.length >= 3) {
       obstacles.push(...buildPolygonObstacle(pts, r, net || void 0, layer, `fill:${pts[0]?.x},${pts[0]?.y}`, true));
     }
+  }
+  const viaPrims = await eda2.pcb_PrimitiveVia.getAll();
+  const viaClear = Math.max(drc.trackToTrackMil, drc.trackToPadMil);
+  for (const v of viaPrims ?? []) {
+    const vp = v;
+    const vx = vp.x ?? vp.center?.x;
+    const vy = vp.y ?? vp.center?.y;
+    if (typeof vx !== "number" || typeof vy !== "number")
+      continue;
+    const dia = Number(vp.diameter) || 24;
+    obstacles.push({
+      id: "via" + obstacles.length,
+      kind: "circle",
+      x: vx,
+      y: vy,
+      r: dia / 2 + viaClear + drc.traceWidthMil / 2 + 0.1,
+      net: vp.net || void 0,
+      layer: void 0,
+      group: "via:" + (vp.net ?? "") + ":" + vx.toFixed(1) + "," + vy.toFixed(1),
+      noPrune: true
+    });
   }
   let copperLayers = 2;
   try {

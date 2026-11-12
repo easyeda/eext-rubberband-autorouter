@@ -86,6 +86,19 @@ export async function tightenExisting(): Promise<void> {
 }
 
 /** 把最终统计推给弹窗（弹窗转「关闭」态） */
-function sendDone(bridge: DialogBridge, res: { nets: number; changed: number; savedMil: number }): void {
-	bridge.send('tighten', { type: 'done', total: res.nets, changed: res.changed, savedMil: res.savedMil });
+function sendDone(
+	bridge: DialogBridge,
+	res: {
+		nets: number; total: number; changed: number; savedMil: number;
+		failed?: number; aborted?: boolean; cancelled?: boolean; issues?: unknown[]; message?: string;
+	},
+): void {
+	// total / changed 都是「段」数（与弹窗文案「x/y 段有改善」同口径，changed ≤ total），nets 只是涉及的网络数；
+	// aborted = 因回写失败中止；cancelled = 用户停止（aborted 优先）；issues = 画布与模型不一致的处数（未恢复 + 结束核对，已去重），
+	// message 为如实汇报文案（含失败段数、是否已恢复、不一致处坐标）
+	bridge.send('tighten', {
+		type: 'done', total: res.total, nets: res.nets, changed: res.changed, savedMil: res.savedMil,
+		failed: res.failed ?? 0, aborted: !!res.aborted, cancelled: !!res.cancelled,
+		issues: res.issues?.length ?? 0, message: res.message ?? '',
+	});
 }

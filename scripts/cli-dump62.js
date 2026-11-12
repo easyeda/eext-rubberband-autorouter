@@ -2,10 +2,11 @@
 // 依赖 bundle：node scripts/build-eda-dump.mjs 生成（复用生产源码的障碍/规则构建器）
 //
 // 分块返回协议（结果可能超 CLI 单次响应 8MB 上限）：
-//   invoke #1（无 args 或 mode='compute'）：计算 dump，JSON 串切块存 globalThis，
+//   invoke #1（--args '{"mode":"compute","bundlePath":"<bundle 绝对路径>"}'）：计算 dump，JSON 串切块存 globalThis，
 //     返回 { token, chunkCount, totalChars, totalPads, added, nets }
+//     bundlePath 必须是 EDA 进程能读到的 scripts/eda-dump-bundle.mjs 绝对路径（由 batch-dump-all.mjs 传入，正斜杠）
 //   invoke #2..N（--args '{"mode":"chunk","token":"...","i":N}'）：返回 { data, done }
-const bundlePath = 'D:/教程/easyeda-docs/github-eext/eext-rubberband-autorouter/scripts/eda-dump-bundle.mjs';
+// 注意：本文件在 EDA 编辑器内作为 async 函数体执行（顶层 return/await 合法），不能用 node 直接运行
 const args = (typeof __CLI__ !== 'undefined' && __CLI__.args) || {};
 
 if (args.mode === 'chunk') {
@@ -14,12 +15,16 @@ if (args.mode === 'chunk') {
 	return { data: store.chunks[args.i], done: args.i >= store.chunks.length - 1 };
 }
 
+const bundlePath = args.bundlePath;
+if (!bundlePath) throw new Error('compute 模式缺少 args.bundlePath（应传 scripts/eda-dump-bundle.mjs 的绝对路径，见 batch-dump-all.mjs）');
 const file = await eda.sys_FileSystem.readFileFromFileSystem(bundlePath);
 if (!file) throw new Error('读不到 dump bundle：' + bundlePath);
 const buf = new Uint8Array(await file.arrayBuffer());
 let bin = '';
 for (let i = 0; i < buf.length; i += 0x8000) bin += String.fromCharCode.apply(null, buf.subarray(i, i + 0x8000));
-const mod = await import('data:text/javascript;base64,' + btoa(unescape(encodeURIComponent(bin))));
+// bin 已是按字节拼出的字符串（每个字符 = 一个字节），直接 btoa 即可；
+// 再套 unescape(encodeURIComponent()) 会把非 ASCII 字节二次 UTF-8 编码导致 bundle 里的中文损坏
+const mod = await import('data:text/javascript;charset=utf-8;base64,' + btoa(bin));
 mod.setup(eda);
 await mod.ensurePcbTab();
 

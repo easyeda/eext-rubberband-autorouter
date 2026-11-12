@@ -1,6 +1,8 @@
 // 批量离线布线 + AI 可检查结果输出（不启动 EDA）
-// 用法: node tmp/batch-route-all.mjs [--budget 毫秒] [--filter <子串>] [--limit N] [--redump]
-//  - 读 tmp/dumps/*-dump.json（structVersion 不匹配时警告；--redump 自动重导该工程）
+// 用法: node scripts/batch-route-all.mjs [--budget 毫秒] [--filter <子串>] [--limit N] [--redump] [--data-root <目录>]
+//  - 读 <data-root>/tmp/dumps/*-dump.json（structVersion 不匹配时警告；--redump 自动重导该工程；
+//    source 为 epcb2-offline 的 dump 用 epcb2-to-dump.mjs 重新生成，其余走 batch-dump-all.mjs）
+//  - --data-root（或环境变量 RB_DATA_ROOT）: tmp/ 所在目录，默认仓库根；git worktree 里跑时指向主检出目录
 //  - 每工程输出两个文件（tmp/results/<case名>/）：
 //      digest.json  = AI 专用微型摘要（<5KB）：布通率/失败网/DRC top10/接缝缺陷/部分网清单
 //                     ⚠ AI 检查结果只许读 digest.json 与 _summary.json，禁止整读 result.json
@@ -10,11 +12,12 @@ import * as esbuild from 'esbuild';
 import * as fs from 'fs';
 import * as path from 'path';
 import { fileURLToPath } from 'url';
-import { spawnSync, spawn as nodeSpawn } from 'child_process';
+import { spawn as nodeSpawn } from 'child_process';
 import { STRUCT_VERSION } from './struct-version.mjs';
+import { ROOT, DATA_ROOT } from './lceda-cli.mjs';
 
 // 与 batch-dump-all.mjs 同源的 STRUCT_VERSION（单一来源）；不匹配的 dump 会被跳过/重导
-const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
+const SCRIPTS_DIR = path.dirname(fileURLToPath(import.meta.url));
 
 const argOf = (k, dflt) => {
 	const i = process.argv.indexOf(k);
@@ -30,33 +33,26 @@ const onlySet = onlyArg ? new Set(onlyArg.split('|')) : null;
 // --reaudit：不重跑引擎，用既有 result.json + dump 重算 DRC/接缝审计并刷新 digest
 const reaudit = process.argv.includes('--reaudit');
 
-const dumpsDir = path.join(ROOT, 'tmp', 'dumps');
-const resultsDir = path.join(ROOT, 'tmp', 'results');
+const dumpsDir = path.join(DATA_ROOT, 'tmp', 'dumps');
+const resultsDir = path.join(DATA_ROOT, 'tmp', 'results');
 
 let dumps = fs.readdirSync(dumpsDir).filter(f => f.endsWith('-dump.json')).map(f => f.replace(/-dump\.json$/, ''));
 if (filter) dumps = dumps.filter(n => n.includes(filter));
 if (onlySet) dumps = dumps.filter(n => onlySet.has(n));
 dumps.sort();
 
-function cli(args, timeoutMs = 60000) {
-	const r = spawnSync('lceda-pro', args, { timeout: timeoutMs, maxBuffer: 256 * 1024 * 1024, encoding: 'utf8' });
-	const out = (r.stdout ?? '').trim();
-	const jsonLine = out.split('\n').reverse().find(l => l.trimStart().startsWith('{'));
-	let parsed = null;
-	try { parsed = jsonLine ? JSON.parse(jsonLine) : null; } catch { /* 非 JSON */ }
-	return { json: parsed };
-}
 function spawn(cmd, args) {
 	return new Promise((resolve) => {
 		const p = nodeSpawn(cmd, args, { stdio: 'inherit' });
-		p.on('exit', () => resolve());
+		p.on('exit', (code) => resolve(code));
+		p.on('error', () => resolve(-1));
 	});
 }
 
 import { drcAudit, jointAudit } from './audit-lib.mjs';
 
 const built = await esbuild.build({
-	entryPoints: ['src/router/planning-engine.ts'],
+	entryPoints: [path.join(ROOT, 'src/router/planning-engine.ts')],
 	bundle: true, format: 'esm', write: false, platform: 'neutral',
 });
 (globalThis).__RB_VERBOSE__ = false;
@@ -110,8 +106,15 @@ for (const name of dumps) {
 	if (wrapped.structVersion !== STRUCT_VERSION) {
 		if (redump) {
 			console.error(`[${idx}/${dumps.length}] ${name}: dump 过期（${wrapped.structVersion ?? 1} ≠ ${STRUCT_VERSION}），重新导出...`);
-			await spawn('node', ['tmp/batch-dump-all.mjs', '--filter', name, '--force']);
-			wrapped = JSON.parse(fs.readFileSync(dumpFile, 'utf8'));
+			// 离线转换得到的 dump（source:"epcb2-offline"）不能交给 EDA 导出器：用转换器按同名工程重新生成
+			if (wrapped.source === 'epcb2-offline') {
+				console.error(`[${idx}/${dumps.length}] ${name}: 来源为 epcb2-offline，改用 epcb2-to-dump.mjs 重新生成`);
+				const code = await spawn(process.execPath, [path.join(SCRIPTS_DIR, 'epcb2-to-dump.mjs'), '--case', name, '--data-root', DATA_ROOT]);
+				if (code !== 0) { summary.push({ case: name, status: 'redumpFailed' }); continue; }
+			} else {
+				await spawn(process.execPath, [path.join(SCRIPTS_DIR, 'batch-dump-all.mjs'), '--filter', name, '--force', '--data-root', DATA_ROOT]);
+			}
+			try { wrapped = JSON.parse(fs.readFileSync(dumpFile, 'utf8')); } catch { summary.push({ case: name, status: 'dumpBroken' }); continue; }
 			if (wrapped.structVersion !== STRUCT_VERSION) { summary.push({ case: name, status: 'staleDump' }); continue; }
 		} else {
 			console.error(`[${idx}/${dumps.length}] ${name}: dump 结构版本 ${wrapped.structVersion ?? 1} ≠ ${STRUCT_VERSION}，跳过（--redump 自动重导）`);

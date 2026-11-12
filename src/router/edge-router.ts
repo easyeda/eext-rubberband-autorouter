@@ -17,6 +17,7 @@ import {
 	RBObstacle, RBPrimitive, fanoutFillet,
 } from './rubberband-engine';
 import { routeBetweenEndpoints, validatePrimsAgainst } from './visibility-router';
+import { ObstacleIndex } from './spatial-index';
 
 /** 焊盘铜皮轮廓圆（相对焊盘中心） */
 export interface PadOutline {
@@ -161,6 +162,7 @@ export function buildPadKeepout(pad: PadTerminal, layer?: number): RBObstacle[] 
  */
 export function stubFeasible(
 	pad: PadTerminal, x2: number, y2: number, obstacles: RBObstacle[], net: string,
+	index?: ObstacleIndex<RBObstacle>,
 ): boolean {
 	const dx = x2 - pad.x, dy = y2 - pad.y;
 	const len = Math.hypot(dx, dy);
@@ -187,29 +189,48 @@ export function stubFeasible(
 		t1 = Math.min(len, t1);
 		return t1 - t0 < 0.01 ? null : [t0, t1];
 	};
-	for (const o of obstacles) {
-		if (o.soft) continue;                // 辅助建图圆（弧外包络）不阻挡
-		if (o.net === net) continue;
-		if (o.forceBlock) continue;          // 本体禁行区（自己的焊盘）
-		const r = o.r - 0.02;
-		if (o.kind !== 'capsule') {
-			const iv = rayInterval(o.x, o.y, r);
-			if (iv && iv[1] > exit) return false;
-			continue;
+	// 引出段包围盒：只有包围盒与之相交的障碍才可能与线段相交（圆/胶囊 ± o.r 为上界，
+	// 1e-6 吸收浮点误差）。index（必须是 obstacles 的索引）只用来缩小候选集，
+	// 结果是「任一障碍侵入」的布尔或，与遍历顺序无关 → 与线性扫描完全一致。
+	const sx0 = Math.min(pad.x, x2) - 1e-6, sx1 = Math.max(pad.x, x2) + 1e-6;
+	const sy0 = Math.min(pad.y, y2) - 1e-6, sy1 = Math.max(pad.y, y2) + 1e-6;
+	const scan = (list: RBObstacle[]): boolean => {
+		for (const o of list) {
+			if (o.soft) continue;                // 辅助建图圆（弧外包络）不阻挡
+			if (o.net === net) continue;
+			if (o.forceBlock) continue;          // 本体禁行区（自己的焊盘）
+			const r = o.r - 0.02;
+			if (o.kind !== 'capsule') {
+				const ar = Math.abs(r);
+				if (o.x + ar < sx0 || o.x - ar > sx1 || o.y + ar < sy0 || o.y - ar > sy1) continue;
+				const iv = rayInterval(o.x, o.y, r);
+				if (iv && iv[1] > exit) return false;
+				continue;
+			}
+			// 胶囊（走线障碍）：沿轴采样成圆链逐个判定——旧实现只查锚点圆，
+			// 引出段从胶囊中段贴过完全漏检（实测 LCD 密排区 10 处 trk-trk）
+			const ox1 = o.x1 ?? o.x, oy1 = o.y1 ?? o.y;
+			const ox2 = o.x2 ?? ox1, oy2 = o.y2 ?? oy1;
+			const segLen = Math.hypot(ox2 - ox1, oy2 - oy1);
+			const steps = Math.min(64, Math.max(1, Math.ceil(segLen / Math.max(0.9 * r, 0.5))));
+			for (let s = 0; s <= steps; s++) {
+				const t = s / steps;
+				const iv = rayInterval(ox1 + (ox2 - ox1) * t, oy1 + (oy2 - oy1) * t, r);
+				if (iv && iv[1] > exit) return false;
+			}
 		}
-		// 胶囊（走线障碍）：沿轴采样成圆链逐个判定——旧实现只查锚点圆，
-		// 引出段从胶囊中段贴过完全漏检（实测 LCD 密排区 10 处 trk-trk）
-		const ox1 = o.x1 ?? o.x, oy1 = o.y1 ?? o.y;
-		const ox2 = o.x2 ?? ox1, oy2 = o.y2 ?? oy1;
-		const segLen = Math.hypot(ox2 - ox1, oy2 - oy1);
-		const steps = Math.min(64, Math.max(1, Math.ceil(segLen / Math.max(0.9 * r, 0.5))));
-		for (let s = 0; s <= steps; s++) {
-			const t = s / steps;
-			const iv = rayInterval(ox1 + (ox2 - ox1) * t, oy1 + (oy2 - oy1) * t, r);
-			if (iv && iv[1] > exit) return false;
-		}
+		return true;
+	};
+	if (!index) return scan(obstacles);
+	const res = scan(index.near(sx0, sy0, sx1, sy1));
+	if ((globalThis as any).__RB_VERIFY_INDEX__) {
+		const cnt = ((globalThis as any).__RB_VERIFY_COUNT__ ??= {}) as Record<string, number>;
+		cnt.stubFeasible = (cnt.stubFeasible ?? 0) + 1;
 	}
-	return true;
+	if ((globalThis as any).__RB_VERIFY_INDEX__ && res !== scan(obstacles)) {
+		throw new Error(`[RB_VERIFY_INDEX] stubFeasible mismatch pad(${pad.x},${pad.y})->(${x2},${y2}) idx=${res}`);
+	}
+	return res;
 }
 
 /** 两个图元之间插入圆角（仅处理 直线→直线） */

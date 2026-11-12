@@ -92,56 +92,189 @@ interface Cell {
 	layer: number;
 }
 
-const D8: Array<[number, number, number]> = [
-	[1, 0, 1], [-1, 0, 1], [0, 1, 1], [0, -1, 1],
-	[1, 1, Math.SQRT2], [1, -1, Math.SQRT2], [-1, 1, Math.SQRT2], [-1, -1, Math.SQRT2],
-];
+/** Math.hypot 的整数格差查表缓存（惰性填充，值就是 Math.hypot(|a|,|b|) 本身，
+ * 逐位一致；Math.hypot 在 V8 里是热点 builtin，A* 每个邻格要调 2 次）。 */
+const HYP_N = 1024;
+let hypTab: Float64Array | null = null;
+function hyp(a: number, b: number): number {
+	if (a < 0) a = -a;
+	if (b < 0) b = -b;
+	if (a < HYP_N && b < HYP_N) {
+		if (hypTab === null) hypTab = new Float64Array(HYP_N * HYP_N).fill(NaN);
+		const k = a * HYP_N + b;
+		let v = hypTab[k];
+		if (v !== v) { v = Math.hypot(a, b); hypTab[k] = v; }
+		return v;
+	}
+	return Math.hypot(a, b);
+}
 
-/** 最小堆（二叉堆，按 f 值） */
+const D8DX = new Int8Array([1, -1, 0, 0, 1, 1, -1, -1]);
+const D8DY = new Int8Array([0, 0, 1, -1, 1, -1, 1, -1]);
+/** LOS 清距跳采样：清距 c（格）→ 可安全跳过的后续样本数 m（0.4m 取整位移 ≤ c-1，留 1e-6 余量） */
+const LOS_JUMP = new Int32Array(256);
+for (let c = 1; c < 256; c++) LOS_JUMP[c] = Math.max(0, Math.floor(2.5 * (c - 1) - 1e-6));
+const D8W = new Float64Array([1, 1, 1, 1, Math.SQRT2, Math.SQRT2, Math.SQRT2, Math.SQRT2]);
+
+/** 最小堆（二叉堆，按 f 值）。typed array + 空穴下沉：比较序列与逐次交换版
+ * 完全一致（同键入堆顺序 → 同弹出顺序），只省掉 push/pop 与交换的开销。 */
 class MinHeap {
-	private keys: number[] = [];
-	private vals: number[] = [];
+	private keys = new Float64Array(4096);
+	private vals = new Int32Array(4096);
+	private n = 0;
 
-	get size(): number { return this.keys.length; }
+	get size(): number { return this.n; }
+
+	clear(): void { this.n = 0; }
 
 	push(key: number, val: number): void {
-		this.keys.push(key);
-		this.vals.push(val);
-		let i = this.keys.length - 1;
-		while (i > 0) {
-			const p = (i - 1) >> 1;
-			if (this.keys[p] <= this.keys[i]) break;
-			this.swap(p, i);
-			i = p;
+		let n = this.n;
+		if (n === this.keys.length) {
+			const nk = new Float64Array(n * 2); nk.set(this.keys); this.keys = nk;
+			const nv = new Int32Array(n * 2); nv.set(this.vals); this.vals = nv;
 		}
+		const keys = this.keys, vals = this.vals;
+		this.n = n + 1;
+		while (n > 0) {
+			const p = (n - 1) >> 1;
+			if (keys[p] <= key) break;
+			keys[n] = keys[p];
+			vals[n] = vals[p];
+			n = p;
+		}
+		keys[n] = key;
+		vals[n] = val;
 	}
 
 	pop(): number {
-		const top = this.vals[0];
-		const lastKey = this.keys.pop()!;
-		const lastVal = this.vals.pop()!;
-		if (this.keys.length) {
-			this.keys[0] = lastKey;
-			this.vals[0] = lastVal;
+		const keys = this.keys, vals = this.vals;
+		const top = vals[0];
+		const n = --this.n;
+		if (n > 0) {
+			const key = keys[n], val = vals[n];
 			let i = 0;
 			for (;;) {
-				const l = i * 2 + 1, r = l + 1;
-				let m = i;
-				if (l < this.keys.length && this.keys[l] < this.keys[m]) m = l;
-				if (r < this.keys.length && this.keys[r] < this.keys[m]) m = r;
+				const l = i * 2 + 1;
+				if (l >= n) break;
+				const r = l + 1;
+				let m = i, mk = key;
+				if (keys[l] < mk) { m = l; mk = keys[l]; }
+				if (r < n && keys[r] < mk) { m = r; mk = keys[r]; }
 				if (m === i) break;
-				this.swap(m, i);
+				keys[i] = keys[m];
+				vals[i] = vals[m];
 				i = m;
 			}
+			keys[i] = key;
+			vals[i] = val;
 		}
 		return top;
 	}
+}
 
-	private swap(a: number, b: number): void {
-		const k = this.keys[a]; this.keys[a] = this.keys[b]; this.keys[b] = k;
-		const v = this.vals[a]; this.vals[a] = this.vals[b]; this.vals[b] = v;
+/**
+ * 每次调用都要的大块临时数组（占据图、g/父链/闭集、Lazy Theta 缓存……最多
+ * 每层 1.2M 格）。模块级池复用，避免每次分配 + 填充 + GC。
+ * 不变量：搜索类数组（gScore/cameFrom/closed/lazyParent/lazyG/goalMark）在
+ * 两次调用之间始终是「初始值」——搜索期间记录被写过的格（touched），调用结束
+ * 只还原这些格；占据类数组（blocked/viaBlocked/penalty/stamp）每次按 total
+ * 清零。异常退出 → dirty，下次整体重填。
+ */
+class GridScratch {
+	cap = 0;
+	busy = false;
+	dirty = false;
+	searching = false;
+	nt = 0;
+	goalIds: number[] = [];
+	blocked = new Uint8Array(0);
+	viaBlocked = new Uint8Array(0);
+	penalty = new Float32Array(0);
+	stamp = new Int32Array(0);
+	gScore = new Float64Array(0);
+	lazyG = new Float64Array(0);
+	cameFrom = new Int32Array(0);
+	lazyParent = new Int32Array(0);
+	closed = new Uint8Array(0);
+	goalMark = new Uint8Array(0);
+	touched = new Int32Array(0);
+	clr = new Uint8Array(0);
+	vis = new Uint8Array(0);
+	qa = new Int32Array(0);
+	qb = new Int32Array(0);
+	heap = new MinHeap();
+
+	ensure(total: number): void {
+		if (total <= this.cap && !this.dirty) return;
+		if (total > this.cap) {
+			const cap = Math.max(total, Math.ceil(this.cap * 1.25));
+			this.cap = cap;
+			this.blocked = new Uint8Array(cap);
+			this.viaBlocked = new Uint8Array(0);
+			this.penalty = new Float32Array(0);
+			this.stamp = new Int32Array(0);
+			this.gScore = new Float64Array(cap);
+			this.lazyG = new Float64Array(cap);
+			this.cameFrom = new Int32Array(cap);
+			this.lazyParent = new Int32Array(cap);
+			this.closed = new Uint8Array(cap);
+			this.goalMark = new Uint8Array(cap);
+			this.touched = new Int32Array(cap);
+			this.clr = new Uint8Array(0);
+			this.vis = new Uint8Array(0);
+			this.qa = new Int32Array(0);
+			this.qb = new Int32Array(0);
+		}
+		this.gScore.fill(Infinity); this.lazyG.fill(Infinity);
+		this.cameFrom.fill(-1); this.lazyParent.fill(-1);
+		this.closed.fill(0); this.goalMark.fill(0);
+		this.dirty = false;
+		this.searching = false;
+	}
+
+	/** 取清零后的 total 长度占据类数组（按需分配） */
+	zeroed<T extends Uint8Array | Float32Array | Int32Array>(
+		key: 'viaBlocked' | 'penalty' | 'stamp', total: number, ctor: new (n: number) => T,
+	): T {
+		let arr = this[key] as unknown as T;
+		if (arr.length < total) { arr = new ctor(this.cap); (this as unknown as Record<string, unknown>)[key] = arr; }
+		else arr.fill(0, 0, total);
+		return arr;
+	}
+
+	/** LOS 清距用：按 total 取（内容由调用方逐层完整覆写，无需清零） */
+	clearance(total: number): Uint8Array {
+		if (this.clr.length < total) this.clr = new Uint8Array(this.cap);
+		return this.clr;
+	}
+
+	/** 可达性 BFS 用：vis 清零，队列备好 */
+	bfsBuffers(total: number): void {
+		if (this.vis.length < total) { this.vis = new Uint8Array(this.cap); this.qa = new Int32Array(this.cap); this.qb = new Int32Array(this.cap); }
+		else this.vis.fill(0, 0, total);
+	}
+
+	/** 调用结束：只还原搜索期间写过的格 */
+	finish(): void {
+		if (this.searching) {
+			const t = this.touched, n = this.nt;
+			if (n * 4 > this.cap) {
+				this.gScore.fill(Infinity); this.lazyG.fill(Infinity);
+				this.cameFrom.fill(-1); this.lazyParent.fill(-1); this.closed.fill(0);
+			} else {
+				const g = this.gScore, lg = this.lazyG, cf = this.cameFrom, lp = this.lazyParent, cl = this.closed;
+				for (let k = 0; k < n; k++) {
+					const id = t[k];
+					g[id] = Infinity; lg[id] = Infinity; cf[id] = -1; lp[id] = -1; cl[id] = 0;
+				}
+			}
+			this.searching = false;
+		}
+		for (const id of this.goalIds) this.goalMark[id] = 0;
+		this.goalIds.length = 0;
 	}
 }
+const POOL = new GridScratch();
 
 /**
  * 网格求解统计（离线基准 / 现场日志共用）：
@@ -176,6 +309,21 @@ export async function gridRoute(req: GridRouteRequest): Promise<GridRouteResult>
 }
 
 async function gridRouteInner(req: GridRouteRequest): Promise<GridRouteResult> {
+	// 求解体内无 await（同步跑完），池不会被交错使用；busy 仅为防御重入
+	const sc = POOL.busy ? new GridScratch() : POOL;
+	sc.busy = true;
+	try {
+		return gridRouteCore(req, sc);
+	} catch (e) {
+		sc.dirty = true;
+		throw e;
+	} finally {
+		sc.finish();
+		sc.busy = false;
+	}
+}
+
+function gridRouteCore(req: GridRouteRequest, sc: GridScratch): GridRouteResult {
 	const fail: GridRouteResult = { ok: false, prims: [], vias: [], cell: req.cell ?? 8 };
 	if (!req.layers.length) return fail;
 	const { src, dst } = req;
@@ -220,11 +368,13 @@ async function gridRouteInner(req: GridRouteRequest): Promise<GridRouteResult> {
 	const __tRaster = Date.now();
 	// 半单元外扩：保证相邻自由格中心之间的线段不切进障碍圆
 	const inflate = cell * 0.5;
-	const blocked = new Uint8Array(total);
+	sc.ensure(total);
+	sc.blocked.fill(0, 0, total);
+	const blocked = sc.blocked;
 	// 过孔落点网格：比走线多要求 viaExtraMil 的净空。只有层间跳变的格点
 	// 需要它（见 A* 的 via 边），普通走线不看。
 	const viaExtra = Math.max(0, req.viaExtraMil ?? 0);
-	const viaBlocked = viaExtra > 0 ? new Uint8Array(total) : null;
+	const viaBlocked = viaExtra > 0 ? sc.zeroed('viaBlocked', total, Uint8Array) : null;
 	const layerIndex = new Map<number, number>();
 	req.layers.forEach((l, i) => layerIndex.set(l, i));
 
@@ -272,6 +422,22 @@ async function gridRouteInner(req: GridRouteRequest): Promise<GridRouteResult> {
 		}
 	};
 
+	// 窗口外障碍的纯跳过：圆/胶囊的包围盒（外扩到最大影响半径 + 1 格 + 1mil 余量）
+	// 与网格范围不相交时，markCircle 的任何一个采样圆都不可能标到格子（格心
+	// 都在窗口内），整段逐格循环可省；`marked` 计数口径不变（仍按过滤后的障碍计）。
+	const gx1 = x0 + (nx - 1) * cell, gy1 = y0 + (ny - 1) * cell;
+	const reachExtra = inflate + Math.max(0, viaExtra, req.viaExtraPadMil ?? 0) + cell + 1;
+	const missesWindow = (o: RBObstacle): boolean => {
+		const R = o.r + reachExtra;
+		let ax = o.x, bx = o.x, ay = o.y, by = o.y;
+		if (o.kind !== 'circle') {
+			ax = Math.min(o.x, o.x2!); bx = Math.max(o.x, o.x2!);
+			ay = Math.min(o.y, o.y2!); by = Math.max(o.y, o.y2!);
+		}
+		return bx + R < x0 || ax - R > gx1 || by + R < y0 || ay - R > gy1;
+	};
+	const nLay = req.layers.length;
+
 	let marked = 0;
 	for (const o of req.obstacles) {
 		if (o.soft) continue;
@@ -281,24 +447,25 @@ async function gridRouteInner(req: GridRouteRequest): Promise<GridRouteResult> {
 		const sameNetPad = sameNet && !!o.group?.startsWith('pad:');
 		if (sameNet && !(sameNetPad && req.viaInPad !== true)) continue;
 		const viaOnly = sameNetPad;
-		const lis: number[] = [];
-		if (o.layer === undefined) lis.push(...req.layers.map((_, i) => i));
-		else {
+		let liLo = 0, liHi = nLay - 1;
+		if (o.layer !== undefined) {
 			const li = layerIndex.get(o.layer);
-			if (li !== undefined) lis.push(li);
+			if (li === undefined) continue;
+			liLo = liHi = li;
 		}
-		if (!lis.length) continue;
-		for (const li of lis) {
+		if (!missesWindow(o)) {
 			const ex = o.group?.startsWith('pad:') ? req.viaExtraPadMil : undefined;
-			if (o.kind === 'circle') {
-				markCircle(o.x, o.y, o.r, li, ex, viaOnly);
-			} else {
-				// 胶囊：沿线采样成圆
-				const len = Math.hypot(o.x2! - o.x, o.y2! - o.y);
-				const steps = Math.max(1, Math.ceil(len / (cell * 0.75)));
-				for (let s = 0; s <= steps; s++) {
-					const t = s / steps;
-					markCircle(o.x + (o.x2! - o.x) * t, o.y + (o.y2! - o.y) * t, o.r, li, ex, viaOnly);
+			for (let li = liLo; li <= liHi; li++) {
+				if (o.kind === 'circle') {
+					markCircle(o.x, o.y, o.r, li, ex, viaOnly);
+				} else {
+					// 胶囊：沿线采样成圆
+					const len = Math.hypot(o.x2! - o.x, o.y2! - o.y);
+					const steps = Math.max(1, Math.ceil(len / (cell * 0.75)));
+					for (let s = 0; s <= steps; s++) {
+						const t = s / steps;
+						markCircle(o.x + (o.x2! - o.x) * t, o.y + (o.y2! - o.y) * t, o.r, li, ex, viaOnly);
+					}
 				}
 			}
 		}
@@ -309,9 +476,9 @@ async function gridRouteInner(req: GridRouteRequest): Promise<GridRouteResult> {
 	// 异网已布铜皮不进占据图，按「每网每格计一次」累加罚分：A* 可以穿过，
 	// 但要付代价 —— 求的是「撕掉谁最便宜」，而不是「能不能过」。
 	const penObs = req.penaltyObstacles ?? [];
-	const penalty = penObs.length ? new Float32Array(total) : null;
+	const penalty = penObs.length ? sc.zeroed('penalty', total, Float32Array) : null;
 	if (penalty) {
-		const stamp = new Int32Array(total);   // 同网多圆重叠只计一次
+		const stamp = sc.zeroed('stamp', total, Int32Array);   // 同网多圆重叠只计一次
 		const netIds = new Map<string, number>();
 		const penOf = req.penaltyOf ?? (() => 60);
 		const markPen = (lx: number, ly: number, r: number, li: number, id: number, val: number): void => {
@@ -451,16 +618,17 @@ async function gridRouteInner(req: GridRouteRequest): Promise<GridRouteResult> {
 	const __tAstar = Date.now();
 
 	// ── A* ──
-	const gScore = new Float64Array(total).fill(Infinity);
-	const cameFrom = new Int32Array(total).fill(-1);
-	const closed = new Uint8Array(total);
-	const heap = new MinHeap();
+	const gScore = sc.gScore;
+	const cameFrom = sc.cameFrom;
+	const closed = sc.closed;
+	const heap = sc.heap;
+	heap.clear();
 	const viaCost = req.viaCostMil ?? 200;
 	const seedStubByCell = new Map<number, { x: number; y: number } | null>();
 	const goalStubByCell = new Map<number, { x: number; y: number }>();
 
 	const idxOf = (i: number, j: number, li: number) => li * stride + j * nx + i;
-	const hOf = (i: number, j: number) => Math.hypot(i - d.i, j - d.j) * cell;
+	const hOf = (i: number, j: number) => hyp(i - d.i, j - d.j) * cell;
 
 	// ── Lazy Theta*（任意角捷径，吸收自 Topola thetastar.rs）──
 	// 生成邻格时额外尝试「祖父格→邻格」直线（光栅 LOS，采样步长 0.4 cell），
@@ -469,8 +637,90 @@ async function gridRouteInner(req: GridRouteRequest): Promise<GridRouteResult> {
 	// 收益 = 拐点更少（楼梯在搜索期就消失）、扩展节点更少、拉直后路径更短。
 	// __RB_THETA_GRID__ = 0 可关闭（A/B 对照）。
 	const anyAngle = (globalThis as unknown as { __RB_THETA_GRID__?: number }).__RB_THETA_GRID__ !== 0;
-	const lazyParent = new Int32Array(total).fill(-1);
-	const lazyG = new Float64Array(total).fill(Infinity);
+	const lazyParent = sc.lazyParent;
+	const lazyG = sc.lazyG;
+	// rasterLos 的「清距跳采样」加速（结果与逐点采样逐位一致）：
+	// clr[格] = 该格到同层最近阻挡格的切比雪夫距离（格数，封顶 255；网格外不算阻挡），
+	// 即以该格为心、半径 clr-1 的方形内全部空闲。A* 开始后 blocked 不再被改写。
+	// 采样序列不变：t = 0..steps，f = t/steps，px = ax + ddx*f，ci = round((px-x0)/cell)。
+	// 相邻采样在格坐标上最多移动 0.4 格/轴（steps ≥ dist/(0.4 cell)），故样本 t+m
+	// 的取整格与样本 t 的相差 ≤ ceil(0.4m + ε)（floor(x+d)-floor(x) ≤ ceil(d)，
+	// ε 为浮点误差，~1e-11 格，LOS_JUMP 里留了 1e-6 余量）。clr=c 时 m 取
+	// 使 ceil(0.4m+ε) ≤ c-1 的最大值，t+1..t+m 全落在空闲格，可直接跳过。
+	// 被跳过的样本都在两端点格的包围盒内（取整单调、端点是整数格），不会越界，
+	// 所以「越界 → false」只需在实际求值的样本上检查，与原循环等价。
+	// __RB_GRID_LOSFAST__ = 0：旧的逐点采样；= 2：自检（同时算快慢两版，不一致即抛，
+	// 并累加 __RB_GRID_LOSFAST_STATS__ {cmp, bad}），且立即建清距表。
+	const losMode = (globalThis as unknown as { __RB_GRID_LOSFAST__?: number }).__RB_GRID_LOSFAST__;
+	const losFastOn = losMode !== 0;
+	const losCheck = losMode === 2;
+	const clrReady = new Uint8Array(nLayers);
+	let clr: Uint8Array | null = null;
+	let losWork = 0;
+	const buildClr = (li: number): void => {
+		if (!clr) clr = sc.clearance(total);
+		const c = clr;
+		const base = li * stride;
+		// 前向：左、上、左上、右上；后向：右、下、右下、左下（切比雪夫 8 邻两遍扫描）
+		for (let j = 0; j < ny; j++) {
+			const row = base + j * nx;
+			for (let i = 0; i < nx; i++) {
+				const id = row + i;
+				if (blocked[id]) { c[id] = 0; continue; }
+				let v = 255;
+				if (i > 0 && c[id - 1] + 1 < v) v = c[id - 1] + 1;
+				if (j > 0) {
+					const u = id - nx;
+					if (c[u] + 1 < v) v = c[u] + 1;
+					if (i > 0 && c[u - 1] + 1 < v) v = c[u - 1] + 1;
+					if (i < nx - 1 && c[u + 1] + 1 < v) v = c[u + 1] + 1;
+				}
+				c[id] = v;
+			}
+		}
+		for (let j = ny - 1; j >= 0; j--) {
+			const row = base + j * nx;
+			for (let i = nx - 1; i >= 0; i--) {
+				const id = row + i;
+				let v = c[id];
+				if (v === 0) continue;
+				if (i < nx - 1 && c[id + 1] + 1 < v) v = c[id + 1] + 1;
+				if (j < ny - 1) {
+					const u = id + nx;
+					if (c[u] + 1 < v) v = c[u] + 1;
+					if (i < nx - 1 && c[u + 1] + 1 < v) v = c[u + 1] + 1;
+					if (i > 0 && c[u - 1] + 1 < v) v = c[u - 1] + 1;
+				}
+				c[id] = v;
+			}
+		}
+		clrReady[li] = 1;
+	};
+	const losPlain = (base: number, ax: number, ay: number, ddx: number, ddy: number, steps: number): boolean => {
+		for (let t = 0; t <= steps; t++) {
+			const f = t / steps;
+			const px = ax + ddx * f, py = ay + ddy * f;
+			const ci = Math.round((px - x0) / cell);
+			const cj = Math.round((py - y0) / cell);
+			if (ci < 0 || cj < 0 || ci >= nx || cj >= ny) return false;
+			if (blocked[base + cj * nx + ci]) return false;
+		}
+		return true;
+	};
+	const losSkip = (c: Uint8Array, base: number, ax: number, ay: number, ddx: number, ddy: number, steps: number): boolean => {
+		let t = 0;
+		while (t <= steps) {
+			const f = t / steps;
+			const px = ax + ddx * f, py = ay + ddy * f;
+			const ci = Math.round((px - x0) / cell);
+			const cj = Math.round((py - y0) / cell);
+			if (ci < 0 || cj < 0 || ci >= nx || cj >= ny) return false;
+			const cc = c[base + cj * nx + ci];
+			if (cc === 0) return false;
+			t += LOS_JUMP[cc] + 1;
+		}
+		return true;
+	};
 	const rasterLos = (a: number, b: number, li: number): boolean => {
 		const base = li * stride;
 		const remA = a - base;
@@ -480,17 +730,28 @@ async function gridRouteInner(req: GridRouteRequest): Promise<GridRouteResult> {
 		const bj = Math.floor(remB / nx), bi = remB - bj * nx;
 		const ax = x0 + ai * cell, ay = y0 + aj * cell;
 		const bx = x0 + bi * cell, by = y0 + bj * cell;
-		const dist = Math.hypot(bx - ax, by - ay);
+		const ddx = bx - ax, ddy = by - ay;
+		const dist = Math.hypot(ddx, ddy);
 		const steps = Math.max(1, Math.ceil(dist / (cell * 0.4)));
-		for (let t = 0; t <= steps; t++) {
-			const f = t / steps;
-			const px = ax + (bx - ax) * f, py = ay + (by - ay) * f;
-			const ci = Math.round((px - x0) / cell);
-			const cj = Math.round((py - y0) / cell);
-			if (ci < 0 || cj < 0 || ci >= nx || cj >= ny) return false;
-			if (blocked[base + cj * nx + ci]) return false;
+		if (losFastOn) {
+			if (!clrReady[li]) {
+				// 清距表建一层约等于 ~stride 次采样的开销：累计采样量够了再建
+				losWork += steps;
+				if (losCheck || losWork * 2 >= stride) buildClr(li);
+			}
+			if (clrReady[li]) {
+				const fast = losSkip(clr!, base, ax, ay, ddx, ddy, steps);
+				if (losCheck) {
+					const st = (globalThis as unknown as { __RB_GRID_LOSFAST_STATS__?: { cmp: number; bad: number } }).__RB_GRID_LOSFAST_STATS__;
+					const slow = losPlain(base, ax, ay, ddx, ddy, steps);
+					if (st) { st.cmp++; if (slow !== fast) st.bad++; }
+					if (slow !== fast) throw new Error(`LOSFAST mismatch a=${a} b=${b} li=${li} fast=${fast} slow=${slow}`);
+					return slow;
+				}
+				return fast;
+			}
 		}
-		return true;
+		return losPlain(base, ax, ay, ddx, ddy, steps);
 	};
 
 	// 起点：焊盘中心格（cost 0）+ 各出线候选点格（cost = 中心到候选点距离，
@@ -524,6 +785,8 @@ async function gridRouteInner(req: GridRouteRequest): Promise<GridRouteResult> {
 			const li = layerIndex.get(layerId)!;
 			const id = idxOf(i, j, li);
 			isGoal.add(id);
+			sc.goalMark[id] = 1;
+			sc.goalIds.push(id);
 			goalCost.set(id, stub ? Math.hypot(stub.x - dst.x, stub.y - dst.y) : 0);
 			if (stub) goalStubByCell.set(id, stub);
 		}
@@ -533,97 +796,201 @@ async function gridRouteInner(req: GridRouteRequest): Promise<GridRouteResult> {
 		const c = toCell(p);
 		addGoal(c.i, c.j, p);
 	}
-	let started = 0;
+	const touched = sc.touched;
+	let nt = 0;
+	if (!seedBest.size) {
+		const sId = idxOf(s.i, s.j, 0), dId = idxOf(d.i, d.j, 0);
+		return { ...fail, cell, debug: `no-seeds startBlocked=${blocked[sId]} goalBlocked=${blocked[dId]} srcLayers=${srcLayers} dstLayers=${dstLayers}` };
+	}
+
+	// ── 可达性预检（双向 BFS，与 A* 交错推进）──
+	// 目标不可达时 A* 要把整个可达连通域用堆 + Lazy Theta LOS 洪泛一遍才返回
+	// 同一个失败；这里用与 A* 邻接规则逐条一致的 BFS 判连通：
+	//   同层八邻（目标格未阻挡；斜走不切角）+ 同格跨层（目标格未阻挡，
+	//   viaBlocked 在两端都为空）。移动关系对称，所以「起点域含目标」⇔
+	//   「目标域含起点」，两端轮流各扩一格，先耗尽的一端即可证明不可达。
+	// 只在能证明「不可达」时直接返回失败（A* 自己跑完也是同一个 no-path）；
+	// 相遇 → 可达，BFS 停用，A* 照常。为避免给「很快就成功」的搜索白加开销，
+	// BFS 在 A* 弹出 BFS_AFTER_POPS 个节点后才启动，之后每个 A* 弹出配 BFS_RATIO
+	// 步（被 deadline / 取消打断时 A* 自己的检查会收手，行为不变）。
+	// __RB_GRID_PRECHECK__ = 0 可关闭（A/B 对照）。
+	// __RB_GRID_PRECHECK__ = 2：测试用「急切」模式（第 1 个弹出起每弹出配 1 步），
+	// 让小场景也走完整的 BFS 路径。
+	const preMode = (globalThis as unknown as { __RB_GRID_PRECHECK__?: number }).__RB_GRID_PRECHECK__;
+	const BFS_AFTER_POPS = preMode === 2 ? 1 : 1500, BFS_RATIO = preMode === 2 ? 1 : 3;
+	let bfsLive = preMode !== 0;
+	let vis = sc.vis, qa = sc.qa, qb = sc.qb;
+	let ah = 0, at = 0, bh = 0, bt = 0;
+	// expand 返回新队尾；-1 = 与对端相遇
+	const expand = (cur: number, q: Int32Array, tail: number, mine: number, other: number): number => {
+		const li = (cur / stride) | 0;
+		const rem = cur - li * stride;
+		const j = (rem / nx) | 0;
+		const i = rem - j * nx;
+		const base = li * stride;
+		for (let k = 0; k < 8; k++) {
+			const dx = D8DX[k], dy = D8DY[k];
+			const ni = i + dx, nj = j + dy;
+			if (ni < 0 || nj < 0 || ni >= nx || nj >= ny) continue;
+			const nid = base + nj * nx + ni;
+			if (blocked[nid]) continue;
+			if (dx !== 0 && dy !== 0) {
+				if (blocked[base + j * nx + ni] || blocked[base + nj * nx + i]) continue;
+			}
+			const v = vis[nid];
+			if (v & mine) continue;
+			if (v & other) return -1;
+			vis[nid] = v | mine;
+			q[tail++] = nid;
+		}
+		for (let l2 = 0; l2 < nLayers; l2++) {
+			if (l2 === li) continue;
+			const nid = l2 * stride + rem;
+			if (blocked[nid]) continue;
+			if (viaBlocked && (viaBlocked[nid] || viaBlocked[cur])) continue;
+			const v = vis[nid];
+			if (v & mine) continue;
+			if (v & other) return -1;
+			vis[nid] = v | mine;
+			q[tail++] = nid;
+		}
+		return tail;
+	};
+	/** BFS 初始化；返回 true = 起点即命中目标（可达，无需再跑） */
+	const bfsInit = (): boolean => {
+		sc.bfsBuffers(total);
+		vis = sc.vis; qa = sc.qa; qb = sc.qb;
+		for (const sd of seedBest.values()) {
+			const id = idxOf(sd.i, sd.j, sd.li);
+			if (!(vis[id] & 1)) { vis[id] |= 1; qa[at++] = id; }
+		}
+		for (const id of isGoal) {
+			if (blocked[id]) continue;
+			if (vis[id] & 1) return true;
+			if (!(vis[id] & 2)) { vis[id] |= 2; qb[bt++] = id; }
+		}
+		return false;
+	};
+	/** 推进至多 steps 轮（每轮两端各扩一格）。-1 = 证明不可达，1 = 相遇，0 = 未决 */
+	const bfsAdvance = (steps: number): number => {
+		for (let n = 0; n < steps; n++) {
+			if (ah >= at || bh >= bt) return -1;
+			at = expand(qa[ah++], qa, at, 1, 2);
+			if (at < 0) return 1;
+			bt = expand(qb[bh++], qb, bt, 2, 1);
+			if (bt < 0) return 1;
+		}
+		return 0;
+	};
+
+	// 起步：种子入堆（搜索数组自此被改写 → 登记 touched，结束时还原）
+	sc.searching = true;
 	for (const sd of seedBest.values()) {
 		const id = idxOf(sd.i, sd.j, sd.li);
+		touched[nt++] = id;
 		gScore[id] = sd.cost;
 		seedStubByCell.set(id, sd.stub);
 		heap.push(sd.cost + hOf(sd.i, sd.j), id);
-		started++;
-	}
-	if (!started) {
-		const sId = idxOf(s.i, s.j, 0), dId = idxOf(d.i, d.j, 0);
-		return { ...fail, cell, debug: `no-seeds startBlocked=${blocked[sId]} goalBlocked=${blocked[dId]} srcLayers=${srcLayers} dstLayers=${dstLayers}` };
 	}
 
 	let best = -1;
 	let bestCost = Infinity;
 	let pops = 0;
+	const goalMark = sc.goalMark;
+	const dcx = d.i, dcy = d.j;
 	while (heap.size) {
 		if ((++pops & 255) === 0) {
 			if (Date.now() > deadline || cancelled()) break;
 		}
+		if (bfsLive && pops >= BFS_AFTER_POPS) {
+			let r = pops === BFS_AFTER_POPS && bfsInit() ? 1 : 0;
+			if (r === 0) r = bfsAdvance(BFS_RATIO);
+			if (r < 0) {
+				// 一端耗尽：证明不可达，与 A* 耗尽堆后的失败等价
+				sc.nt = nt;
+				const sId = idxOf(s.i, s.j, 0), dId = idxOf(d.i, d.j, 0);
+				return { ...fail, cell, debug: `no-path(unreachable) nx=${nx} ny=${ny} pops=${pops} startBlocked=${blocked[sId]} goalBlocked=${blocked[dId]}` };
+			}
+			if (r > 0) bfsLive = false;
+		}
 		const cur = heap.pop();
 		if (closed[cur]) continue;
 		closed[cur] = 1;
-		const li = Math.floor(cur / stride);
+		const li = (cur / stride) | 0;
 		const rem = cur - li * stride;
-		const j = Math.floor(rem / nx);
+		const j = (rem / nx) | 0;
 		const i = rem - j * nx;
 		// Lazy Theta*：弹出时才校验捷径 LOS；成立则采纳祖父直连（更少拐点），
 		// 失败保持常规 A* 父链。只裁决一次。
 		if (anyAngle && lazyParent[cur] >= 0 && lazyG[cur] < gScore[cur] - 1e-9) {
 			const p = lazyParent[cur];
-			if (Math.floor(p / stride) === li && rasterLos(p, cur, li)) {
+			if (((p / stride) | 0) === li && rasterLos(p, cur, li)) {
 				gScore[cur] = lazyG[cur];
 				cameFrom[cur] = p;
 			}
 			lazyParent[cur] = -1;
 		}
 		const g = gScore[cur];
-		if (isGoal.has(cur)) {
+		if (goalMark[cur] === 1) {
 			const total = g + (goalCost.get(cur) ?? 0);
 			if (total < bestCost) { bestCost = total; best = cur; }
 			// 目标格命中：八字邻接的最优性足够，直接收手
 			break;
 		}
+		const base = li * stride;
+		// Lazy Theta* 的祖父格在本格的邻格循环内不变（cameFrom[cur] 只在弹出时改；
+		// 祖父已在闭集，其 gScore 在本轮不会被写）→ 提到循环外
+		const p = anyAngle ? cameFrom[cur] : -1;
+		const pRem = p >= 0 ? p - base : -1;
+		const hasP = anyAngle && pRem >= 0 && pRem < stride;
+		let pj = 0, pi = 0, gp = 0;
+		if (hasP) { pj = (pRem / nx) | 0; pi = pRem - pj * nx; gp = gScore[p]; }
 		// 同层八邻
-		for (const [dx, dy, w] of D8) {
+		for (let k = 0; k < 8; k++) {
+			const dx = D8DX[k], dy = D8DY[k];
 			const ni = i + dx, nj = j + dy;
 			if (ni < 0 || nj < 0 || ni >= nx || nj >= ny) continue;
-			const nid = idxOf(ni, nj, li);
+			const nid = base + nj * nx + ni;
 			if (blocked[nid] || closed[nid]) continue;
 			// 斜走禁止切角：两个正交邻格必须都空
 			if (dx !== 0 && dy !== 0) {
-				if (blocked[idxOf(i + dx, j, li)] || blocked[idxOf(i, j + dy, li)]) continue;
+				if (blocked[base + j * nx + ni] || blocked[base + nj * nx + i]) continue;
 			}
-			const ng = g + w * cell + (penalty ? penalty[nid] : 0);
+			const ng = g + D8W[k] * cell + (penalty ? penalty[nid] : 0);
 			if (ng < gScore[nid] - 1e-9) {
+				if (gScore[nid] === Infinity && lazyG[nid] === Infinity) touched[nt++] = nid;
 				gScore[nid] = ng;
 				cameFrom[nid] = cur;
-				heap.push(ng + hOf(ni, nj), nid);
+				heap.push(ng + hyp(ni - dcx, nj - dcy) * cell, nid);
 			}
 			// Lazy Theta* 捷径候选：祖父格直连邻格（同层），弹出时验 LOS
-			if (anyAngle) {
-				const p = cameFrom[cur];
-				const pRem = p >= 0 ? p - li * stride : -1;
-				if (pRem >= 0 && pRem < stride) {
-					const pj = Math.floor(pRem / nx), pi = pRem - pj * nx;
-					const cand = gScore[p] + Math.hypot(ni - pi, nj - pj) * cell;
-					if (cand < gScore[nid] - 1e-9 && cand < lazyG[nid] - 1e-9) {
-						lazyG[nid] = cand;
-						lazyParent[nid] = p;
-						heap.push(cand + hOf(ni, nj), nid);
-					}
+			if (hasP) {
+				const cand = gp + hyp(ni - pi, nj - pj) * cell;
+				if (cand < gScore[nid] - 1e-9 && cand < lazyG[nid] - 1e-9) {
+					if (gScore[nid] === Infinity && lazyG[nid] === Infinity) touched[nt++] = nid;
+					lazyG[nid] = cand;
+					lazyParent[nid] = p;
+					heap.push(cand + hyp(ni - dcx, nj - dcy) * cell, nid);
 				}
 			}
 		}
 		// 层间过孔边（同格跨层）
-		const here = idxOf(i, j, li);
 		for (let l2 = 0; l2 < nLayers; l2++) {
 			if (l2 === li) continue;
-			const nid = idxOf(i, j, l2);
+			const nid = l2 * stride + rem;
 			if (blocked[nid] || closed[nid]) continue;
 			// 过孔比走线粗：两侧层都必须在「过孔净距」网格上为空
-			if (viaBlocked && (viaBlocked[nid] || viaBlocked[here])) continue;
+			if (viaBlocked && (viaBlocked[nid] || viaBlocked[cur])) continue;
 			const ng = g + viaCost + (penalty ? penalty[nid] : 0);
 			if (ng < gScore[nid] - 1e-9) {
+				if (gScore[nid] === Infinity && lazyG[nid] === Infinity) touched[nt++] = nid;
 				gScore[nid] = ng;
-				cameFrom[nid] = here;
+				cameFrom[nid] = cur;
 				heap.push(ng + hOf(i, j), nid);
 			}
 		}
 	}
+	sc.nt = nt;
 	if (best < 0) {
 		const sId = idxOf(s.i, s.j, 0), dId = idxOf(d.i, d.j, 0);
 		return { ...fail, cell, debug: `no-path nx=${nx} ny=${ny} pops=${pops} startBlocked=${blocked[sId]} goalBlocked=${blocked[dId]}` };

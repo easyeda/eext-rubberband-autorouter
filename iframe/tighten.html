@@ -169,12 +169,49 @@
 				if (data.stage) els.stage.textContent = data.stage;
 				if (data.message) els.msg.textContent = data.message;
 				if (typeof data.done === 'number') els.done.textContent = data.done;
-				if (typeof data.total === 'number' && data.total) { els.total.textContent = data.total; els.done.textContent = '0'; }
+				if (typeof data.total === 'number' && data.total) els.total.textContent = data.total;
 				if (typeof data.changed === 'number') els.changed.textContent = data.changed;
 				if (typeof data.savedMil === 'number') els.saved.textContent = Math.round(data.savedMil);
 				if (typeof data.adopted === 'number') els.adopted.textContent = data.adopted;
 			} else if (data.type === 'done') {
 				finished = true;
+				if (data.aborted) {
+					// 回写失败中止：如实显示（已写入 / 失败 / 未处理 / 残留图元），不能显示成「完成」
+					els.pulse.classList.add('error');
+					els.stage.textContent = '已中止';
+					els.msg.textContent = String(data.message || '拉紧因回写失败已中止');
+					els.msg.title = els.msg.textContent;
+					els.hint.textContent = '已写入的保留，失败段已尝试恢复原走线（详见上方文案）；可以关闭窗口';
+					els.closeBtn.textContent = '关闭';
+					els.closeBtn.classList.remove('primary');
+					els.closeBtn.onclick = function () { send({ type: 'close' }); };
+					return;
+				}
+				if (data.cancelled) {
+					// 用户停止：不能显示成「完成」；有差异时文案里带坐标（宿主的 message 已如实写明）
+					els.pulse.classList.add(data.issues ? 'error' : 'done');
+					els.stage.textContent = data.issues ? '已停止（有差异）' : '已停止';
+					els.msg.textContent = String(data.message || '拉紧已停止，已写入的保留');
+					els.msg.title = els.msg.textContent;
+					els.hint.textContent = data.issues ? '已写入的保留；请按提示坐标检查走线；可以关闭窗口' : '已写入的保留；可以关闭窗口';
+					els.closeBtn.textContent = '关闭';
+					els.closeBtn.classList.remove('primary');
+					els.closeBtn.onclick = function () { send({ type: 'close' }); };
+					return;
+				}
+				if (data.issues) {
+					// 完成但画布与模型不一致（结束核对发现缺铜/多余铜）：如实显示文案（含坐标），不能显示成干净的「完成」
+					els.pulse.classList.add('error');
+					setPercent(100);
+					els.stage.textContent = '完成（有差异）';
+					els.msg.textContent = String(data.message || '拉紧完成，但画布与模型不一致');
+					els.msg.title = els.msg.textContent;
+					els.hint.textContent = '请按提示坐标检查走线；可以关闭窗口';
+					els.closeBtn.textContent = '关闭';
+					els.closeBtn.classList.remove('primary');
+					els.closeBtn.onclick = function () { send({ type: 'close' }); };
+					return;
+				}
 				els.pulse.classList.add('done');
 				setPercent(100);
 				els.stage.textContent = '完成';
